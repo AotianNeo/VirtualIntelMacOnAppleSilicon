@@ -453,7 +453,7 @@ static void flags_decode(u64 rip, Insn *out, const Insn *block, int count) {
 
 static int flags_needed_at(u64 rip, u64 page, int depth, const Insn *block, int count) {
     int need = 0, written = 0;
-    for (int i = 0; i < 16; i++) {
+    for (int i = 0; i < 32; i++) {
         if ((rip & ~0xfffULL) != page || ((rip + 15) & ~0xfffULL) != page)
             return need | (F_ARITH & ~written);
         Insn in;
@@ -530,6 +530,14 @@ static const Insn *block_insns;
 static u32 *insn_arm[MAX_INSNS];
 static int insn_total;
 
+typedef struct {
+    u32 *site;
+    int target_idx;
+    int form;
+} FwdFix;
+static FwdFix fwd_fix[MAX_INSNS];
+static int fwd_count;
+
 // If target is an instruction already emitted in this block, returns where.
 static u32 *internal_target(u64 target, int upto) {
     for (int i = 0; i <= upto && i < insn_total; i++)
@@ -538,23 +546,43 @@ static u32 *internal_target(u64 target, int upto) {
     return NULL;
 }
 
+// If target is a later instruction in this same superblock, returns its index.
+static int forward_target_idx(u64 target, int from) {
+    for (int i = from + 1; i < insn_total; i++)
+        if (block_insns[i].rip == target)
+            return i;
+    return -1;
+}
+
+static void add_fwd(u32 *site, int target_idx, int form) {
+    if (fwd_count < MAX_INSNS)
+        fwd_fix[fwd_count++] = (FwdFix){site, target_idx, form};
+}
+
 static void emit_monitor_op(const Insn *in);
 
 static void emit_control(const Insn *in, int idx, int live_after) {
     switch (in->op) {
         case OP_JCC: {
             u32 *back = internal_target(in->target, idx);
+            int fwd = back ? -1 : forward_target_idx(in->target, idx);
             int acc = x86_to_arm_cc[in->cc];
             if (acc < 0) {
                 emit_parity(S4);
                 if (back) {
                     cbz(in->cc == 10, 0, S4, (int)(back - tr_cc));
+                } else if (fwd >= 0) {
+                    add_fwd(tr_cc, fwd, 0);
+                    cbz(in->cc == 10, 0, S4, 0);
                 } else {
                     add_pending(tr_cc, in->target, SVC_JCC, 0);
                     cbz(in->cc == 10, 0, S4, 0);
                 }
             } else if (back) {
                 b_cond(acc, (int)(back - tr_cc));
+            } else if (fwd >= 0) {
+                add_fwd(tr_cc, fwd, 0);
+                b_cond(acc, 0);
             } else {
                 add_pending(tr_cc, in->target, SVC_JCC, 0);
                 b_cond(acc, 0);
@@ -563,6 +591,7 @@ static void emit_control(const Insn *in, int idx, int live_after) {
         }
         case OP_JRCXZ: {
             u32 *back = internal_target(in->target, idx);
+            int fwd = back ? -1 : forward_target_idx(in->target, idx);
             int sub = in->sub;
             int sf = in->addr32 ? 0 : 1; // with 67h the count is ecx
             if (in->addr16) { // 32-bit code with 67h: the count is cx, and ecx's top half stays
@@ -576,8 +605,12 @@ static void emit_control(const Insn *in, int idx, int live_after) {
                     over = tr_cc;
                     b_cond(sub == 3 ? 1 : 0, 0);
                 }
-                if (!back)
-                    add_pending(tr_cc, in->target, SVC_JCC, 0);
+                if (!back) {
+                    if (fwd >= 0)
+                        add_fwd(tr_cc, fwd, 0);
+                    else
+                        add_pending(tr_cc, in->target, SVC_JCC, 0);
+                }
                 cbz(sub >= 2, 0, S0, back ? (int)(back - tr_cc) : 0);
                 if (over)
                     *over |= ((u32)(tr_cc - over) & 0x7ffff) << 5;
@@ -586,18 +619,30 @@ static void emit_control(const Insn *in, int idx, int live_after) {
             if (sub >= 2)
                 add_imm(sf, 1, 0, 1, 1, 1);
             if (sub == 0 || sub == 1) {
-                if (!back)
-                    add_pending(tr_cc, in->target, SVC_JCC, 0);
+                if (!back) {
+                    if (fwd >= 0)
+                        add_fwd(tr_cc, fwd, 0);
+                    else
+                        add_pending(tr_cc, in->target, SVC_JCC, 0);
+                }
                 cbz(0, sub == 1 ? 0 : 1, 1, back ? (int)(back - tr_cc) : 0);
             } else if (sub == 2) {
-                if (!back)
-                    add_pending(tr_cc, in->target, SVC_JCC, 0);
+                if (!back) {
+                    if (fwd >= 0)
+                        add_fwd(tr_cc, fwd, 0);
+                    else
+                        add_pending(tr_cc, in->target, SVC_JCC, 0);
+                }
                 cbz(1, sf, 1, back ? (int)(back - tr_cc) : 0);
             } else {
                 u32 *over = tr_cc;
                 b_cond(sub == 3 ? 1 : 0, 0); // loope leaves when ZF is clear, loopne when it is set
-                if (!back)
-                    add_pending(tr_cc, in->target, SVC_JCC, 0);
+                if (!back) {
+                    if (fwd >= 0)
+                        add_fwd(tr_cc, fwd, 0);
+                    else
+                        add_pending(tr_cc, in->target, SVC_JCC, 0);
+                }
                 cbz(1, sf, 1, back ? (int)(back - tr_cc) : 0);
                 *over |= ((u32)(tr_cc - over) & 0x7ffff) << 5;
             }
@@ -605,8 +650,12 @@ static void emit_control(const Insn *in, int idx, int live_after) {
         }
         case OP_JMP: {
             u32 *back = internal_target(in->target, idx);
+            int fwd = back ? -1 : forward_target_idx(in->target, idx);
             if (back) {
                 b_rel((int)(back - tr_cc));
+            } else if (fwd >= 0) {
+                add_fwd(tr_cc, fwd, 1);
+                b_rel(0);
             } else {
                 add_pending(tr_cc, in->target, SVC_DIRECT, 1);
                 b_rel(0);
@@ -907,33 +956,57 @@ static TrResult do_translate(int key, int view, u64 cr3, int cpl, u64 rip, bool 
                              last->op == OP_UD || last->op == OP_IRET);
     int live;
     if (last->op == OP_JMP)
-        live = flags_needed_at(last->target, page, 2, list, count);
+        live = flags_needed_at(last->target, page, 3, list, count);
     else if (!fallthrough_end)
         live = F_ARITH;
     else
-        live = flags_needed_at(last->next, page, 2, list, count);
+        live = flags_needed_at(last->next, page, 3, list, count);
     static u8 live_after[MAX_INSNS];
+    static u8 live_before[MAX_INSNS];
     for (int i = count - 1; i >= 0; i--) {
         Insn *in = &list[i];
-        if (in->op == OP_JCC || in->op == OP_JRCXZ)
-            live |= flags_needed_at(in->target, page, 1, list, count);
-        else if (in->op == OP_CALL || in->op == OP_CALLI)
+        if (in->op == OP_JCC || in->op == OP_JRCXZ) {
+            int fwd = -1;
+            for (int j = i + 1; j < count; j++) {
+                if (list[j].rip == in->target) {
+                    fwd = j;
+                    break;
+                }
+            }
+            if (fwd >= 0)
+                live |= live_before[fwd];
+            else
+                live |= flags_needed_at(in->target, page, 2, list, count);
+        } else if (in->op == OP_CALL || in->op == OP_CALLI)
             live = F_ARITH; // the callee and the landing pad are unknown
         else if (in->op == OP_JMP || in->op == OP_JMPI || in->op == OP_RET)
             live = i == count - 1 ? live : F_ARITH;
         live_after[i] = (u8)(cfg.all_flags_live ? F_ARITH : live);
         live = (live & ~in->writes) | insn_reads(in);
+        live_before[i] = (u8)live;
     }
 
     block_insns = list;
     insn_total = count;
     pend_count = 0;
+    fwd_count = 0;
+    tr_ad_page = ~0ULL;
     u32 *start = tr_cc;
     if (ctx_ptr->vcpu_count > 1) // a kill patches the entry word under peers running it: nop to svc is a change the architecture allows, an arbitrary word isn't
         E(0xD503201Fu);
     u32 map0 = pc_map_used[cur_part];
     for (int i = 0; i < count; i++) {
         const Insn *in = &list[i];
+        // Any branch target inside the block can be reached with an unknown AD value.
+        for (int j = 0; j < count; j++) {
+            int jop = list[j].op;
+            if ((jop == OP_JCC || jop == OP_JRCXZ || jop == OP_JMP) && list[j].target == in->rip) {
+                tr_ad_page = ~0ULL;
+                break;
+            }
+        }
+        if (in->op != OP_SSE)
+            tr_ad_page = ~0ULL;
         insn_arm[i] = tr_cc;
         if (i)
             stats.op_words[list[i - 1].op & 127] += (u64)(tr_cc - insn_arm[i - 1]);
@@ -1026,6 +1099,8 @@ static TrResult do_translate(int key, int view, u64 cr3, int cpl, u64 rip, bool 
                 break;
         }
     }
+    for (int i = 0; i < fwd_count; i++)
+        fix(fwd_fix[i].site, fwd_fix[i].form, insn_arm[fwd_fix[i].target_idx]);
     u32 *tail = tr_cc;
     stats.op_words[last->op & 127] += (u64)(tr_cc - insn_arm[count - 1]);
     if (fallthrough_end) {
@@ -1328,9 +1403,21 @@ static void emit_monitor_op(const Insn *in) {
             break;
         }
         case OP_LTR: {
-            int mode = in->sub; // 0 ltr, 1 str, 2 lldt, 3 sldt
+            int mode = in->sub; // 0 ltr, 1 str, 2 lldt, 3 sldt, 4 verr, 5 verw, 6 lsl
+            if (mode == 6) {
+                if (in->rm_reg)
+                    mov_reg(0, S0, in->rm);
+                else
+                    ldst(1, 2, S0, addr_prepare(in, 2));
+                svc(SVC_LSL);
+                u32 *skip = tr_cc;
+                b_cond(1, 0); // skip write if ZF == 0 (invalid selector)
+                gpr_write(in->reg, in->sz, false, S0);
+                *skip |= (u32)(tr_cc - skip) << 5;
+                break;
+            }
             bool read = mode == 1 || mode == 3;
-            int svcn = mode == 0 ? SVC_LTR : mode == 1 ? SVC_STR : mode == 2 ? SVC_LLDT : SVC_SLDT;
+            int svcn = mode == 0 ? SVC_LTR : mode == 1 ? SVC_STR : mode == 2 ? SVC_LLDT : mode == 3 ? SVC_SLDT : mode == 4 ? SVC_VERR : SVC_VERW;
             if (read) {
                 svc(svcn);
                 if (in->rm_reg)
