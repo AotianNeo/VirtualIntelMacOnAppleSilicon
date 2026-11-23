@@ -50,7 +50,6 @@ static const char *x87_rare(int esc, u8 m) {
             switch (m) {
                 case 0xF0: return "x87: f2xm1";
                 case 0xF1: return "x87: fyl2x";
-                case 0xF2: return "x87: fptan";
                 case 0xF3: return "x87: fpatan";
                 case 0xF9: return "x87: fyl2xp1";
                 case 0xFB: return "x87: fsincos";
@@ -712,8 +711,19 @@ static void decode_inner(u64 rip, Insn *in, const u8 *b, int avail) {
                 in->op = OP_LTR;
                 in->sub = s == 0 ? 3 : s == 1 ? 1 : s == 2 ? 2 : 0;
                 w = in->rm_reg && (s < 2) ? sz : 2;
+            } else if (s == 4 || s == 5) {
+                in->op = OP_LTR;
+                in->sub = s; // 4 verr, 5 verw
+                in->writes = F_Z;
+                w = 2;
             } else
                 set_bad(in, "verr, verw");
+        } else if (opc == 0x03) {
+            MODRM();
+            in->op = OP_LTR;
+            in->sub = 6; // lsl
+            in->writes = F_Z;
+            w = sz;
         } else if (opc == 0x01) {
             u8 m = *p;
             if (m == 0xF8) {
