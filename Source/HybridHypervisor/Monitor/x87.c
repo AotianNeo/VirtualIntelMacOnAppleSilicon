@@ -1240,7 +1240,7 @@ static void x87_op(void) {
                     else if (adjust == 1 && (rc == 1 || rc == 3))
                         k.m--;
                     st_push(s, k);
-                } else if (m == 0xF2) { // fptan slow-path (|x| >= 1024, NaN/Inf, or stack overflow/underflow)
+                } else if (m == 0xF0 || m == 0xF2 || m == 0xFB || m == 0xFE || m == 0xFF) { // f2xm1/fptan/fsincos/fsin/fcos slow-path
                     fp_cannot(rip, op, FB_X87, 16);
                 } else if (m == 0xF4) { // fxtract
                     if (e0) {

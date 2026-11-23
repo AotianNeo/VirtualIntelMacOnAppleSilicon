@@ -48,13 +48,9 @@ static const char *x87_rare(int esc, u8 m) {
     switch (esc) {
         case 1:
             switch (m) {
-                case 0xF0: return "x87: f2xm1";
                 case 0xF1: return "x87: fyl2x";
                 case 0xF3: return "x87: fpatan";
                 case 0xF9: return "x87: fyl2xp1";
-                case 0xFB: return "x87: fsincos";
-                case 0xFE: return "x87: fsin";
-                case 0xFF: return "x87: fcos";
                 default: break;
             }
             return r == 0xC0 || r == 0xC8 || m == 0xD0 || (m >= 0xE0 && m != 0xE2 && m != 0xE3 && m != 0xE6 && m != 0xE7 && m != 0xEF) ? NULL : "x87: reserved D9 form";

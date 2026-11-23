@@ -981,6 +981,146 @@ static bool try_fast_reg(const Insn *in) {
         return true;
     }
 
+    // D9 F0: F2XM1 (2^ST(0) - 1, |ST(0)| <= 1.0) in extreme fast double mode
+    if (esc == 1 && m == 0xF0) {
+        static const u64 kexp_c[14] = {
+            0x3FE0000000000000ULL, 0x3FC5555555555555ULL, 0x3FA5555555555555ULL, 0x3F81111111111111ULL,
+            0x3F56C16C16C16C17ULL, 0x3F2A01A01A01A01AULL, 0x3EFA01A01A01A01AULL, 0x3EC71DE3A556C734ULL,
+            0x3E927E4FB7789F5CULL, 0x3E5AE64567F544E4ULL, 0x3E21EED8EFF8D898ULL, 0x3DE6124613A86D09ULL,
+            0x3DA93974A8C07C9DULL, 0x3D6AE7F3E733B81FULL,
+        };
+        SlowList sl = {.n = 0};
+        emit_x87_guard(&sl);
+        emit_st_phys_nonempty(S0, 0, &sl);
+        emit_load_cached_d(S0, V_S0, &sl);
+        fmov_x_d(S1, V_S0);
+        ubfx(1, S2, S1, 0, 63); // |x| bits
+        movimm(S5, 0x3FF0000000000000ULL); // 1.0
+        add_reg(1, 1, 1, XZR, S5, S2, 0);
+        cset(S1, 3); // CC: |x| > 1.0 or NaN/Inf -> slow
+        add_cbz(&sl, 1, 0, S1);
+        movimm(S1, 0x3FE62E42FEFA39EFULL); // ln(2)
+        fmov_d_x(28, S1);
+        fmul_d(V_S0, V_S0, 28); // u = x * ln(2)
+        fmul_d(V_S1, V_S0, V_S0); // u^2
+        movimm(S1, kexp_c[13]);
+        fmov_d_x(V_S2, S1);
+        for (int ci = 12; ci >= 0; ci--) {
+            movimm(S1, kexp_c[ci]);
+            fmov_d_x(28, S1);
+            fmadd_d(V_S2, V_S2, V_S0, 28);
+        }
+        fmadd_d(V_S0, V_S1, V_S2, V_S0); // u + u^2 * p(u)
+        emit_store_cached_d(V_S0, S0);
+        u32 *done = tr_cc;
+        b_rel(0);
+        patch_slow(&sl);
+        call_monitor(in);
+        patch_b(done);
+        return true;
+    }
+
+    // D9 FB (FSINCOS) / D9 FE (FSIN) / D9 FF (FCOS) in extreme fast double mode
+    if (esc == 1 && (m == 0xFB || m == 0xFE || m == 0xFF)) {
+        static const u64 ksin_c[7] = {
+            0xBFC5555555555555ULL, 0x3F81111111111111ULL, 0xBF2A01A01A01A01AULL,
+            0x3EC71DE3A556C734ULL, 0xBE5AE64567F544E4ULL, 0x3DE6124613A86D09ULL,
+            0xBD6AE7F3E733B81FULL,
+        };
+        static const u64 kcos_c[7] = {
+            0xBFE0000000000000ULL, 0x3FA5555555555555ULL, 0xBF56C16C16C16C17ULL,
+            0x3EFA01A01A01A01AULL, 0xBE927E4FB7789F5CULL, 0x3E21EED8EFF8D898ULL,
+            0xBDA93974A8C07C9DULL,
+        };
+        SlowList sl = {.n = 0};
+        emit_x87_guard(&sl);
+        emit_st_phys_nonempty(S0, 0, &sl);
+        if (m == 0xFB) {
+            // Check stack not full (ST(7) must be empty before pushing cos)
+            add_imm(0, 0, 0, S1, S3, 7);
+            ubfx(0, S1, S1, 0, 3);
+            lsr_imm(0, S2, S3, 8);
+            var_shift(0, 1, S2, S2, S1);
+            add_tbz(&sl, 1, S2, 0);
+        }
+        emit_load_cached_d(S0, V_S0, &sl);
+        fmov_x_d(S1, V_S0);
+        ubfx(1, S2, S1, 0, 63);
+        movimm(S5, 0x4090000000000000ULL); // 1024.0
+        add_reg(1, 1, 1, XZR, S2, S5, 0);
+        cset(S1, 2); // CS: >= 1024.0 or NaN/Inf -> slow
+        add_cbz(&sl, 1, 0, S1);
+        // Cody-Waite range reduction: k = round(x * (2/pi)), r = (x - k*PIO2_HI) - k*PIO2_LO
+        movimm(S1, 0x3FE45F306DC9C883ULL); // 2/pi
+        fmov_d_x(28, S1);
+        fmul_d(V_S1, V_S0, 28);
+        frintn_d(V_S1, V_S1);
+        fcvtzs_w_d(S4, V_S1); // int32 k in S4
+        movimm(S1, 0x3FF921FB54400000ULL); // PIO2_HI
+        fmov_d_x(28, S1);
+        fmsub_d(V_S0, V_S1, 28, V_S0);
+        movimm(S1, 0x3DD0B4611A626331ULL); // PIO2_LO
+        fmov_d_x(28, S1);
+        fmsub_d(V_S0, V_S1, 28, V_S0); // V_S0 = r
+        fmul_d(V_S1, V_S0, V_S0);      // V_S1 = r^2
+        fmul_d(27, V_S0, V_S1);        // v27 = r^3
+        // sin(r) -> V_S2
+        movimm(S1, ksin_c[6]);
+        fmov_d_x(V_S2, S1);
+        for (int ci = 5; ci >= 0; ci--) {
+            movimm(S1, ksin_c[ci]);
+            fmov_d_x(28, S1);
+            fmadd_d(V_S2, V_S2, V_S1, 28);
+        }
+        fmadd_d(V_S2, 27, V_S2, V_S0); // V_S2 = s = sin(r)
+        // cos(r) -> 29
+        movimm(S1, kcos_c[6]);
+        fmov_d_x(29, S1);
+        for (int ci = 5; ci >= 0; ci--) {
+            movimm(S1, kcos_c[ci]);
+            fmov_d_x(28, S1);
+            fmadd_d(29, 29, V_S1, 28);
+        }
+        movimm(S1, 0x3FF0000000000000ULL); // 1.0
+        fmov_d_x(28, S1);
+        fmadd_d(29, V_S1, 29, 28); // v29 = c = cos(r)
+        // Quadrant adjustment using k in S4:
+        // if (k & 1): (s, c) = (c, -s)
+        u32 *b_k0 = tr_cc;
+        tbz(0, S4, 0, 0);
+        fneg_d(28, V_S2);          // v28 = -s
+        E(0x1E604000u | (29u << 5) | V_S2); // fmov d(V_S2), d29  (s = c)
+        E(0x1E604000u | (28u << 5) | 29u);  // fmov d29, d28      (c = -s)
+        *b_k0 |= ((u32)(tr_cc - b_k0) & 0x3fffu) << 5;
+        // if (k & 2): (s, c) = (-s, -c)
+        u32 *b_k1 = tr_cc;
+        tbz(0, S4, 1, 0);
+        fneg_d(V_S2, V_S2);
+        fneg_d(29, 29);
+        *b_k1 |= ((u32)(tr_cc - b_k1) & 0x3fffu) << 5;
+        // Clear C2 (bit 26) in S3
+        movimm(S1, 1u << 26);
+        logic_reg(0, 0, 1, S3, S3, S1);
+        if (m == 0xFE) {
+            emit_store_cached_d(V_S2, S0);
+            ldst(0, 4, S3, (Addr){.base = CTX, .imm = __builtin_offsetof(EngineCtx, fp_top)});
+        } else if (m == 0xFF) {
+            emit_store_cached_d(29, S0);
+            ldst(0, 4, S3, (Addr){.base = CTX, .imm = __builtin_offsetof(EngineCtx, fp_top)});
+        } else {
+            // FSINCOS: store sin in ST(0), push cos onto new ST(0) (updates fp_top/sw)
+            emit_store_cached_d(V_S2, S0);
+            fmov_x_d(S0, 29);
+            emit_push_cached_x64(S0, &sl);
+        }
+        u32 *done = tr_cc;
+        b_rel(0);
+        patch_slow(&sl);
+        call_monitor(in);
+        patch_b(done);
+        return true;
+    }
+
     // D9 FA (FSQRT) / D9 FC (FRNDINT)
     if (esc == 1 && (m == 0xFA || m == 0xFC)) {
         SlowList sl = {.n = 0};
