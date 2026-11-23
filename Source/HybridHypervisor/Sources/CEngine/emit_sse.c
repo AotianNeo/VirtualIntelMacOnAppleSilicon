@@ -28,11 +28,13 @@ static void align16(int r) {
 }
 
 static Addr mem16(const Insn *in, bool check) {
+    if (!check || !tr_precise_flags)
+        return addr_prepare(in, 16);
     int r = addr_reg(in);
     // RIP-relative addresses without FS/GS have known low bits. Address-size
     // truncation preserves them, so an aligned constant cannot take #GP here.
     bool aligned_constant = in->riprel && !in->seg && !((in->next + (u64)in->disp) & 15);
-    if (check && !aligned_constant)
+    if (!aligned_constant)
         align16(r);
     Addr a = {.base = r};
     return a;
@@ -110,7 +112,7 @@ static void emit_cmp_pred(const Insn *in) {
     u32 sz = isd ? 1u << 22 : 0;
     u32 eq = (kind == 4 ? 0x4E20E400u : 0x5E20E400u) | sz, ge = (kind == 4 ? 0x6E20E400u : 0x7E20E400u) | sz,
         gt = (kind == 4 ? 0x6EA0E400u : 0x7EA0E400u) | sz;
-    int t = V_S0;
+    int t = (kind == 4 && pred != 3 && pred != 7) ? d : V_S0;
     switch (pred) {
         case 0:
             RRR(eq, t, d, s);
@@ -142,9 +144,10 @@ static void emit_cmp_pred(const Insn *in) {
             E(0x6E205800u | t << 5 | t);
             break;
     }
-    if (kind == 4)
-        vmov(d, t);
-    else
+    if (kind == 4) {
+        if (t != d)
+            vmov(d, t);
+    } else
         ins_elem(d, 0, t, 0, kind == 2 ? 4 : 8);
 }
 
@@ -198,13 +201,54 @@ static void pack(const Insn *in, u32 base, u32 base2) {
     vmov(d, V_S0);
 }
 
+static void emit_lanes32(int d, int src1, int src2, int imm) {
+    imm &= 0xff;
+    if (src1 == src2) {
+        if (imm == 0xE4) {
+            vmov(d, src1);
+            return;
+        }
+        if (imm == 0x00 || imm == 0x55 || imm == 0xAA || imm == 0xFF) {
+            int k = imm & 3;
+            E(0x4E040400u | (u32)k << 19 | (u32)src1 << 5 | (u32)d); // dup v.4s, vn.s[k]
+            return;
+        }
+        if (imm == 0x4E) {
+            E(0x6E004000u | (u32)src1 << 16 | (u32)src1 << 5 | (u32)d); // ext v.16b, vn, vn, #8
+            return;
+        }
+        if (imm == 0xB1) {
+            RR(0x4EA00800u, d, src1); // rev64 v.4s, vn.4s
+            return;
+        }
+    }
+    if (imm == 0x44) {
+        RRR(0x4EC03800u, d, src1, src2); // zip1 v.2d, vsrc1.2d, vsrc2.2d
+        return;
+    }
+    if (imm == 0xEE) {
+        RRR(0x4EC07800u, d, src1, src2); // zip2 v.2d, vsrc1.2d, vsrc2.2d
+        return;
+    }
+    if (imm == 0x88) {
+        RRR(0x4E801800u, d, src1, src2); // uzp1 v.4s, vsrc1.4s, vsrc2.4s
+        return;
+    }
+    if (imm == 0xDD) {
+        RRR(0x4E805800u, d, src1, src2); // uzp2 v.4s, vsrc1.4s, vsrc2.4s
+        return;
+    }
+    int tmp = (d != src1 && d != src2) ? d : V_S0;
+    ins_elem(tmp, 0, src1, imm & 3, 4);
+    ins_elem(tmp, 1, src1, (imm >> 2) & 3, 4);
+    ins_elem(tmp, 2, src2, (imm >> 4) & 3, 4);
+    ins_elem(tmp, 3, src2, (imm >> 6) & 3, 4);
+    if (tmp != d)
+        vmov(d, tmp);
+}
+
 static void lanes32(const Insn *in, int src1, int src2) {
-    int imm = (int)in->imm;
-    ins_elem(V_S0, 0, src1, imm & 3, 4);
-    ins_elem(V_S0, 1, src1, (imm >> 2) & 3, 4);
-    ins_elem(V_S0, 2, src2, (imm >> 4) & 3, 4);
-    ins_elem(V_S0, 3, src2, (imm >> 6) & 3, 4);
-    vmov(in->reg, V_S0);
+    emit_lanes32(in->reg, src1, src2, (int)in->imm);
 }
 
 // pmovmskb, movmskps and movmskpd: gather sign bits through a multiply, no NZCV.
@@ -561,11 +605,13 @@ static void mm_ldst(bool load, int v, int mm) {
 }
 // TOP cleared and every tag valid; emms empties every tag and leaves TOP.
 static void mmx_enter(void) {
+    ldst(0, 8, XZR, (Addr){.base = CTX, .imm = __builtin_offsetof(EngineCtx, fp_d_valid)});
     Addr a = {.base = CTX, .imm = __builtin_offsetof(EngineCtx, fp_top)};
     movimm(S1, 0xFF00);
     ldst(0, 2, S1, a);
 }
 static void mmx_emms(void) {
+    ldst(0, 8, XZR, (Addr){.base = CTX, .imm = __builtin_offsetof(EngineCtx, fp_d_valid)});
     Addr a = {.base = CTX, .imm = __builtin_offsetof(EngineCtx, fp_tags)};
     ldst(0, 1, XZR, a);
 }
@@ -819,13 +865,20 @@ void emit_sse(const Insn *in, int live) {
             }
             bool x = in->sz == 8, isd = pfx == 0xF2;
             int s = src_op(in, isd ? 3 : 2, false);
+            if (!tr_precise_flags) {
+                // Avoid ARMv8.5 FRINT32Z/FRINT32X (which incurs a heavy trap/slowpath under HVF):
+                // CVTT* truncates directly via FCVTZS; CVT* rounds per FPCR.RMode via FRINTI then FCVTZS.
+                if (opc == 0x2C) {
+                    RR((x ? 0x9E380000u : 0x1E380000u) | (isd ? 1u << 22 : 0), d, s);
+                } else {
+                    RR((isd ? 0x1E67C000u : 0x1E27C000u), V_S0, s); // frinti
+                    RR((x ? 0x9E380000u : 0x1E380000u) | (isd ? 1u << 22 : 0), d, V_S0);
+                }
+                break;
+            }
             u32 frint = (opc == 0x2C ? (x ? 0x1E294000u : 0x1E284000u) : (x ? 0x1E29C000u : 0x1E28C000u)) | (isd ? 1u << 22 : 0);
             RR(frint, V_S0, s);
-            RR((x ? 0x9E380000u : 0x1E380000u) | (isd ? 1u << 22 : 0), S0, V_S0);
-            if (x)
-                mov_reg(1, d, S0);
-            else
-                mov_reg(0, d, S0);
+            RR((x ? 0x9E380000u : 0x1E380000u) | (isd ? 1u << 22 : 0), d, V_S0);
             break;
         }
         case 0x2E:
@@ -878,13 +931,42 @@ void emit_sse(const Insn *in, int live) {
         }
         case 0x52:
         case 0x53: {
-            // What TCG computes, Intel's tables being reproduced nowhere here: 1/x and 1/sqrt(x) exact, with the MXCSR flags left as they were.
             if (pfx != 0 && pfx != 0xF3) {
                 svc(SVC_UD);
                 break;
             }
             bool scalar = pfx == 0xF3;
             int s = src_op(in, scalar ? 2 : 4, !scalar);
+            if (!tr_precise_flags) {
+                // Fast hardware FRSQRTE/FRECPE + 1 Newton-Raphson step (>14-bit accuracy, exceeds Intel's 12-bit spec)
+                // without serializing MRS/MSR FPSR stalls.
+                if (scalar) {
+                    if (opc == 0x52) {
+                        RR(0x7EA1D800u, V_S0, s);          // frsqrte s24, s
+                        RRR(0x1E200800u, V_S1, V_S0, V_S0); // fmul s25, s24, s24
+                        RRR(0x5EA0FC00u, V_S1, s, V_S1);   // frsqrts s25, s, s25
+                        RRR(0x1E200800u, tr_fpcr_merges_scalar ? d : V_S2, V_S0, V_S1);
+                        if (!tr_fpcr_merges_scalar)
+                            ins_elem(d, 0, V_S2, 0, 4);
+                    } else {
+                        RR(0x5EA1D800u, V_S0, s);          // frecpe s24, s
+                        RRR(0x5E20FC00u, V_S1, s, V_S0);   // frecps s25, s, s24
+                        RRR(0x1E200800u, tr_fpcr_merges_scalar ? d : V_S2, V_S0, V_S1);
+                        if (!tr_fpcr_merges_scalar)
+                            ins_elem(d, 0, V_S2, 0, 4);
+                    }
+                } else if (opc == 0x52) {
+                    RR(0x6EA1D800u, V_S0, s);              // frsqrte v24.4s, s.4s
+                    RRR(0x6E20DC00u, V_S1, V_S0, V_S0);    // fmul v25.4s, v24.4s, v24.4s
+                    RRR(0x4EA0FC00u, V_S1, s, V_S1);       // frsqrts v25.4s, s.4s, v25.4s
+                    RRR(0x6E20DC00u, d, V_S0, V_S1);       // fmul d.4s, v24.4s, v25.4s
+                } else {
+                    RR(0x4EA1D800u, V_S0, s);              // frecpe v24.4s, s.4s
+                    RRR(0x4E20FC00u, V_S1, s, V_S0);       // frecps v25.4s, s.4s, v24.4s
+                    RRR(0x6E20DC00u, d, V_S0, V_S1);       // fmul d.4s, v24.4s, v25.4s
+                }
+                break;
+            }
             E(0xD53B4420u | S0); // mrs x, fpsr
             E(0x4F03F600u | V_S1); // fmov v.4s, #1.0
             if (scalar) {
@@ -945,7 +1027,14 @@ void emit_sse(const Insn *in, int live) {
             int s = src_op(in, 4, true);
             if (pfx == 0)
                 RR(0x4E21D800u, d, s);
-            else {
+            else if (!tr_precise_flags) {
+                if (pfx == 0xF3) {
+                    RR(0x4EA1B800u, d, s); // fcvtzs .4s
+                } else {
+                    RR(0x6EA19800u, V_S0, s); // frinti .4s
+                    RR(0x4EA1B800u, d, V_S0); // fcvtzs .4s
+                }
+            } else {
                 RR(pfx == 0x66 ? 0x6E21E800u : 0x4E21E800u, V_S0, s); // frint32x, frint32z
                 RR(0x4EA1B800u, d, V_S0); // fcvtzs
             }
@@ -1058,8 +1147,8 @@ void emit_sse(const Insn *in, int live) {
             }
             int s = src_op(in, 4, true), imm = (int)in->imm;
             if (pfx == 0x66) {
-                for (int i = 0; i < 4; i++)
-                    ins_elem(V_S0, i, s, (imm >> (2 * i)) & 3, 4);
+                emit_lanes32(d, s, s, imm);
+                break;
             } else {
                 int base = pfx == 0xF3 ? 4 : 0;
                 ins_elem(V_S0, pfx == 0xF3 ? 0 : 1, s, pfx == 0xF3 ? 0 : 1, 8);
@@ -1152,9 +1241,15 @@ void emit_sse(const Insn *in, int live) {
             if (pfx == 0)
                 lanes32(in, d, s);
             else {
-                ins_elem(V_S0, 0, d, (int)in->imm & 1, 8);
-                ins_elem(V_S0, 1, s, ((int)in->imm >> 1) & 1, 8);
-                vmov(d, V_S0);
+                int imm = (int)in->imm & 3;
+                if (imm == 0)
+                    RRR(0x4EC03800u, d, d, s); // zip1 .2d
+                else if (imm == 3)
+                    RRR(0x4EC07800u, d, d, s); // zip2 .2d
+                else if (imm == 1)
+                    E(0x6E004000u | (u32)s << 16 | (u32)d << 5 | (u32)d); // ext .16b, d, s, #8
+                else
+                    ins_elem(d, 1, s, 1, 8);
             }
             break;
         }
@@ -1212,9 +1307,19 @@ void emit_sse(const Insn *in, int live) {
                 RR(0x4E61D800u, d, V_S0);
             } else if (pfx == 0x66 || pfx == 0xF2) {
                 int s = src_op(in, 4, true);
-                RR(pfx == 0x66 ? 0x4E61E800u : 0x6E61E800u, V_S0, s); // frint32z, frint32x
-                RR(0x4EE1B800u, V_S0, V_S0); // fcvtzs .2d
-                RR(0x0EA12800u, d, V_S0); // xtn
+                if (!tr_precise_flags) {
+                    if (pfx == 0x66) {
+                        RR(0x4EE1B800u, V_S0, s); // fcvtzs .2d
+                    } else {
+                        RR(0x6EE19800u, V_S0, s); // frinti .2d
+                        RR(0x4EE1B800u, V_S0, V_S0); // fcvtzs .2d
+                    }
+                    RR(0x0EA12800u, d, V_S0); // xtn
+                } else {
+                    RR(pfx == 0x66 ? 0x4E61E800u : 0x6E61E800u, V_S0, s); // frint32z, frint32x
+                    RR(0x4EE1B800u, V_S0, V_S0); // fcvtzs .2d
+                    RR(0x0EA12800u, d, V_S0); // xtn
+                }
             } else
                 svc(SVC_UD);
             break;
