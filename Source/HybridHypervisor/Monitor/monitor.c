@@ -91,33 +91,36 @@ _Static_assert(OFF_RSTACKS + MAX_VCPUS * MAX_VIEWS * RSTACK_SLOT <= PRIV_SIZE, "
 // overtaking the compositor's vCPU during cold translation/page-table bursts.
 // At most MAX_VCPUS tickets are outstanding, so equality remains valid across
 // u32 wrap. Reentrance and abandoned-stack release consume only the outer ticket.
-static u32 mon_next_ticket, mon_serving_ticket;
+static u32 mon_lock_word __attribute__((aligned(64)));
 static inline void hostcall(u64 code);
 #define smp (c0->vcpu_count > 1)
 static inline void mon_lock(void) {
     if (!smp || me->lock_depth++)
         return;
-    u64 waiting_from = 0;
-    u32 ticket = __atomic_fetch_add(&mon_next_ticket, 1, __ATOMIC_RELAXED);
+    if (__builtin_expect(__atomic_exchange_n(&mon_lock_word, 1, __ATOMIC_ACQUIRE) == 0, 1)) {
+        me->lock_from = RSR(cntvct_el0);
+        me->lock_site = 0;
+        return;
+    }
+    u64 waiting_from = RSR(cntvct_el0);
     for (u32 spins = 1;; spins++) {
-        if (__atomic_load_n(&mon_serving_ticket, __ATOMIC_ACQUIRE) == ticket) {
-            if (waiting_from)
-                __atomic_fetch_add(&c0->stat_mon_wait, RSR(cntvct_el0) - waiting_from, __ATOMIC_RELAXED); // all vCPUs' time, for the tally
+        // Test-and-Test-and-Set avoids ticket-lock preemption convoys on 16 vCPUs when a waiter yields to macOS.
+        if (__atomic_load_n(&mon_lock_word, __ATOMIC_RELAXED) == 0 &&
+            __atomic_exchange_n(&mon_lock_word, 1, __ATOMIC_ACQUIRE) == 0) {
+            __atomic_fetch_add(&c0->stat_mon_wait, RSR(cntvct_el0) - waiting_from, __ATOMIC_RELAXED);
             me->lock_from = RSR(cntvct_el0);
             me->lock_site = 0;
             return;
         }
-        if (!waiting_from)
-            waiting_from = RSR(cntvct_el0);
         __asm__ volatile("yield");
-        if (!(spins & 0x3FFF)) // a long wait: the holder's thread may have lost its core, and with more vCPUs than free cores, spinning here is what keeps it off
+        if (!(spins & 0xFFFF))
             hostcall(HC_YIELD);
     }
 }
 static inline void mon_unlock(void) {
     if (smp && me->lock_depth && !--me->lock_depth) {
         __atomic_fetch_add(&c0->stat_mon_hold[me->lock_site], RSR(cntvct_el0) - me->lock_from, __ATOMIC_RELAXED);
-        __atomic_fetch_add(&mon_serving_ticket, 1, __ATOMIC_RELEASE);
+        __atomic_store_n(&mon_lock_word, 0, __ATOMIC_RELEASE);
     }
 }
 // The shadow pool and its lists go wrong silently without the lock, and show up much later as a loop that nothing can report.
@@ -129,7 +132,7 @@ static inline void mon_unlock(void) {
 static inline void mon_unlock_all(void) {
     if (smp && me->lock_depth) {
         me->lock_depth = 0;
-        __atomic_fetch_add(&mon_serving_ticket, 1, __ATOMIC_RELEASE);
+        __atomic_store_n(&mon_lock_word, 0, __ATOMIC_RELEASE);
     }
 }
 // Bumped when blocks die, so that every other vCPU drops its return stacks at its next way out of the monitor, which any x86 serialising event or interrupt passes through.
