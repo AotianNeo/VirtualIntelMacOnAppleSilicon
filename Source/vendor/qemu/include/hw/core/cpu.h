@@ -582,6 +582,9 @@ struct CPUState {
     /* Used for user-only emulation of prctl(PR_SET_UNALIGN). */
     bool prctl_unalign_sigbus;
 
+    /* True while the vCPU is executing inside the HVDBT engine (not TCG). */
+    bool hvdbt_active;
+
     /* track IOMMUs whose translations we've cached in the TCG TLB */
     GArray *iommu_notifiers;
 

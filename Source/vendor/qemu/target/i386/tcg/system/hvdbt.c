@@ -360,8 +360,9 @@ static bool hvdbt_has_interrupt(void *opaque)
     CPUState *cs = opaque;
     bool hard;
 
-    if (!cpu_test_interrupt(cs, CPU_INTERRUPT_POLL | CPU_INTERRUPT_HARD | OTHER_INTERRUPTS)) { /* most kicks: not worth waiting for the BQL to learn it */
-        return false;
+    if (!cpu_test_interrupt(cs, CPU_INTERRUPT_POLL | OTHER_INTERRUPTS)) {
+        /* Most interrupts are already latched in CPU_INTERRUPT_HARD; avoid taking BQL just to read it. */
+        return cpu_test_interrupt(cs, CPU_INTERRUPT_HARD);
     }
     bql_lock();
     if (cpu_test_interrupt(cs, CPU_INTERRUPT_POLL)) { /* what the IO-APIC raises from another thread, as x86_cpu_exec_interrupt handles it */
@@ -1003,6 +1004,7 @@ static bool hvdbt_want_engine(CPUState *cs, vaddr pc, uint32_t flags)
 
 static void hvdbt_finish(CPUState *cs)
 {
+    qatomic_set(&cs->hvdbt_active, false);
     hv.dead = true;
     cpu_dump_state(cs, stderr, CPU_DUMP_CODE | CPU_DUMP_CCOP);
     hvdbt_write_tally_at_exit();
@@ -1105,6 +1107,7 @@ static void hvdbt_run(CPUState *cs)
     }
     hvdbt_protect_written(cpu);
     qatomic_set_mb(&cpu->in_engine, true);
+    qatomic_set(&cs->hvdbt_active, true);
     if (!cpu_can_run(cs) || !cpu_work_list_empty(cs)) {
         qatomic_set(&cpu->in_engine, false);
         return;

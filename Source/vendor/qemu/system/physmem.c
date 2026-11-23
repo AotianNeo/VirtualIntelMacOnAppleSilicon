@@ -3112,6 +3112,9 @@ static void tcg_log_global_after_sync(MemoryListener *listener)
          * record/replay is enabled.
          */
         cpuas = container_of(listener, CPUAddressSpace, tcg_as_listener);
+        if (qatomic_read(&cpuas->cpu->hvdbt_active)) {
+            return;
+        }
         run_on_cpu(cpuas->cpu, do_nothing, RUN_ON_CPU_NULL);
     }
 }
