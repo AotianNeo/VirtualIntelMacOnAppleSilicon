@@ -3,6 +3,24 @@
 #include "engine_api.h"
 #include "tr_internal.h"
 
+u16 tr_aes_mask;
+u8 tr_aes_key[16];
+
+static inline void sse_aes_flush_one(int r) {
+    if (tr_aes_mask & (1u << r)) {
+        E(0x6E201C00u | (u32)tr_aes_key[r] << 16 | (u32)r << 5 | (u32)r); // eor vr.16b, vr.16b, vk.16b
+        tr_aes_mask &= (u16)~(1u << r);
+    }
+}
+
+void sse_aes_flush_all(void) {
+    u16 m = tr_aes_mask;
+    tr_aes_mask = 0;
+    for (int r = 0; m; r++, m >>= 1)
+        if (m & 1)
+            E(0x6E201C00u | (u32)tr_aes_key[r] << 16 | (u32)r << 5 | (u32)r);
+}
+
 // kind: 2 s, 3 d, 4 q
 static void vldst(int kind, bool load, int rt, Addr a) {
     u32 size = kind == 4 ? 0 : (u32)kind;
@@ -577,14 +595,49 @@ static void emit_sse41(const Insn *in, int live) {
         case 0xDC:
         case 0xDD:
         case 0xDE:
-        case 0xDF: { // the x86 forms xor the round key last, the ARM ones first: give ARM a zero key
+        case 0xDF: { // x86 xors round key last, ARM first: fuse deferred register round key into next AESE/AESD (2 insns/round)
             bool dec = opc >= 0xDE, last = opc & 1;
-            E(0x6E201C00u | V_S0 << 16 | V_S0 << 5 | V_S0);
-            vmov(V_S1, d);
-            RR(dec ? 0x4E285800u : 0x4E284800u, V_S1, V_S0);
+            if (in->rm_reg && s != d) {
+                sse_aes_flush_one(s);
+                for (int r = 0; r < 16; r++)
+                    if (r != d && (tr_aes_mask & (1u << r)) && tr_aes_key[r] == d)
+                        sse_aes_flush_one(r);
+                if (tr_aes_mask & (1u << d)) {
+                    int kprev = tr_aes_key[d];
+                    tr_aes_mask &= (u16)~(1u << d);
+                    RR(dec ? 0x4E285800u : 0x4E284800u, d, kprev);
+                } else {
+                    E(0x4F00E400u | V_S0); // movi v24.16b, #0
+                    RR(dec ? 0x4E285800u : 0x4E284800u, d, V_S0);
+                }
+                if (!last) {
+                    RR(dec ? 0x4E287800u : 0x4E286800u, d, d);
+                    tr_aes_key[d] = (u8)s;
+                    tr_aes_mask |= (u16)(1u << d);
+                } else {
+                    RRR(0x6E201C00u, d, d, s);
+                }
+                return;
+            }
+            for (int r = 0; r < 16; r++)
+                if (r != d && (tr_aes_mask & (1u << r)) && tr_aes_key[r] == d)
+                    sse_aes_flush_one(r);
+            int tmp = (s == d) ? V_S1 : d;
+            if (s == d)
+                sse_aes_flush_one(d);
+            if (tmp != d)
+                vmov(tmp, d);
+            if (tr_aes_mask & (1u << d)) {
+                int kprev = tr_aes_key[d];
+                tr_aes_mask &= (u16)~(1u << d);
+                RR(dec ? 0x4E285800u : 0x4E284800u, tmp, kprev);
+            } else {
+                E(0x4F00E400u | V_S0); // movi v24.16b, #0
+                RR(dec ? 0x4E285800u : 0x4E284800u, tmp, V_S0);
+            }
             if (!last)
-                RR(dec ? 0x4E287800u : 0x4E286800u, V_S1, V_S1);
-            RRR(0x6E201C00u, d, V_S1, s);
+                RR(dec ? 0x4E287800u : 0x4E286800u, tmp, tmp);
+            RRR(0x6E201C00u, d, tmp, s);
             return;
         }
     }
@@ -722,6 +775,21 @@ static void emit_mmx(const Insn *in, int live) {
 
 void emit_sse(const Insn *in, int live) {
     int opc = in->opc, pfx = in->pfx, d = in->reg;
+    if (tr_aes_mask) {
+        bool is_aes_round = (in->op == OP_SSE && in->sub == 3 && opc >= 0xDC && opc <= 0xDF);
+        if (!is_aes_round) {
+            bool is_xmm_load = (!tr_precise_flags && in->op == OP_SSE && in->sub == 0 && !in->rm_reg &&
+                                (opc == 0x6F || opc == 0x28 || opc == 0x10));
+            if (is_xmm_load) {
+                sse_aes_flush_one(d);
+                for (int r = 0; r < 16; r++)
+                    if ((tr_aes_mask & (1u << r)) && tr_aes_key[r] == d)
+                        sse_aes_flush_one(r);
+            } else {
+                sse_aes_flush_all();
+            }
+        }
+    }
     if (in->op == OP_SSE && in->sub >= 3) {
         emit_sse41(in, live);
         return;

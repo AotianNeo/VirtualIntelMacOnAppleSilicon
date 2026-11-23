@@ -160,6 +160,9 @@ extern u32 *tr_cc; // write cursor
 extern bool tr_precise_flags, tr_has_tzcnt, tr_hybrid, tr_no_bulk_rep;
 extern bool tr_fpcr_merges_scalar;
 extern u64 tr_ad_page;
+extern u16 tr_aes_mask;
+extern u8 tr_aes_key[16];
+void sse_aes_flush_all(void);
 extern bool tr_profile_shift_helpers;
 extern bool tr_inline_shr8;
 extern bool tr_page_rep;

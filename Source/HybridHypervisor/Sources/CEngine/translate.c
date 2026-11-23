@@ -991,6 +991,7 @@ static TrResult do_translate(int key, int view, u64 cr3, int cpl, u64 rip, bool 
     pend_count = 0;
     fwd_count = 0;
     tr_ad_page = ~0ULL;
+    tr_aes_mask = 0;
     u32 *start = tr_cc;
     if (ctx_ptr->vcpu_count > 1) // a kill patches the entry word under peers running it: nop to svc is a change the architecture allows, an arbitrary word isn't
         E(0xD503201Fu);
@@ -1002,11 +1003,16 @@ static TrResult do_translate(int key, int view, u64 cr3, int cpl, u64 rip, bool 
             int jop = list[j].op;
             if ((jop == OP_JCC || jop == OP_JRCXZ || jop == OP_JMP) && list[j].target == in->rip) {
                 tr_ad_page = ~0ULL;
+                if (tr_aes_mask)
+                    sse_aes_flush_all();
                 break;
             }
         }
-        if (in->op != OP_SSE)
+        if (in->op != OP_SSE) {
             tr_ad_page = ~0ULL;
+            if (tr_aes_mask)
+                sse_aes_flush_all();
+        }
         insn_arm[i] = tr_cc;
         if (i)
             stats.op_words[list[i - 1].op & 127] += (u64)(tr_cc - insn_arm[i - 1]);
@@ -1099,6 +1105,8 @@ static TrResult do_translate(int key, int view, u64 cr3, int cpl, u64 rip, bool 
                 break;
         }
     }
+    if (tr_aes_mask)
+        sse_aes_flush_all();
     for (int i = 0; i < fwd_count; i++)
         fix(fwd_fix[i].site, fwd_fix[i].form, insn_arm[fwd_fix[i].target_idx]);
     u32 *tail = tr_cc;
