@@ -28,6 +28,7 @@ final class CMachine: EngineMachine {
     func waitForInterrupt(deadlineNanos: UInt64) -> Bool { ops.wait_for_interrupt(ops.opaque, deadlineNanos) }
     func apicEOI(vector: UInt8) { ops.apic_eoi(ops.opaque, vector) }
     func apicICR(_ icr: UInt64) { ops.apic_icr(ops.opaque, icr) }
+    func apicTPR(_ tpr: UInt8) { ops.apic_tpr?(ops.opaque, tpr) }
     func syscall(_ state: UnsafeMutablePointer<EngineCtx>, engine: Engine) throws {
         throw EngineError.stop("syscall with no shim: the C API is the kernel model")
     }
@@ -177,6 +178,17 @@ public func engine_note_write(_ h: OpaquePointer, _ gpa: UInt64, _ bytes: UInt64
 @_cdecl("engine_set_irq_line")
 public func engine_set_irq_line(_ h: OpaquePointer, _ level: Bool) { engine_ctx_set_irq_line(handle(h).engine.ctx, level) }
 
+@_cdecl("engine_apic_shared_ptrs")
+public func engine_apic_shared_ptrs(
+    _ h: OpaquePointer,
+    _ tprOut: UnsafeMutablePointer<UnsafeMutablePointer<UInt32>?>,
+    _ irrPrioOut: UnsafeMutablePointer<UnsafeMutablePointer<UInt32>?>
+) {
+    let raw = UnsafeMutableRawPointer(handle(h).engine.ctx)
+    tprOut.pointee = (raw + MemoryLayout<EngineCtx>.offset(of: \.apic_tpr)!).assumingMemoryBound(to: UInt32.self)
+    irrPrioOut.pointee = (raw + MemoryLayout<EngineCtx>.offset(of: \.apic_irr_prio)!).assumingMemoryBound(to: UInt32.self)
+}
+
 @_cdecl("engine_set_tsc")
 public func engine_set_tsc(_ h: OpaquePointer, _ nsOffset: UInt64, _ tscOffset: UInt64, _ num: UInt64, _ den: UInt64) {
     handle(h).engine.setTSC(nsOffset: nsOffset, tscOffset: tscOffset, num: num, den: den)
@@ -236,6 +248,9 @@ public func engine_request_exit(_ h: OpaquePointer) { handle(h).engine.requestSt
 
 @_cdecl("engine_request_boundary")
 public func engine_request_boundary(_ h: OpaquePointer) { handle(h).engine.requestBoundary() }
+
+@_cdecl("engine_request_boundary_local")
+public func engine_request_boundary_local(_ h: OpaquePointer) { handle(h).engine.requestBoundaryLocal() }
 
 @_cdecl("engine_kick")
 public func engine_kick(_ h: OpaquePointer) { handle(h).engine.interruptRequested() }
@@ -307,6 +322,7 @@ extension Engine {
         s.hybrid_apic_page = c.pointee.hybrid_apic_page
         s.hybrid_icr_lo = c.pointee.apic_icr_lo
         s.hybrid_icr_hi = c.pointee.apic_icr_hi
+        s.hybrid_tpr = c.pointee.apic_tpr
         s.irq_shadow = s.rip == c.pointee.irq_shadow_rip ? 1 : 0
         s.compat = c.pointee.compat
         s.seg_bad = c.pointee.seg_bad
@@ -354,6 +370,7 @@ extension Engine {
         c.pointee.hybrid_apic_page = s.hybrid_apic_page
         c.pointee.apic_icr_lo = s.hybrid_icr_lo
         c.pointee.apic_icr_hi = s.hybrid_icr_hi
+        c.pointee.apic_tpr = s.hybrid_tpr
         c.pointee.resume_mxcsr = s.mxcsr
         writeXMM(from: s)
         c.pointee.mm = s.mm

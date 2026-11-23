@@ -32,9 +32,9 @@
 #define OFF_CC (6ULL << 20) // EL0 execute-only, EL1 rw: translated code
 #define CC_SIZE (118ULL << 20)
 #define OFF_CTX (124ULL << 20) // EL0 rw: one EngineCtx per vCPU, CTX_SLOT apart. x18 holds this vCPU's
-#define MAX_VCPUS 8
+#define MAX_VCPUS 16
 #define CTX_SLOT (64ULL << 10)
-#define OFF_MON_CPU (OFF_MON_DATA + (3ULL << 19)) // EL1 rw: per vCPU, CTX_SLOT apart too, the monitor's own state and stack
+#define OFF_MON_CPU (OFF_MON_DATA + (1ULL << 20)) // EL1 rw: per vCPU, CTX_SLOT apart too, the monitor's own state and stack
 #define OFF_CTX_END (126ULL << 20)
 #define OFF_HASH (1024ULL << 20) // EL0 ro, per view: indirect-branch table
 #define HASH_ENTRIES (1ULL << 16)
@@ -139,6 +139,8 @@ enum {
     SVC_STR, // result x16
     SVC_LLDT,
     SVC_SLDT,
+    SVC_VERR, // x16 selector, updates ZF in SPSR
+    SVC_VERW, // x16 selector, updates ZF in SPSR
     SVC_MOV_SEG_WRITE, // x16 segment index, x17 selector
     SVC_MOV_SEG_READ, // x16 segment index, result x16
     SVC_IN, // x16 port, x17 size, result x16
@@ -163,6 +165,7 @@ enum {
     SVC_H_PCMPISTRI, // x16, x17 the first operand, x22, x23 the second, x24 imm8. x16 the index, x22 to x24 flags as data
     SVC_H_RMWFLAGS_UNUSED,
     SVC_REP_PAGE = 71, // internal only: exact page-REP stub head; x17=32/element bytes
+    SVC_LSL = 72, // x16 selector, returns 32-bit limit in x16 and updates ZF in SPSR
 };
 
 // Opt-in metadata for SVC_H_SHIFT only. The semantic kind is bits 0..2 and
@@ -200,6 +203,7 @@ enum {
     HC_VIEW_FORGET, // a[0] view: empty its lookup table, as a slot above a shared directory changed
     HC_CALL_TAIL, // a[0] a cross-key call/jump site, a[1] its x86 target: use a view lookup without repeatedly entering the monitor
     HC_CODE_FETCH_RETRY, // a[0] ARM pc, a[1] x86 block entry or 0, a[2] this vCPU's retry count (only the first few are reported)
+    HC_APIC_TPR, // a[0] new TPR (bits 7:4): hybrid mode fast-path for CR8/TPR writes without TCG fallback
 };
 
 // Stop reasons for HC_STOP.
@@ -319,7 +323,7 @@ typedef struct {
     uint32_t clts_on_host;
     uint64_t tsc_ns_offset, tsc_num, tsc_den; // TSC = ns + ns * num / den + tsc_offset; see tsc_counter_offset below.
     // Frames written behind the monitor's back (DMA, TCG), holding code or page tables. Many producers, consumed in the monitor.
-    uint32_t note_head, note_tail, note_overflow, pad4;
+    uint32_t note_head, note_tail, note_overflow, apic_irr_prio;
     uint32_t note_ring[256]; // frame + 1
     uint64_t stat_note_code, stat_note_pt, stat_nm, stat_pt_stale, stat_links_here, stat_stack_deepest;
     uint64_t stat_vector[256], vector_last_rip[256], vector_last_err[256], vector_last_cr3[256]; // every delivery, software int and #GP included
@@ -370,6 +374,10 @@ typedef struct {
     // cores only this vCPU's own ISB discards instructions fetched before that write.
     uint64_t code_gen __attribute__((aligned(8)));
     uint64_t code_synced;
+    // Extreme Fast x87 shadow IEEE-754 double cache: bit p of fp_d_valid means fp_d[p] is authoritative.
+    // Lazy-flushed back to mm[p]/fp_exp[p] on SVC_X87, FXSAVE, HC_FALLBACK, and HC_BOUNDARY.
+    uint64_t fp_d_valid;
+    uint64_t fp_d[8];
 } EngineCtx;
 _Static_assert(sizeof(EngineCtx) <= CTX_SLOT, "EngineCtx must fit its existing per-vCPU slot");
 // Monitor/vectors.s reads these two from x18 with fixed offsets.

@@ -32,6 +32,8 @@ typedef struct {
     void (*apic_eoi)(void *opaque, uint8_t vector);
     // An IPI the local APIC cannot finish alone: other CPUs, INIT, SIPI. Raw ICR value, high word in bits 63:32.
     void (*apic_icr)(void *opaque, uint64_t icr);
+    // Hybrid: CR8/TPR update forwarded directly to QEMU's APIC without a TCG fallback.
+    void (*apic_tpr)(void *opaque, uint8_t tpr);
 } EngineMachineOps;
 
 typedef struct {
@@ -83,6 +85,7 @@ typedef struct {
     // Hybrid: the APIC is QEMU's, but the monitor answers for ICR, so that an IPI takes one exit. hybrid_apic_page: 0 if the APIC is off.
     uint64_t hybrid_apic_page;
     uint32_t hybrid_icr_lo, hybrid_icr_hi;
+    uint32_t hybrid_tpr;
     uint32_t irq_shadow; // the returned RIP is still protected by STI or MOV SS
 } EngineX86State;
 
@@ -117,6 +120,7 @@ void engine_request_exit(EngineHandle *engine);
 
 // Any thread.
 void engine_request_boundary(EngineHandle *engine); // kick: engine_run returns ENGINE_RUN_BOUNDARY at the next x86 boundary
+void engine_request_boundary_local(EngineHandle *engine); // same-thread hostcall: set stop_requested without self-canceling hv_vcpu_run
 void engine_kick(EngineHandle *engine); // look at has_interrupt_waiting and pending vectors
 void engine_post_vector(EngineHandle *engine, uint8_t vector, bool level);
 // Guest RAM was written other than by this engine (DMA, TCG): drop what depends on it. Translations and shadow tables are gone before the next
@@ -124,6 +128,8 @@ void engine_post_vector(EngineHandle *engine, uint8_t vector, bool level);
 void engine_note_write(EngineHandle *engine, uint64_t gpa, uint64_t bytes);
 // Hybrid: an interrupt may be waiting. The monitor asks acknowledge_interrupt once IF allows.
 void engine_set_irq_line(EngineHandle *engine, bool level);
+// Hybrid: shared pointers to ctx->apic_tpr and ctx->apic_irr_prio for zero-exit CR8/TPR sync.
+void engine_apic_shared_ptrs(EngineHandle *engine, uint32_t **tpr_out, uint32_t **irr_prio_out);
 
 // While stopped. The guest's TSC in QEMU's terms: ns is the host's uptime clock plus ns_offset, TSC = ns + ns * num / den + tsc_offset.
 void engine_set_tsc(EngineHandle *engine, uint64_t ns_offset, uint64_t tsc_offset, uint64_t num, uint64_t den);

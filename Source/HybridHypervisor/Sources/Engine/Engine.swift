@@ -20,6 +20,8 @@ public protocol EngineMachine: AnyObject {
     func apicEOI(vector: UInt8)
     /// An IPI the local APIC model cannot finish alone. High word in bits 63:32.
     func apicICR(_ icr: UInt64)
+    /// Hybrid: CR8/TPR update forwarded directly to QEMU's APIC.
+    func apicTPR(_ tpr: UInt8)
     /// True when an interrupt wants delivering; the engine then raises the guest's IRQ line on the vCPU thread.
     func hasInterruptWaiting() -> Bool
     /// End this run at a host-visible boundary, including a completed HLT.
@@ -31,6 +33,7 @@ public protocol EngineMachine: AnyObject {
 
 extension EngineMachine {
     public var shouldStopRun: Bool { false }
+    public func apicTPR(_ tpr: UInt8) {}
 }
 
 public struct EngineOptions {
@@ -340,7 +343,7 @@ public final class Engine {
             gb += 1 << 30
         }
         // Handed to the monitor: the root-level descriptors of its private slots.
-        let handoff = (priv + Int(kOffMonData) + (1 << 20)).assumingMemoryBound(to: UInt64.self)
+        let handoff = (priv + Int(kOffMonData) + (1 << 19)).assumingMemoryBound(to: UInt64.self)
         handoff[0] = ipa(privL1) | valid
         handoff[1] = ipa(ramL1) | valid
         slot(bootRoot, Int((kRamAliasVA >> 39) & 0x1FF)).pointee = ipa(ramL1) | valid
@@ -708,6 +711,8 @@ public final class Engine {
             machine?.apicEOI(vector: UInt8(truncatingIfNeeded: c.pointee.req_a.0))
         case Int(HC_APIC_ICR):
             machine?.apicICR(c.pointee.req_a.0)
+        case Int(HC_APIC_TPR):
+            machine?.apicTPR(UInt8(truncatingIfNeeded: c.pointee.req_a.0))
         case Int(HC_BOUNDARY):
             if !options.hybrid && severalVCPUs && machine?.shouldStopRun != true { // a cache reset keeps this vCPU in the monitor; an explicit machine stop does not
                 gate.leave()
@@ -957,6 +962,11 @@ public final class Engine {
     public func requestBoundary() {
         engine_ctx_set_stop(ctx)
         interruptRequested()
+    }
+
+    /// Current vCPU thread inside a host call: mark stop_requested without latching a self-cancel via hv_vcpus_exit.
+    public func requestBoundaryLocal() {
+        engine_ctx_set_stop(ctx)
     }
 
     /// Any thread: a vector for the virtual APIC's IRR, as an IO-APIC or MSI would deliver.
