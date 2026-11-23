@@ -333,6 +333,8 @@ static Walk x86_walk(u64 cr3, u64 va, u32 access, bool set_ad) {
             w.leaf_level = level;
             w.dirty = e & X_D;
             w.fault_err |= 1; // present from here on
+            if (!(access & 4) && !(c->cr0 & (1ULL << 16)))
+                w.write = true; // Ring 0 ignores R/W when CR0.WP=0 (UEFI/winload)
             if ((access & 4) && !w.user)
                 return w;
             if ((access & 2) && !w.write)
@@ -530,6 +532,7 @@ static u64 rip_here(u64 pc) {
 // ---- Stops ----
 // A stop this instruction can come back from, in hybrid mode. The state is precise at every rip passed to stop: nothing guest-visible changes
 // before an instruction's last access. Stops with no rip are about the engine's own limits, and stay final.
+static void x87_flush_fast_cache(void);
 static void irq_deliver_now(u64 rip, u32 apic_vector);
 _Noreturn static void stop(u64 reason, u64 rip, u64 a, u64 b, u64 d) {
     if (reason == STOP_MONITOR_FAULT)
@@ -549,7 +552,9 @@ _Noreturn static void stop(u64 reason, u64 rip, u64 a, u64 b, u64 d) {
     c->req_a[4] = d;
     if (resumable) {
         c->req_r[0] = rip;
+        x87_flush_fast_cache();
         hostcall(HC_FALLBACK);
+        c->fp_d_valid = 0;
         mon_resync = true;
         mon_restart();
     }
@@ -773,12 +778,12 @@ static View *domain_keeper(u64 pml4e_target, View *requester) {
     static struct {
         u64 target;
         u32 view;
-    } keepers[16];
+    } keepers[128];
     static u32 count;
     for (u32 i = 0; i < count; i++)
         if (keepers[i].target == pml4e_target)
             return &views[keepers[i].view];
-    if (count == 16)
+    if (count == 128)
         stop(STOP_UNSUPPORTED, 0, 16, pml4e_target, 0);
     keepers[count].target = pml4e_target;
     keepers[count].view = (u32)(requester - views);
@@ -1369,7 +1374,7 @@ static void zap_table(u32 idx) {
 // A guest wrote a tracked table: drop every shadow entry that mirrors the slot. The next access refaults and refills.
 // A frame written many times with no walk through it in between has stopped being a page table (a freed one reused as data, say). Unshadow
 // it, or every store to it would trap for as long as the frame lives.
-#define PT_FLOOD_WRITES 64
+#define PT_FLOOD_WRITES 256
 static inline bool pt_flood_decision(ShadowDesc *d, bool nobody_home) {
     if (!(d->level < 3 && d->parent))
         return false;
@@ -1390,13 +1395,27 @@ static inline bool pt_flood_decision(ShadowDesc *d, bool nobody_home) {
     return true;
 }
 
-static void pt_slot_changed_impl(u64 gpa_slot, bool same64) {
+#define X_ARCH_UPPER (X_P | X_RW | X_US | X_PS | X_NX | X_ADDR)
+#define X_ARCH_LEAF  (X_P | X_RW | X_US | X_D  | X_NX | X_ADDR)
+static inline bool pte_arch_same(u64 old, u64 next, u32 level) {
+    if (!(old & X_P))
+        return false;
+    if (level == 0)
+        return (old & X_ARCH_LEAF) == (next & X_ARCH_LEAF);
+    if (old & X_PS)
+        return (old & (X_ARCH_UPPER | X_D)) == (next & (X_ARCH_UPPER | X_D));
+    return (old & X_ARCH_UPPER) == (next & X_ARCH_UPPER);
+}
+
+static void pt_slot_changed_impl(u64 gpa_slot, bool same64, bool has_old_next, u64 old_val, u64 next_val) {
     u32 fr = (u32)(gpa_slot >> 12), i = (u32)((gpa_slot & 0xfff) >> 3);
     zap_why = KILL_PT_LEAF;
     for (u32 it = mirror_head[fr], next; it; it = next) {
         ShadowDesc *d = &desc[it - 1];
         u64 *t = pool_page(it - 1);
         next = d->next_mirror;
+        if (has_old_next && pte_arch_same(old_val, next_val, d->level))
+            continue;
         // A user table of an address space no vCPU is in: it is being torn down or its frame reused, and every store would trap. It refills if that address space ever runs.
         bool nobody_home = d->view != c->view && d->va_base >> 47 == 0 && !view_pinned(d->view);
         if (pt_flood_decision(d, nobody_home)) {
@@ -1460,7 +1479,7 @@ static void pt_slot_changed_impl(u64 gpa_slot, bool same64) {
 }
 
 // All legacy callers retain their original invalidation and retirement behavior.
-static void pt_slot_changed(u64 gpa_slot) { pt_slot_changed_impl(gpa_slot, false); }
+static void pt_slot_changed(u64 gpa_slot) { pt_slot_changed_impl(gpa_slot, false, false, 0, 0); }
 
 // ---- ARM load and store decode, for the forms the translator emits ----
 typedef struct {
@@ -1870,7 +1889,23 @@ static void handle_data_abort(bool lower) {
         u64 val = a.rt == 31 ? 0 : c->x[a.rt];
         u64 r = 0;
         u64 reg = (w.gpa & ~0xfffULL) == c->hybrid_apic_page && a.bytes == 4 ? w.gpa & 0xfff : 0;
-        if (reg == 0x300 || reg == 0x310) { // the kernel reads both and writes both for each IPI, and only the last write needs QEMU
+        if (reg == 0x80) { // hybrid APIC TPR MMIO: keep c->apic_tpr coherent with CR8 fast-path
+            if (a.load) {
+                r = c->apic_tpr;
+            } else {
+                u32 old_tpr = c->apic_tpr;
+                u32 new_tpr = (u32)val & 0xffu;
+                if (new_tpr != old_tpr) {
+                    __atomic_store_n(&c->apic_tpr, new_tpr, __ATOMIC_SEQ_CST);
+                    if (new_tpr < old_tpr &&
+                        __atomic_load_n(&c->apic_irr_prio, __ATOMIC_SEQ_CST) > (new_tpr & 0xf0u)) {
+                        c->req_a[0] = new_tpr;
+                        hostcall(HC_APIC_TPR);
+                    }
+                }
+            }
+            c->stat_mmio_vm++;
+        } else if (reg == 0x300 || reg == 0x310) { // the kernel reads both and writes both for each IPI, and only the last write needs QEMU
             if (a.load)
                 r = reg == 0x300 ? c->apic_icr_lo : c->apic_icr_hi;
             else if (reg == 0x310)
@@ -1960,17 +1995,21 @@ static void handle_data_abort(bool lower) {
             u64 observed_old = 0;
             if (observe_plain)
                 observed_old = n == 8 ? *(u64 *)RAM(w.gpa) : *(u32 *)RAM(w.gpa);
-            bool same64 = false;
-            if (c->pte_same64 && n == 8 && !(w.gpa & 7) && is_ram(w.gpa)) {
+            bool same64 = false, has_old_next = false;
+            u64 old_val = 0;
+            if (n == 8 && !(w.gpa & 7) && is_ram(w.gpa)) {
                 // Preserve the actual guest store. Unlike a separate old-value
                 // read, exchange sees an intervening lock-free walker A/D CAS.
-                u64 old = __atomic_exchange_n((u64 *)RAM(w.gpa), val, __ATOMIC_SEQ_CST);
-                c->stat_pte_same64_exchanges++;
-                same64 = old == val;
-                if (same64)
-                    c->stat_pte_same64_equal++;
-                else
-                    c->stat_pte_same64_changed++;
+                old_val = __atomic_exchange_n((u64 *)RAM(w.gpa), val, __ATOMIC_SEQ_CST);
+                has_old_next = true;
+                if (c->pte_same64) {
+                    c->stat_pte_same64_exchanges++;
+                    same64 = old_val == val;
+                    if (same64)
+                        c->stat_pte_same64_equal++;
+                    else
+                        c->stat_pte_same64_changed++;
+                }
             } else if (n == 8)
                 *(u64 *)RAM(w.gpa) = val;
             else if (n == 4 && !(w.gpa & 3)) // one piece: another vCPU can read the table while this runs
@@ -1979,7 +2018,7 @@ static void handle_data_abort(bool lower) {
                 memcpy(RAM(w.gpa), &val, n);
             if (observe_plain)
                 mmu_observe_store(n == 8 ? 1 : 0, observed_old, val);
-            pt_slot_changed_impl(w.gpa & ~7ULL, same64);
+            pt_slot_changed_impl(w.gpa & ~7ULL, same64, has_old_next, old_val, val);
             if (((w.gpa & 7) + n) > 8)
                 pt_slot_changed((w.gpa & ~7ULL) + 8);
             arm_finish(&a, 0);
@@ -2012,7 +2051,7 @@ static void handle_data_abort(bool lower) {
                 next = is_cas ? (changed ? (u32)rt_v : old) : (u32)rs_v;
             }
             if (next != old)
-                pt_slot_changed(w.gpa & ~7ULL);
+                pt_slot_changed_impl(w.gpa & ~7ULL, false, wide_atomic, old, next);
             if (is_cas) {
                 if (rs != 31)
                     c->x[rs] = old;
@@ -2453,6 +2492,7 @@ again:
     if (refresh_host_irq || (c->hybrid && can_acknowledge && !c->irq_pending && c->irq_line)) {
         sync_host_irq(can_acknowledge);
         refresh_host_irq = false;
+        stop_now = c->stop_requested;
     }
     waiting = if_open && (apic_vector || c->irq_pending || (c->hybrid && c->irq_line));
     if (!stop_now && !waiting)
@@ -2462,7 +2502,9 @@ again:
             c->stop_requested = 0;
             c->req_a[0] = rip;
             c->req_r[0] = rip;
+            x87_flush_fast_cache();
             hostcall(HC_BOUNDARY);
+            c->fp_d_valid = 0;
             if (c->hybrid)
                 host_resync();
             else if (c->req_r[0] != rip || c->tr_flushed) { // the host moved the x86 pc, or reset the code cache this pc is in
@@ -2865,9 +2907,16 @@ static void do_mov_cr_write(void) {
     u64 here = rip_here(c->elr - 4);
     switch (cr) {
         case 0:
-            if ((v & 0x80010001ULL) != 0x80010001ULL)
-                stop(STOP_UNSUPPORTED, here, 10, v, 0); // paging, protection or WP off
-            c->cr0 = v;
+            if ((v & 0x80000001ULL) != 0x80000001ULL)
+                stop(STOP_UNSUPPORTED, here, 10, v, 0); // paging or protection off
+            if ((c->cr0 ^ v) & (1ULL << 16)) {
+                c->cr0 = v;
+                mon_lock();
+                shadow_drop_all();
+                mon_unlock();
+            } else {
+                c->cr0 = v;
+            }
             fp_trap_sync();
             break;
         case 2:
@@ -2889,11 +2938,19 @@ static void do_mov_cr_write(void) {
                 stop(STOP_UNSUPPORTED, here, 11, v, 0);
             c->cr4 = v;
             break;
-        case 8:
-            if (c->hybrid)
-                stop(STOP_FALLBACK, here, FB_CR8, 0, 0);
-            c->apic_tpr = (u32)(v & 15) << 4;
+        case 8: {
+            u32 old_tpr = c->apic_tpr;
+            u32 new_tpr = (u32)(v & 15) << 4;
+            if (new_tpr != old_tpr) {
+                __atomic_store_n(&c->apic_tpr, new_tpr, __ATOMIC_SEQ_CST);
+                if (c->hybrid && new_tpr < old_tpr &&
+                    __atomic_load_n(&c->apic_irr_prio, __ATOMIC_SEQ_CST) > new_tpr) {
+                    c->req_a[0] = new_tpr;
+                    hostcall(HC_APIC_TPR);
+                }
+            }
             break;
+        }
     }
 }
 
@@ -3775,8 +3832,6 @@ void mon_sync(void) {
                         c->x[R_S0] = c->cr4;
                         break;
                     case 8:
-                        if (c->hybrid)
-                            stop(STOP_FALLBACK, rip_here(c->elr - 4), FB_CR8, 0, 0);
                         c->x[R_S0] = c->apic_tpr >> 4;
                         break;
                     default:
@@ -3828,6 +3883,52 @@ void mon_sync(void) {
             case SVC_STR:
                 c->x[R_S0] = c->tr;
                 break;
+            case SVC_VERR:
+            case SVC_VERW: {
+                u32 sel = (u32)c->x[R_S0] & 0xffffu;
+                u64 d = 0;
+                bool ok = false;
+                if ((sel & ~3u) && (!(sel & 4) || (c->ldtr & ~3u)) && desc_read(sel, &d) && (d & DESC_S)) {
+                    u32 dpl = desc_dpl(d), rpl = sel & 3;
+                    if (n == SVC_VERW) {
+                        ok = !(d & DESC_CODE) && (d & DESC_RW) && c->cpl <= dpl && rpl <= dpl;
+                    } else if (d & DESC_CODE) {
+                        ok = (d & DESC_RW) && ((d & DESC_CONFORMING) || (c->cpl <= dpl && rpl <= dpl));
+                    } else {
+                        ok = c->cpl <= dpl && rpl <= dpl;
+                    }
+                }
+                if (ok)
+                    c->spsr |= (1ULL << 30);
+                else
+                    c->spsr &= ~(1ULL << 30);
+                break;
+            }
+            case SVC_LSL: {
+                u32 sel = (u32)c->x[R_S0] & 0xffffu;
+                u64 d = 0;
+                bool ok = false;
+                if ((sel & ~3u) && (!(sel & 4) || (c->ldtr & ~3u)) && desc_read(sel, &d)) {
+                    u32 dpl = desc_dpl(d), rpl = sel & 3;
+                    if (d & DESC_S) {
+                        ok = ((d & DESC_CODE) && (d & DESC_CONFORMING)) || (c->cpl <= dpl && rpl <= dpl);
+                    } else {
+                        u32 type = (u32)(d >> 40) & 0xfu;
+                        ok = (type == 1 || type == 2 || type == 3 || type == 9 || type == 11) &&
+                             c->cpl <= dpl && rpl <= dpl;
+                    }
+                }
+                if (ok) {
+                    u32 lim = (u32)((d & 0xffffULL) | ((d >> 32) & 0xf0000ULL));
+                    if (d & (1ULL << 55))
+                        lim = (lim << 12) | 0xfffu;
+                    c->x[R_S0] = lim;
+                    c->spsr |= (1ULL << 30);
+                } else {
+                    c->spsr &= ~(1ULL << 30);
+                }
+                break;
+            }
             case SVC_LLDT: {
                 u64 d[2] = {0, 0};
                 u32 sel = (u32)c->x[R_S0] & 0xffff, idx = sel & ~7u;
@@ -3957,7 +4058,7 @@ void mon_init(void) {
     zap_why = KILL_RECLAIM;
     c->irq_shadow_rip = ~0ULL;
     WSR(cntkctl_el1, 2); // EL0VCTEN: rdtsc in translated code reads the virtual counter
-    u64 *desc_hole = (u64 *)PRIV(OFF_MON_DATA + (1ULL << 20));
+    u64 *desc_hole = (u64 *)PRIV(OFF_MON_DATA + (1ULL << 19));
     hole_entry_priv = desc_hole[0];
     hole_entry_ram = desc_hole[1];
     View *v = view_find(cr3_key(c->cr3), view_mode());

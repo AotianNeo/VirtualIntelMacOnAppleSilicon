@@ -977,7 +977,22 @@ static void bcd_store(F a, u64 *lo, u64 *hi) {
 }
 
 // One operation. The literal after the svc gives the opcode and rip; EL0 has moved any memory operand.
+static void x87_flush_fast_cache(void) {
+    u64 mask = c->fp_d_valid & 0xffu;
+    if (!mask)
+        return;
+    c->fp_d_valid = 0;
+    for (u32 p = 0; p < 8; p++) {
+        if (!(mask & (1ULL << p)))
+            continue;
+        F f = from_fp(c->fp_d[p], 52, 11);
+        c->mm[p] = f.m;
+        c->fp_exp[p] = (u16)f.se;
+    }
+}
+
 static void x87_op(void) {
+    x87_flush_fast_cache();
     u32 lit0 = *(u32 *)c->elr, op = lit0 & 0xFFFF;
     u64 rip = *(u64 *)(c->elr + 4);
     engine_profile_x87_helper(c,op);
@@ -1002,7 +1017,7 @@ static void x87_op(void) {
     bool control = mem ? (esc == 1 && reg >= 4) || (esc == 5 && reg >= 4)
                        : (esc == 3 && (m == 0xE2 || m == 0xE3)) || (esc == 7 && m == 0xE0);
     if (!control) {
-        if ((c->fcw & 0x3F) != 0x3F || (c->fsw & FE_ES))
+        if (c->fsw & FE_ES)
             fp_cannot(rip, op, FB_X87, 16);
         c->fop = (u16)op;
         c->fip = rip;
@@ -1225,6 +1240,8 @@ static void x87_op(void) {
                     else if (adjust == 1 && (rc == 1 || rc == 3))
                         k.m--;
                     st_push(s, k);
+                } else if (m == 0xF2) { // fptan slow-path (|x| >= 1024, NaN/Inf, or stack overflow/underflow)
+                    fp_cannot(rip, op, FB_X87, 16);
                 } else if (m == 0xF4) { // fxtract
                     if (e0) {
                         underflow();
@@ -1372,8 +1389,11 @@ static void x87_op(void) {
     }
     if (pop)
         st_pop(s);
-    if (!control)
+    if (!control) {
         st.fsw = (st.fsw & (c1_kept ? ~0u : ~(u32)FC1)) | xfl;
+        if (st.fsw & ~c->fcw & 0x3F)
+            st.fsw |= FE_ES | FB;
+    }
     if (store) {
         c->x[R_S0] = out;
         c->x[R_S1] = out_hi;
@@ -1388,6 +1408,10 @@ static void x87_op(void) {
 // fxsave and fxrstor, in 64-bit (REX.W, x22 set) or 32-bit format. Leaves bytes 416 up alone, as the CPU does: software
 // may keep its own there.
 static void do_fx(bool save) {
+    if (save)
+        x87_flush_fast_cache();
+    else
+        c->fp_d_valid = 0;
     u8 *area = me->fx_area;
     u64 va = c->x[R_S0], here = rip_here(c->elr - 4);
     bool wide = c->x[R_S2];
