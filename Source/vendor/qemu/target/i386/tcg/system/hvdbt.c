@@ -43,6 +43,9 @@
 #include "engine_api.h"
 #include "compat_segments.h"
 #include "hvdbt-write-span.h"
+#ifdef __APPLE__
+#include <pthread/qos.h>
+#endif
 
 #define HIGH_RAM (1ULL << 32)
 /* What the monitor's CR4_OK allows. */
@@ -57,10 +60,15 @@ static struct {
     uint64_t ram_bytes, below_4g;
     uint64_t kernel_base, kernel_slide, kernel_data, kernel_data_bytes;
     bool shutdown_dumped;
+    bool vga_bar_ready;
+    int64_t boot_t0_ns;
+    bool logged_kernel;
+    bool logged_user;
+    FILE *bootprof;
 } hv;
 
 /* As the engine's MAX_VCPUS. */
-#define HVDBT_MAX_CPUS 8
+#define HVDBT_MAX_CPUS 16
 
 typedef struct {
     EngineHandle *engine;
@@ -91,7 +99,7 @@ static void hvdbt_after_device(CPUState *cs)
         engine_set_irq_line(HV(cs)->engine, true);
     }
     if (cpu_test_interrupt(cs, OTHER_INTERRUPTS) || !cpu_can_run(cs) || !cpu_work_list_empty(cs)) {
-        engine_request_boundary(HV(cs)->engine);
+        engine_request_boundary_local(HV(cs)->engine);
     }
 }
 
@@ -113,23 +121,79 @@ static bool hvdbt_direct_section(MemoryRegionSection *section)
            QEMU_IS_ALIGNED(section->offset_within_address_space | int128_get64(section->size), qemu_real_host_page_size());
 }
 
+typedef struct {
+    uint64_t gpa;
+    void *host;
+    uint64_t size;
+    char name[48];
+} HvDirectSlot;
+
+static HvDirectSlot hv_direct_add_q[16];
+static HvDirectSlot hv_direct_del_q[16];
+static int hv_direct_add_n, hv_direct_del_n;
+
+static void hvdbt_direct_begin(MemoryListener *listener)
+{
+    hv_direct_add_n = 0;
+    hv_direct_del_n = 0;
+}
+
 static void hvdbt_direct_add(MemoryListener *listener, MemoryRegionSection *section)
 {
-    if (hvdbt_direct_section(section)) {
-        bool done = engine_map_direct(hv.engine, section->offset_within_address_space,
-                                      memory_region_get_ram_ptr(section->mr), int128_get64(section->size));
-        char line[120];
-        snprintf(line, sizeof(line), "direct map of '%s' at 0x%llx: %s", memory_region_name(section->mr),
-                 (unsigned long long)section->offset_within_address_space, done ? "done" : "refused");
-        engine_tally_note(hv.engine, line);
+    if (hvdbt_direct_section(section) && hv_direct_add_n < 16) {
+        HvDirectSlot *s = &hv_direct_add_q[hv_direct_add_n++];
+        s->gpa = section->offset_within_address_space;
+        s->host = memory_region_get_ram_ptr(section->mr);
+        s->size = int128_get64(section->size);
+        snprintf(s->name, sizeof(s->name), "%s", memory_region_name(section->mr));
     }
 }
 
 static void hvdbt_direct_del(MemoryListener *listener, MemoryRegionSection *section)
 {
-    if (hvdbt_direct_section(section)) {
-        engine_unmap_direct(hv.engine, section->offset_within_address_space, int128_get64(section->size));
+    if (hvdbt_direct_section(section) && hv_direct_del_n < 16) {
+        HvDirectSlot *s = &hv_direct_del_q[hv_direct_del_n++];
+        s->gpa = section->offset_within_address_space;
+        s->host = memory_region_get_ram_ptr(section->mr);
+        s->size = int128_get64(section->size);
+        snprintf(s->name, sizeof(s->name), "%s", memory_region_name(section->mr));
     }
+}
+
+static void hvdbt_direct_commit(MemoryListener *listener)
+{
+    /* Cancel identical del+add pairs in the same memory transaction (e.g., VGA dirty-log / bank updates)
+     * so we don't spuriously unmap vga.vram and drop all shadow page tables across every vCPU. */
+    for (int d = 0; d < hv_direct_del_n; d++) {
+        bool matched = false;
+        for (int a = 0; a < hv_direct_add_n; a++) {
+            if (hv_direct_add_q[a].size &&
+                hv_direct_add_q[a].gpa == hv_direct_del_q[d].gpa &&
+                hv_direct_add_q[a].host == hv_direct_del_q[d].host &&
+                hv_direct_add_q[a].size == hv_direct_del_q[d].size) {
+                hv_direct_add_q[a].size = 0;
+                hv_direct_del_q[d].size = 0;
+                matched = true;
+                break;
+            }
+        }
+        if (!matched && hv_direct_del_q[d].size) {
+            engine_unmap_direct(hv.engine, hv_direct_del_q[d].gpa, hv_direct_del_q[d].size);
+        }
+    }
+    for (int a = 0; a < hv_direct_add_n; a++) {
+        if (!hv_direct_add_q[a].size) {
+            continue;
+        }
+        bool done = engine_map_direct(hv.engine, hv_direct_add_q[a].gpa,
+                                      hv_direct_add_q[a].host, hv_direct_add_q[a].size);
+        char line[120];
+        snprintf(line, sizeof(line), "direct map of '%s' at 0x%llx: %s", hv_direct_add_q[a].name,
+                 (unsigned long long)hv_direct_add_q[a].gpa, done ? "done" : "refused");
+        engine_tally_note(hv.engine, line);
+    }
+    hv_direct_add_n = 0;
+    hv_direct_del_n = 0;
 }
 
 /* shortcut: everything counts as written at each sync, so legacy VGA redraws whole frames. It is only the boot screens; narrow it with write protection if they ever matter. */
@@ -143,8 +207,10 @@ static void hvdbt_direct_sync(MemoryListener *listener, MemoryRegionSection *sec
 
 static MemoryListener hvdbt_direct_listener = {
     .name = "hvdbt-direct",
+    .begin = hvdbt_direct_begin,
     .region_add = hvdbt_direct_add,
     .region_del = hvdbt_direct_del,
+    .commit = hvdbt_direct_commit,
     .log_sync = hvdbt_direct_sync,
     .priority = MEMORY_LISTENER_PRIORITY_ACCEL,
 };
@@ -284,6 +350,9 @@ static void hvdbt_cpuid(void *opaque, uint32_t leaf, uint32_t subleaf, uint32_t 
 {
     CPUState *cs = opaque;
     cpu_x86_cpuid(cpu_env(cs), leaf, subleaf, &out[0], &out[1], &out[2], &out[3]);
+    if (leaf == 0x80000007) {
+        out[3] |= (1u << 8); /* Invariant TSC: Apple Silicon cntvct_el0 is constant-rate */
+    }
 }
 
 static bool hvdbt_has_interrupt(void *opaque)
@@ -300,7 +369,7 @@ static bool hvdbt_has_interrupt(void *opaque)
         apic_poll_irq(X86_CPU(cs)->apic_state);
     }
     if (cpu_test_interrupt(cs, OTHER_INTERRUPTS)) { /* TCG delivers these, when the boundary stop gets back to its loop */
-        engine_request_boundary(HV(cs)->engine);
+        engine_request_boundary_local(HV(cs)->engine);
     }
     hard = cpu_test_interrupt(cs, CPU_INTERRUPT_HARD);
     bql_unlock();
@@ -340,6 +409,22 @@ static void hvdbt_apic_icr(void *opaque, uint64_t icr)
     hvdbt_name_device(apic->apicbase & MSR_IA32_APICBASE_BASE);
     uint32_t low = icr;
     address_space_write(&address_space_memory, (apic->apicbase & MSR_IA32_APICBASE_BASE) + 0x300, MEMTXATTRS_UNSPECIFIED, &low, 4);
+    hvdbt_after_device(opaque);
+    bql_unlock();
+}
+
+static void hvdbt_apic_tpr(void *opaque, uint8_t tpr)
+{
+    CPUState *cs = opaque;
+    APICCommonState *apic = X86_CPU(cs)->apic_state;
+
+    if (!apic) {
+        return;
+    }
+    uint8_t new_tpr = tpr & 0xf0;
+    /* Only called by monitor.c when lowering TPR unmasks a pending IRR. */
+    bql_lock();
+    cpu_set_apic_tpr(apic, new_tpr >> 4);
     hvdbt_after_device(opaque);
     bql_unlock();
 }
@@ -419,6 +504,7 @@ static void hvdbt_put_state(CPUState *cs)
         s.hybrid_apic_page = mapped ? apic->apicbase & MSR_IA32_APICBASE_BASE : 0;
         s.hybrid_icr_lo = apic ? apic->icr[0] : 0;
         s.hybrid_icr_hi = apic ? apic->icr[1] : 0;
+        s.hybrid_tpr = apic ? apic->tpr : 0;
     }
     s.rip = env->eip;
     s.rflags = env->eflags; /* cpu_exec_exit made it whole */
@@ -500,6 +586,7 @@ static void hvdbt_get_state(CPUState *cs)
     if (X86_CPU(cs)->apic_state) { /* TCG may be the one to read them next, or to finish an IPI begun here */
         X86_CPU(cs)->apic_state->icr[0] = s.hybrid_icr_lo;
         X86_CPU(cs)->apic_state->icr[1] = s.hybrid_icr_hi;
+        X86_CPU(cs)->apic_state->tpr = s.hybrid_tpr;
     }
     env->eip = s.rip;
     env->eflags = s.rflags; /* cpu_exec_enter splits it again */
@@ -658,16 +745,46 @@ static void hvdbt_set_ops(EngineMachineOps *ops, CPUState *cs)
         .wait_for_interrupt = hvdbt_wait,
         .apic_eoi = hvdbt_apic_eoi,
         .apic_icr = hvdbt_apic_icr,
+        .apic_tpr = hvdbt_apic_tpr,
     };
 }
 
 static void *hvdbt_watchdog(void *arg);
+static void *hvdbt_bootprof_thread(void *arg);
 static void hvdbt_find_kernel(CPUState *cs);
+
+static bool hvdbt_check_vga_bar(Int128 start, Int128 len, const MemoryRegion *mr, hwaddr offset, void *opaque)
+{
+    bool *found = opaque;
+    const char *name = memory_region_name(mr);
+    if (name && !strcmp(name, "vga.vram") && memory_region_is_ram(mr) &&
+        int128_get64(start) >= (1ULL << 20)) {
+        *found = true;
+        return true;
+    }
+    return false;
+}
+
+static bool hvdbt_vga_bar_ready(void)
+{
+    if (hv.vga_bar_ready) {
+        return true;
+    }
+    bool found = false;
+    WITH_RCU_READ_LOCK_GUARD() {
+        flatview_for_each_range(address_space_to_flatview(&address_space_memory), hvdbt_check_vga_bar, &found);
+    }
+    if (found) {
+        hv.vga_bar_ready = true;
+    }
+    return found;
+}
 
 /* A reset, which a snapshot load also starts with: RAM is about to change with nothing telling the engine. vCPUs are paused. */
 static void hvdbt_reset(void *opaque)
 {
     engine_forget_all(hv.engine);
+    hv.vga_bar_ready = false;
     for (int i = 0; i < HVDBT_MAX_CPUS; i++) {
         hv_cpus[i].until_kernel = true;
         hv_cpus[i].protect_all = true;
@@ -679,6 +796,9 @@ static void hvdbt_reset(void *opaque)
 
 static bool hvdbt_create(CPUState *cs)
 {
+#ifdef __APPLE__
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+#endif
     MachineState *ms = current_machine;
     X86MachineState *x86ms = X86_MACHINE(ms);
     CPUX86State *env = cpu_env(cs);
@@ -693,8 +813,8 @@ static bool hvdbt_create(CPUState *cs)
         .ram_host = memory_region_get_ram_ptr(ms->ram),
         .ram_below_4g = x86ms->above_4g_mem_size ? x86ms->below_4g_mem_size : 0,
         .kernel_model = true,
-        .precise_flags = true,
-        .tso = true,
+        .precise_flags = !getenv("LC_HVDBT_FAST_FLAGS"),
+        .tso = !getenv("LC_HVDBT_NO_TSO"),
         .tzcnt_lzcnt = (env->features[FEAT_7_0_EBX] & CPUID_7_0_EBX_BMI1) && (env->features[FEAT_8000_0001_ECX] & CPUID_EXT3_ABM),
         .hybrid = true,
     };
@@ -735,6 +855,15 @@ static bool hvdbt_create(CPUState *cs)
         QemuThread watchdog;
         qemu_thread_create(&watchdog, "hvdbt-watchdog", hvdbt_watchdog, cs, QEMU_THREAD_DETACHED);
     }
+    if (!cs->cpu_index && !hv.bootprof && getenv("LC_HVDBT_BOOTPROF")) {
+        hv.bootprof = fopen(getenv("LC_HVDBT_BOOTPROF"), "w");
+        if (hv.bootprof) {
+            fprintf(hv.bootprof, "sec,cpu,cpl,hlt,cr3,module\n");
+            fflush(hv.bootprof);
+            QemuThread bp;
+            qemu_thread_create(&bp, "hvdbt-bootprof", hvdbt_bootprof_thread, cs, QEMU_THREAD_DETACHED);
+        }
+    }
     info_report("hvdbt: the engine takes over at rip 0x%" PRIx64 ", cr3 0x%" PRIx64, (uint64_t)env->eip, (uint64_t)env->cr[3]);
     return true;
 }
@@ -742,6 +871,9 @@ static bool hvdbt_create(CPUState *cs)
 /* Another vCPU joins the VM on its own thread, as HVF requires. The first made it and said how many there would be. */
 static bool hvdbt_create_secondary(CPUState *cs)
 {
+#ifdef __APPLE__
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+#endif
     const char *tally = getenv("LC_HVDBT_TALLY");
     EngineMachineOps ops;
 
@@ -761,6 +893,15 @@ static bool hvdbt_create_secondary(CPUState *cs)
         QemuThread watchdog;
         qemu_thread_create(&watchdog, "hvdbt-watchdog", hvdbt_watchdog, cs, QEMU_THREAD_DETACHED);
     }
+    if (!cs->cpu_index && !hv.bootprof && getenv("LC_HVDBT_BOOTPROF")) {
+        hv.bootprof = fopen(getenv("LC_HVDBT_BOOTPROF"), "w");
+        if (hv.bootprof) {
+            fprintf(hv.bootprof, "sec,cpu,cpl,hlt,cr3,module\n");
+            fflush(hv.bootprof);
+            QemuThread bp;
+            qemu_thread_create(&bp, "hvdbt-bootprof", hvdbt_bootprof_thread, cs, QEMU_THREAD_DETACHED);
+        }
+    }
     info_report("hvdbt: vCPU %d joins at rip 0x%" PRIx64, cs->cpu_index, (uint64_t)cpu_env(cs)->eip);
     return true;
 }
@@ -779,15 +920,16 @@ static bool hvdbt_want_engine(CPUState *cs, vaddr pc, uint32_t flags)
         return false;
     }
     /*
-     * Firmware and boot loaders run identity-mapped, and XNU's vstart is the first thing in the high half. An application processor gets there through TCG's real mode, and
-     * waits on TCG until the first vCPU has made the VM.
+     * Firmware early PCI enumeration runs on TCG. Once vga.vram is mapped at its PCI BAR (TianoCore ready),
+     * allow early 64-bit handoff so UEFI boot loaders (bootmgfw.efi / winload.efi WIM decompression) run accelerated.
      */
-    if (!cpu->engine && ((int64_t)pc >= 0 || (cs->cpu_index && !__atomic_load_n(&hv.engine, __ATOMIC_ACQUIRE)))) {
+    bool early_ready = (int64_t)pc < 0 || ((flags & HF_CS64_MASK) && hvdbt_vga_bar_ready());
+    if (!cpu->engine && (!early_ready || (cs->cpu_index && !__atomic_load_n(&hv.engine, __ATOMIC_ACQUIRE)))) {
         cpu->tcg_ran = true;
         return false;
     }
     if (cpu->until_kernel) {
-        if ((int64_t)pc >= 0) {
+        if (!early_ready) {
             cpu->tcg_ran = true;
             return false;
         }
@@ -827,8 +969,6 @@ static bool hvdbt_want_engine(CPUState *cs, vaddr pc, uint32_t flags)
         snprintf(why, sizeof why, "refused: SMM");
     } else if (flags & TF_MASK) {
         snprintf(why, sizeof why, "refused: TF set");
-    } else if (!(env->cr[0] & CR0_WP_MASK)) {
-        snprintf(why, sizeof why, "refused: CR0.WP clear");
     } else if (env->cr[4] & ~ENGINE_CR4) {
         snprintf(why, sizeof why, "refused: CR4 bits 0x%" PRIx64, (uint64_t)env->cr[4] & ~ENGINE_CR4);
     } else if ((env->mxcsr & 0x1F80) != 0x1F80) {
@@ -951,6 +1091,13 @@ static void hvdbt_run(CPUState *cs)
     if (!cpu->engine && !(hv.engine ? hvdbt_create_secondary(cs) : hvdbt_create(cs))) {
         hv.dead = true;
         return;
+    }
+    APICCommonState *apic = X86_CPU(cs)->apic_state;
+    if (apic && !apic->hvdbt_tpr) {
+        engine_apic_shared_ptrs(cpu->engine, &apic->hvdbt_tpr, &apic->hvdbt_irr_prio);
+        int irrv = apic_get_highest_priority_irr(apic);
+        qatomic_set(apic->hvdbt_irr_prio, irrv >= 0 ? (uint32_t)(irrv & 0xf0) : 0);
+        qatomic_set(apic->hvdbt_tpr, apic->tpr & 0xf0);
     }
     if (cpu->tcg_ran) { /* the flush runs from the work queue, then the TB miss brings control back. It is exclusive: with several vCPUs, it stops the others at a boundary */
         cpu->tcg_ran = false;
@@ -1179,6 +1326,93 @@ static void hvdbt_dump_kernel(CPUState *cs, const char *path)
     fflush(stderr);
 }
 
+static void hvdbt_resolve_pe(CPUState *cs, uint64_t rip, char *out, size_t out_sz)
+{
+    static struct { uint64_t base, end; char name[40]; } cache[64];
+    static int cache_n;
+
+    for (int i = 0; i < cache_n; i++) {
+        if (rip >= cache[i].base && rip < cache[i].end) {
+            snprintf(out, out_sz, "%s+0x%" PRIx64, cache[i].name, rip - cache[i].base);
+            return;
+        }
+    }
+    uint64_t start = rip & ~0xfffULL;
+    uint64_t limit = start > (32ULL << 20) ? start - (32ULL << 20) : 0;
+    for (uint64_t at = start; at > limit; at -= 4096) {
+        uint8_t mz[64];
+        if (cpu_memory_rw_debug(cs, at, mz, sizeof mz, false)) {
+            break;
+        }
+        if (mz[0] == 'M' && mz[1] == 'Z') {
+            uint32_t e_lfanew = ldl_le_p(mz + 0x3c);
+            if (e_lfanew < 0x40 || e_lfanew > 0x1000) {
+                continue;
+            }
+            uint8_t pe[0x98];
+            if (cpu_memory_rw_debug(cs, at + e_lfanew, pe, sizeof pe, false)) {
+                continue;
+            }
+            if (pe[0] != 'P' || pe[1] != 'E' || pe[2] != 0 || pe[3] != 0) {
+                continue;
+            }
+            uint32_t img_size = ldl_le_p(pe + 0x50);
+            if (img_size < 0x1000 || img_size > (256ULL << 20) || rip >= at + img_size) {
+                continue;
+            }
+            char name[40] = "pe_img";
+            uint16_t magic = lduw_le_p(pe + 0x18);
+            uint32_t exp_rva = (magic == 0x20b) ? ldl_le_p(pe + 0x88) : ldl_le_p(pe + 0x78);
+            if (exp_rva && exp_rva < img_size) {
+                uint8_t expdir[40];
+                if (!cpu_memory_rw_debug(cs, at + exp_rva, expdir, sizeof expdir, false)) {
+                    uint32_t name_rva = ldl_le_p(expdir + 12);
+                    if (name_rva && name_rva < img_size) {
+                        if (!cpu_memory_rw_debug(cs, at + name_rva, (uint8_t *)name, sizeof name - 1, false)) {
+                            name[sizeof name - 1] = 0;
+                        }
+                    }
+                }
+            }
+            if (cache_n < 64) {
+                cache[cache_n].base = at;
+                cache[cache_n].end = at + img_size;
+                snprintf(cache[cache_n].name, sizeof cache[cache_n].name, "%s", name);
+                cache_n++;
+            }
+            snprintf(out, out_sz, "%s+0x%" PRIx64, name, rip - at);
+            return;
+        }
+    }
+    snprintf(out, out_sz, "0x%" PRIx64, rip);
+}
+
+static void hvdbt_bootprof_sample(CPUState *cs, run_on_cpu_data unused)
+{
+    if (!hv.bootprof) {
+        return;
+    }
+    CPUX86State *env = cpu_env(cs);
+    double sec = (g_get_monotonic_time() * 1000LL - hv.boot_t0_ns) / 1e9;
+    char mod[64];
+    hvdbt_resolve_pe(cs, env->eip, mod, sizeof mod);
+    fprintf(hv.bootprof, "%.2f,cpu%d,cpl%d,hlt%d,cr3=0x%" PRIx64 ",%s\n",
+            sec, cs->cpu_index, env->hflags & HF_CPL_MASK, cs->halted, (uint64_t)env->cr[3], mod);
+    fflush(hv.bootprof);
+}
+
+static void *hvdbt_bootprof_thread(void *arg)
+{
+    CPUState *cs = arg;
+    while (!qatomic_read(&hv.dead) && hv.bootprof) {
+        g_usleep(500000); /* 2 Hz lightweight sample on vCPU 0 */
+        if (runstate_is_running()) {
+            async_run_on_cpu(cs, hvdbt_bootprof_sample, RUN_ON_CPU_NULL);
+        }
+    }
+    return NULL;
+}
+
 /* A separate thread, so none of this costs the vCPU anything until something is wrong. */
 static void *hvdbt_watchdog(void *arg)
 {
@@ -1244,6 +1478,7 @@ static void __attribute__((constructor)) hvdbt_init(void)
     const char *on = getenv("LC_HVDBT");
 
     if (on && !strcmp(on, "1")) {
+        hv.boot_t0_ns = g_get_monotonic_time() * 1000LL;
         tcg_handoff = &hvdbt_ops;
     }
 }

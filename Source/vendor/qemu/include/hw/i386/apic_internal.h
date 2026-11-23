@@ -188,6 +188,8 @@ struct APICCommonState {
     DeviceState *vapic;
     hwaddr vapic_paddr; /* note: persistence via kvmvapic */
     uint32_t extended_log_dest;
+    uint32_t *hvdbt_tpr;
+    uint32_t *hvdbt_irr_prio;
 };
 
 typedef struct VAPICState {

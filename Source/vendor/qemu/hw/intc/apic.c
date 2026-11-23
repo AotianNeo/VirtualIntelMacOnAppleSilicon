@@ -377,11 +377,31 @@ static int apic_set_base(APICCommonState *s, uint64_t val)
     return 0;
 }
 
+static inline void apic_hvdbt_sync_tpr(APICCommonState *s)
+{
+    if (s->hvdbt_tpr) {
+        s->tpr = qatomic_read(s->hvdbt_tpr) & 0xf0;
+    }
+}
+
+static inline void apic_hvdbt_publish_irr(APICCommonState *s)
+{
+    if (s->hvdbt_irr_prio) {
+        int irrv = get_highest_priority_int(s->irr);
+        uint32_t prio = irrv >= 0 ? (uint32_t)(irrv & 0xf0) : 0;
+        qatomic_set(s->hvdbt_irr_prio, prio);
+        smp_mb();
+    }
+}
+
 static void apic_set_tpr(APICCommonState *s, uint8_t val)
 {
     /* Updates from cr8 are ignored while the VAPIC is active */
     if (!s->vapic_paddr) {
         s->tpr = val << 4;
+        if (s->hvdbt_tpr) {
+            qatomic_set(s->hvdbt_tpr, s->tpr);
+        }
         apic_update_irq(s);
     }
 }
@@ -397,6 +417,7 @@ int apic_get_highest_priority_irr(APICCommonState *s)
 
 static uint8_t apic_get_tpr(APICCommonState *s)
 {
+    apic_hvdbt_sync_tpr(s);
     apic_sync_vapic(s, SYNC_FROM_VAPIC);
     return s->tpr >> 4;
 }
@@ -405,6 +426,7 @@ int apic_get_ppr(APICCommonState *s)
 {
     int tpr, isrv, ppr;
 
+    apic_hvdbt_sync_tpr(s);
     tpr = (s->tpr >> 4);
     isrv = get_highest_priority_int(s->isr);
     if (isrv < 0)
@@ -489,6 +511,7 @@ static void apic_set_irq(APICCommonState *s, int vector_num, int trigger_mode)
         smp_wmb();
         apic_sync_vapic(s, SYNC_FROM_VAPIC);
     }
+    apic_hvdbt_publish_irr(s);
     apic_update_irq(s);
 }
 
@@ -503,6 +526,7 @@ static void apic_eoi(APICCommonState *s)
         ioapic_eoi_broadcast(isrv);
     }
     apic_sync_vapic(s, SYNC_FROM_VAPIC | SYNC_TO_VAPIC);
+    apic_hvdbt_publish_irr(s);
     apic_update_irq(s);
 }
 
@@ -732,6 +756,7 @@ int apic_get_interrupt(APICCommonState *s)
     apic_set_bit(s->isr, intno);
     apic_sync_vapic(s, SYNC_TO_VAPIC);
 
+    apic_hvdbt_publish_irr(s);
     apic_update_irq(s);
 
     return intno;
