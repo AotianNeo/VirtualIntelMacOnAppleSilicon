@@ -1,118 +1,139 @@
-# Virtual Intel Mac on Apple silicon
+# VirtualIntelMacOnAppleSilicon — Windows x86-64 Edition
 
-![Screenshot of Virtual Intel Mac](Source/screenshots/Virtual_Intel_Mac.png)
+> **This fork is specifically optimized for running x86-64 Windows (`Windows 10`, `Windows 11`, `Windows Server 2022`, and `WinPE`) on Apple Silicon via pure-software full-system binary translation (HVDBT, zero external FEX dependencies).**
+>
+> Derived from [`nfzerox/VirtualIntelMacOnAppleSilicon`](https://github.com/nfzerox/VirtualIntelMacOnAppleSilicon) (MIT License), pairing Apple `Hypervisor.framework` with an in-tree pure-C / ARM64 NEON dynamic binary translator and freestanding EL1 monitor.
 
-For the first time ever, run every Intel version of macOS between Mac OS X Tiger 10.4 and macOS Big Sur 11 on Apple silicon with graphics acceleration, so you can run older 32-bit and 64-bit Intel apps like iWork ’09, iLife ’11, Aperture, Final Cut Pro 7, and Front Row, or PowerPC apps like AppleWorks, and re-experience iconic Aqua desktop effects like the translucent menu bar, reflective blurred Dock, and water ripple animation in Dashboard. This marks an exciting new chapter in the preservation of the history of Mac.
-<p align="center">
-  <a href="https://github.com/nfzerox/VirtualIntelMacOnAppleSilicon/releases/download/2.2.1/VirtualIntelMac.2.2.1.zip"><img width="250" src="Source/screenshots/assets/download.svg" alt="Download Virtual Intel Mac"></a>
-</p>
+---
 
-Virtual Intel Mac seamlessly integrates many technical breakthroughs into an intuitive Mac app. It uses Hybrid Hypervisor for fast Intel emulation on Apple silicon, supports Metal and OpenGL acceleration, 32-bit and 64-bit Intel apps, PowerPC apps, Retina resolution, live resizing, automatic setup, USB and audio passthrough, shared and bridged networking, file sharing, remote login, clipboard sync, and more.
+## Overview
 
-Virtual Intel Mac is a community project and is not affiliated with UTM, VirtualBuddy, Parallels Desktop, or Apple. Contributions are welcome!
+This repository adapts the [Hybrid Hypervisor](Source/HybridHypervisor) full-system x86-64 engine and QEMU HVDBT handoff layer for **x86-64 Windows guests** on Apple Silicon Macs:
 
-## Frequently Asked Questions
+- **100% Pure-Native & Self-Contained**: Pure C / ARM64 NEON x86-64 translation engine (`CEngine` + freestanding EL1 `Monitor` + Swift `Hypervisor.framework` runner) with **zero external FEXCore / fmt / xxhash dependencies** on `main`.
+- **Windows Kernel & ISA Focus**: Targeted fast paths for NT kernel scheduling, CR3 context switches, lockless HPET reads, deferred edge-triggered LAPIC EOIs, 44 RAPL/thermal/platform MSRs, WoW64 segment transitions, and full AVX/AVX2/FMA3/BMI1/BMI2/ADX/AES-NI/SHA-NI user-mode workloads.
+- **Branch Layout**:
+  - `main`: Pure-native, self-contained Windows x86-64 optimized engine and QEMU HVDBT integration.
+  - [`fex-frozen`](https://github.com/AotianNeo/VirtualIntelMacOnAppleSilicon/tree/fex-frozen): Frozen archive of the earlier experimental FEXCore JIT bridge exploration.
 
-### Which versions of macOS guests can I run?
+---
 
-You can run Mac OS X Tiger 10.4, Mac OS X Leopard 10.5, Mac OS X Snow Leopard 10.6, Mac OS X Lion 10.7, OS X Mountain Lion 10.8, OS X Mavericks 10.9, OS X Yosemite 10.10, OS X El Capitan 10.11, macOS Sierra 10.12, macOS High Sierra 10.13, macOS Mojave 10.14, macOS Catalina 10.15, and macOS Big Sur 11 guests.
+## Measured Benchmarks (Apple M5 Pro, 16-vCPU Windows Server 2022)
 
-OpenGL acceleration is available in Mac OS X Tiger 10.4 up to macOS Big Sur 11 guests. Metal acceleration is available in macOS Mojave 10.14, macOS Catalina 10.15, and macOS Big Sur 11 guests. Contributions to expand app and game compatibility are welcome!
+Measured inside a **16-vCPU Windows Server 2022** guest (`LC_HVDBT=1 LC_HVDBT_FAST_FLAGS=1`) on an **Apple M5 Pro** host:
 
-To avoid potential account lockouts, signing into iCloud or an Apple Account is not supported. You can download apps from the web.
+### 7-Zip 26.06 Benchmark
 
-### Which versions of macOS do I need as the host?
+| Configuration | Score (MIPS) | Comparison |
+|---|---|---|
+| **1-Thread** (`-mmt1 -md22`) | **`8,292 MIPS`** | **`+34.8%`** vs macOS Rosetta 2 (`6,152 MIPS`) · **`85.7%`** of native ARM64 (`9,680 MIPS`) |
+| **16-Thread** (`-mmt16 -md24`) | **`110,011 MIPS`** | **`+29.1%`** vs macOS Rosetta 2 (`85,240 MIPS`) |
 
-Virtual Intel Mac works on macOS 27 Golden Gate, macOS Tahoe 26, and macOS Sequoia 15 hosts.
+### Geekbench 7.1.0 Pro AVX2
 
-While the headline feature is to run Intel versions of macOS on Apple silicon with graphics acceleration, Virtual Intel Mac is actually a Universal app, meaning it works on both Apple silicon hosts and Intel hosts.
+| Metric | Historical Baseline | Optimized `main` | Improvement |
+|---|---|---|---|
+| **Single-Core** | `419` | **`1,611`** | **`3.84x`** (`16/16` valid workloads) |
+| **Multi-Core** | `1,897` | **`11,768`** | **`6.20x`** (`8/8` valid workloads) |
+| **Code-Cache Global Flushes (`all=1`)** | Frequent | **`0`** | Zero full-cache flushes across the entire SC + MC run |
 
-### What kind of performance does Virtual Intel Mac offer?
+---
 
-On Apple silicon hosts, Virtual Intel Mac supports Hybrid Hypervisor for CPU workloads and hardware-accelerated graphics for GPU workloads. With the M4 chip, Virtual Intel Mac delivers roughly the same class of CPU performance as MacBook Pro (13-inch, Mid 2020) and GPU performance as MacBook Pro (16-inch, 2019) with Radeon Pro 5500M.
+## Core Architectural Optimizations for Windows
 
-On Intel hosts, Virtual Intel Mac runs with near-native CPU and GPU performance.
+1. **Pure-C AVX/AVX2/FMA/BMI/ADX Translator & `YMM8..15_HI` Register Cache**
+   - Vendored **Zydis v4.1.0** decoder ([`x86_decode.c`](Source/HybridHypervisor/Sources/CEngine/x86_decode.c)) paired with a pure-C ARM64/NEON emitter ([`emit_ext.c`](Source/HybridHypervisor/Sources/CEngine/emit_ext.c)) using MIT-licensed Box64 encoding primitives ([`arm64_emitter.h`](Source/HybridHypervisor/Sources/CEngine/third_party/box64/arm64_emitter.h)).
+   - Resident `YMM0..7` upper 128-bit lanes in NEON `v16..v23` (spilled/reloaded across monitor transitions via `CTX_YMM_HI` in [`vectors.s`](Source/HybridHypervisor/Monitor/vectors.s)), paired with a 4-slot LRU dirty-tracking pool and `ymm_zero_mask` for `YMM8..15_HI`.
+   - Complete `XSAVE`/`XRSTOR` 256-bit `YMM` state plumbing ([`x87.c`](Source/HybridHypervisor/Monitor/x87.c), [`EngineAPI.swift`](Source/HybridHypervisor/Sources/Engine/EngineAPI.swift)) and `log2sz(16)` fix in [`tr_internal.h`](Source/HybridHypervisor/Sources/CEngine/tr_internal.h) for full 128-bit memory loads on `VPMOV{S,Z}X* ymm, m128`.
 
-### How long does it take to install macOS?
+2. **Forward-DAG, 9-Instruction Inline L1 Indirect Cache & `x26` Hardware RAS**
+   - CPL-tiered Forward-DAG translation ([`translate.c`](Source/HybridHypervisor/Sources/CEngine/translate.c)) with compact codegen and EL0 inlining of narrow 8/16-bit shifts/rotates and 32/64-bit `ROL`/`ROR` by `CL` ([`emit_int.c`](Source/HybridHypervisor/Sources/CEngine/emit_int.c)), `LDMXCSR` fast-path skip, and pure-NEON EL0 `PCMPISTRI`/`VPCMPISTRI` ([`emit_sse.c`](Source/HybridHypervisor/Sources/CEngine/emit_sse.c)).
+   - 9-instruction `_stub_lookup_l1_fast` (`0x900` in [`vectors.s`](Source/HybridHypervisor/Monitor/vectors.s)) probing per-vCPU 64 KB `OFF_FEX_L1` (`x18 + 4 MiB`), shrinking shared-partition block footprint from `520 B` to `289.7 B/block` (`-44.3%`) alongside the `x26` hardware return-address stack (`OFF_RSTACKS`).
 
-Installing macOS generally takes about a few minutes after download.
+3. **EL1 Lockless HPET / Deferred LAPIC EOI / CR3 / RAPL-MSR Fast Paths**
+   - **Lockless HPET Main Counter**: Read-only EL1 `c0` seqlock fast path driven by `cntvct_el0` with monotonic floor enforcement, invalidated automatically on HPET writes/resets in [`hvdbt.c`](Source/vendor/qemu/target/i386/tcg/system/hvdbt.c).
+   - **Deferred Edge-Triggered LAPIC EOI**: EL1 fast path updating `apic_isr` and `hybrid_eoi_pending` when `TMR=0` and `apic_irr_prio <= new_ppr`, synchronized prior to QEMU APIC reads (`hvdbt_sync_eoi_to_apic`).
+   - **Platform & RAPL MSRs + CR3 Pinning**: Direct EL1 handling in [`monitor.c`](Source/HybridHypervisor/Monitor/monitor.c) for `MSR_IA32_TSC`, `MSR_APIC_BASE`, `MSR_CORE_THREAD_COUNT`, and 44 RAPL/thermal/performance MSRs (`CPL != 0 -> #GP(0)`), lockless pinned kernel-view switching (`me->pin[2]`), 64-byte-aligned TTAS `mon_lock`, and WoW64/64-bit `do_mov_seg` / `do_iret` segment validation fixes.
 
-### What if I encounter crashes, bugs, or other issues?
+4. **248 MiB Split Code Cache & 128 MiB PcMap Layout**
+   - Expanded per-partition code cache from `118 MiB` to `248 MiB` (`OFF_CC` shared + `OFF_CC2` private), `PCMAP_BYTES` from `44 MiB` to `128 MiB`, and `BLOCKS_MAX` to `1M` shared / `512K` private, with dual stub copies (`OFF_STUBS` / `OFF_STUBS_HI` and `OFF_STUBS2` / `OFF_STUBS2_HI`) so `+/-128 MiB` ARM64 `B`/`BL` branches stay in range across the entire code cache ([`engine_abi.h`](Source/HybridHypervisor/Sources/CEngine/include/engine_abi.h), [`Engine.swift`](Source/HybridHypervisor/Sources/Engine/Engine.swift)).
 
-First, [update to the latest version of Virtual Intel Mac](https://github.com/nfzerox/VirtualIntelMacOnAppleSilicon/releases), and temporarily uninstall tweaks such as [Ammonia](https://github.com/CoreBedtime/ammonia) which may generally cause compatibility issues with virtualization software.
+5. **45/45 Zero-Bit-Diff AVX2/YMM Differential Test Suite**
+   - Bare-metal x86-64 Multiboot1 differential harness ([`test-ext-diff.py`](Source/HybridHypervisor/Tests/test-ext-diff.py)) verifying QEMU TCG (`LC_HVDBT=0`) vs HVDBT (`LC_HVDBT=1`) across 45 instruction suites (GPRs, RFLAGS, XMM0-15, YMM0-15) with **0 bit differences**, plus cross-page VEX decode coverage ([`page-edge-decode.c`](Source/HybridHypervisor/Tests/page-edge-decode.c)).
 
-If the issue remains, point [Codex](https://chatgpt.com/codex) or [Claude Code](https://claude.com/product/claude-code) at this repository, then ask it to diagnose live and fix the issue. Because many issues can be specific to the overall setup, or apps and games you'd like to run, this is usually the easiest way to fix issues. If you find a solution, please [open a pull request](https://github.com/nfzerox/VirtualIntelMacOnAppleSilicon/pulls). Contributions are welcome!
+---
 
-If you don't have access to frontier coding agents, [open a GitHub issue](https://github.com/nfzerox/VirtualIntelMacOnAppleSilicon/issues?q=is%3Aissue) when you encounter a crash, bug, or other problem. Include clear reproduction steps, a screenshot or screen recording, and a diagnostics file from Virtual Intel Mac's in-app Settings > Export Diagnostics.
+## Quick Start: Build, Test & Run Windows
 
-## Screenshots
+### Prerequisites
 
-<p align="center">
-  <a href="Source/screenshots/Virtual_Intel_Mac_Multi_Window.png"><img src="Source/screenshots/Virtual_Intel_Mac_Multi_Window.png" alt="Multiple virtual Mac windows" width="32%"></a>
-  <a href="Source/screenshots/Virtual_Intel_Mac_Create_Version_Select.png"><img src="Source/screenshots/Virtual_Intel_Mac_Create_Version_Select.png" alt="Choose a macOS version" width="32%"></a>
-  <a href="Source/screenshots/Virtual_Intel_Mac_Create_Configure.png"><img src="Source/screenshots/Virtual_Intel_Mac_Create_Configure.png" alt="Configure a new virtual Mac" width="32%"></a>
-</p>
-<p align="center">
-  <a href="Source/screenshots/Virtual_Intel_Mac_Create_Download.png"><img src="Source/screenshots/Virtual_Intel_Mac_Create_Download.png" alt="Download and prepare macOS" width="32%"></a>
-  <a href="Source/screenshots/Virtual_Intel_Mac_Library_Expanded.png"><img src="Source/screenshots/Virtual_Intel_Mac_Library_Expanded.png" alt="Expanded library view" width="32%"></a>
-  <a href="Source/screenshots/Virtual_Intel_Mac_Library_Compact.png"><img src="Source/screenshots/Virtual_Intel_Mac_Library_Compact.png" alt="Compact library view" width="32%"></a>
-</p>
-<p align="center">
-  <a href="Source/screenshots/Virtual_Intel_Mac_Mojave_Aperture.png"><img src="Source/screenshots/Virtual_Intel_Mac_Mojave_Aperture.png" alt="Aperture running in Mojave" width="32%"></a>
-  <a href="Source/screenshots/Virtual_Intel_Mac_Mojave_iTunes.png"><img src="Source/screenshots/Virtual_Intel_Mac_Mojave_iTunes.png" alt="iTunes running in Mojave" width="32%"></a>
-  <a href="Source/screenshots/Virtual_Intel_Mac_Mojave_Xcode_Carbon.png"><img src="Source/screenshots/Virtual_Intel_Mac_Mojave_Xcode_Carbon.png" alt="Building a 32-bit Carbon app with Xcode in Mojave" width="32%"></a>
-</p>
-<p align="center">
-  <a href="Source/screenshots/Virtual_Intel_Mac_Catalina_Pages_Preview.png"><img src="Source/screenshots/Virtual_Intel_Mac_Catalina_Pages_Preview.png" alt="Pages and Preview running in Catalina" width="32%"></a>
-  <a href="Source/screenshots/Virtual_Intel_Mac_Big_Sur_Keynote.png"><img src="Source/screenshots/Virtual_Intel_Mac_Big_Sur_Keynote.png" alt="Keynote running in Big Sur" width="32%"></a>
-  <a href="Source/screenshots/Virtual_Intel_Mac_Configure_General.png"><img src="Source/screenshots/Virtual_Intel_Mac_Configure_General.png" alt="General virtual Mac configuration" width="32%"></a>
-</p>
-<p align="center">
-  <a href="Source/screenshots/Virtual_Intel_Mac_Configure_Hardware.png"><img src="Source/screenshots/Virtual_Intel_Mac_Configure_Hardware.png" alt="Virtual Mac hardware configuration" width="32%"></a>
-  <a href="Source/screenshots/Virtual_Intel_Mac_Configure_Sharing.png"><img src="Source/screenshots/Virtual_Intel_Mac_Configure_Sharing.png" alt="Virtual Mac sharing configuration" width="32%"></a>
-  <a href="Source/screenshots/Virtual_Intel_Mac_Settings.png"><img src="Source/screenshots/Virtual_Intel_Mac_Settings.png" alt="Virtual Intel Mac settings" width="32%"></a>
-</p>
-<p align="center">
-  <a href="Source/screenshots/Virtual_Intel_Mac_Geekbench_Hybrid_Hypervisor_CPU.png"><img src="Source/screenshots/Virtual_Intel_Mac_Geekbench_Hybrid_Hypervisor_CPU.png" alt="Geekbench CPU results with Hybrid Hypervisor" width="32%"></a>
-  <a href="Source/screenshots/Virtual_Intel_Mac_Geekbench_TCG_Emulation_CPU.png"><img src="Source/screenshots/Virtual_Intel_Mac_Geekbench_TCG_Emulation_CPU.png" alt="Geekbench CPU results with TCG Emulation" width="32%"></a>
-  <a href="Source/screenshots/Virtual_Intel_Mac_Geekbench_Metal.png"><img src="Source/screenshots/Virtual_Intel_Mac_Geekbench_Metal.png" alt="Geekbench Metal results" width="32%"></a>
-</p>
+- Apple Silicon Mac (macOS with `Hypervisor.framework` entitlement support and Xcode / Swift toolchain)
+- Build & test tools (e.g., via Homebrew): `meson`, `ninja`, `glib`, `pixman`, `libslirp`, `nasm`, `lld` (`ld.lld`)
 
-## Technical Overview
+### 1. Build Hybrid Hypervisor (`libEngine.a`)
 
-As the world's first high performance full-system x86_64 emulation engine on arm64 hosts, [Hybrid Hypervisor](Source/HybridHypervisor) premieres with Virtual Intel Mac and is permissively licensed under MIT for developers to improve upon and virtualization apps to integrate. It [translates x86 instructions into AArch64 blocks](Source/HybridHypervisor/Sources/CEngine/translate.c) and runs them inside a [Hypervisor.framework virtual machine](Source/HybridHypervisor/Sources/Engine/Engine.swift), using hardware-backed shadow paging and x86-compatible memory ordering. A small [in-VM monitor](Source/HybridHypervisor/Monitor/monitor.c) handles page tables, exceptions, and frequent kernel operations without returning to the host for each operation. [QEMU's handoff layer](Source/vendor/qemu/target/i386/tcg/system/hvdbt.c) synchronizes CPU state when execution falls back to TCG, while QEMU continues to emulate devices and timers through the engine's [C interface](Source/HybridHypervisor/Sources/Engine/EngineAPI.swift).
+```zsh
+./Source/HybridHypervisor/build.sh release --library-only
+```
 
-For Tiger up to Mojave guests, the groundbreaking [PassthroughOpenGL](Source/PassthroughOpenGL) implementation connects a compiled [GLD engine](Source/PassthroughOpenGL/passthrough-opengl-gli.c) to the host's [native hardware OpenGL executor](Source/PassthroughOpenGL/passthrough-opengl-host.c). [Generated dispatch marshalling](Source/scripts/generate-passthrough-opengl.py) carries the guest's OpenGL calls, while [shared-memory render targets](Source/PassthroughOpenGL/direct-vram-render-target-host.c) and [surface publication](Source/PassthroughOpenGL/direct-iosurface-writes.h) enables fast graphics routing. The [VMsvga2-derived guest drivers](Source/vendor/source/VMsvga2) supply framebuffer and surface integration.
+Sync sources and build `Source/Build/HybridEngine/Package` for QEMU linking:
 
-Because the ParavirtualizedGraphics stack was first introduced in macOS Big Sur, enabling Metal in macOS Catalina and macOS Mojave guests means backporting its guest side support. Since AppleParavirtGPU depends on Big Sur's changes to surface cache ownership and release, it is transplanted together with IOSurface, IOAcceleratorFamily2 and IOGraphicsFamily, with newer kernel APIs shimmed using [`PVGKernelCompat`](Source/compat/PVGKernelCompat/PVGKernelCompat.cpp). Guest-side [IOSurface and accelerator ABI translations](Source/compat/PVGIOSurfaceABI/PVGIOSurfaceABI.cpp), [surface-limit fixes](Source/compat/PVGIOSurfaceABI/PVGSurfaceLimits.h), and [framebuffer initialization](Source/compat/PVGFramebufferBootstrap/PVGFramebufferBootstrap.cpp) bridge the older display stack. [MetalSerializer is then extracted](Source/scripts/build-metalserializer) from Big Sur's dyld shared cache using [dsce](Source/vendor/source/dsce), and rebuilt for the [older Objective-C runtime](Source/compat/PVGMojaveObjC.m), including [Mojave's pipeline descriptor serialization](Source/compat/PVGMojavePipelineSerialization.m).
+```zsh
+./Source/scripts/build-hybrid-engine Source/Build/HybridEngine --library-only
+```
 
-Big Sur's compiler plugin is built against LLVM 31001, whose C++ layouts differ from the LLVM 3902 in Mojave and Catalina. To bridge them, [`PVGCompilerPluginBridge`](Source/compat/PVGCompilerPluginBridge/PVGCompilerPluginBridge.c) has the guest's LLVM serialize each shader as bitcode and Big Sur's LLVM parse it back, so both compilers run side by side in one process. The [Metal compatibility layer](Source/compat/PVGMetalCompat/PVGMetalCompat.m) adapts command encoding and library loading, with [completion-layout recognition](Source/compat/PVGMetalCompat/PVGCompletionSite.h) and a [shader cache](Source/compat/PVGMetalCompat/PVGShaderCache.h) for the older guest stack.
+### 2. Build & Sign QEMU with HVDBT (`qemu-system-x86_64`)
 
-OpenGL acceleration on Catalina comes from Big Sur's Metal-based OpenGL renderer, with [`PVGOpenGLMetal`](Source/compat/PVGOpenGLProbe/PVGOpenGLMetal.m) filling in the Metal and IOSurface APIs it expects and a [small registration driver](Source/compat/PVGOpenGLProbe/PVGOpenGLProbe.cpp) connecting it to the virtual accelerator. Its built-in shaders are [downgraded](Source/scripts/opengl-downgrade-builtins) to Mojave's AIR 2.1, while [pixel-buffer lifetime compatibility](Source/compat/PVGOpenGLProbe/PVGCGLPBufferCompat.m) handles older CGL clients.
+```zsh
+meson setup Source/Build/qemu-win-hvdbt Source/vendor/qemu \
+  -Dhvf=disabled -Dcocoa=enabled -Dpixman=enabled -Dslirp=enabled \
+  -Dpvg=disabled -Dguest_agent=disabled -Dwerror=false -Db_pie=false -Ddocs=disabled \
+  -Dhvdbt_engine="$PWD/Source/Build/HybridEngine/Package"
 
-On Apple silicon, the arm64e slice of ParavirtualizedGraphics uses a different wire protocol compared to the x86_64 slice; therefore, the Intel slice is run through an [x86_64 helper](Source/vendor/qemu/hw/display/apple-gfx-helper.m) under Rosetta 2 while [sharing guest memory](Source/vendor/qemu/hw/display/apple-gfx.m) with arm64 QEMU. Since Metal rejects buffers spanning fragmented 4 KB guest pages on a 16 KB page host, the helper [shadows them with GPU scatter and gather blits](Source/vendor/qemu/hw/display/apple-gfx-legacy-shadow.m). An update to Virtual Intel Mac is planned for macOS 28 and later so it continues to work after the removal of Rosetta 2.
+ninja -C Source/Build/qemu-win-hvdbt -j"$(sysctl -n hw.ncpu)" qemu-system-x86_64
 
-Additional QEMU optimizations are made to reduce [audio skips and crackling](Source/vendor/qemu/hw/audio/hda-codec.c), as well as improve [USB passthrough](Source/USBHelper/main.m) and [networking support](Source/NetworkHelper/main.m).
+xattr -cr Source/Build/qemu-win-hvdbt/qemu-system-x86_64
+codesign --force --sign - \
+  --entitlements Source/vendor/qemu/accel/hvf/entitlements.plist \
+  Source/Build/qemu-win-hvdbt/qemu-system-x86_64
+```
 
-## Credits
+### 3. Run the 45-Case AVX2/YMM Differential Test Suite
 
-Virtual Intel Mac is made possible thanks to learnings from building [Virtual Mac on iPad](https://github.com/nfzerox/VirtualMacOniPad), further advances in agentic coding, and these excellent open source projects:
+```zsh
+python3 Source/HybridHypervisor/Tests/test-ext-diff.py --ymm
+```
 
-- [QEMU](https://www.qemu.org) provides x86_64 emulation and the `apple-gfx-pci` device that connects Intel guests to Apple's paravirtualized graphics framework.
-- [Hybrid Hypervisor](Source/HybridHypervisor), invented by Sam Henri Gold (developer of Light Touch), delivers up to 8x faster CPU emulation on Apple silicon.
-- [dsce](https://github.com/moraea/dsce) makes it possible to extract loadable x86_64 libraries from Big Sur's and macOS 26's dyld shared caches.
-- [reims-vgpu](https://github.com/steelbrain/reims-vgpu) provides an invaluable reference for the paravirtualized graphics protocol.
-- [Lilu](https://github.com/acidanthera/Lilu) and [MacKernelSDK](https://github.com/acidanthera/MacKernelSDK) underpin this project's kernel compatibility extensions.
-- [OpenCore](https://github.com/acidanthera/OpenCorePkg) and [OpenCore-ISO](https://github.com/LongQT-sea/OpenCore-ISO) boot macOS in QEMU.
-- [macos-iso-builder](https://github.com/LongQT-sea/macos-iso-builder) informs this project's installer media assembly.
-- [VoodooHDA](https://sourceforge.net/projects/voodoohda/) brings sound to Tiger through Catalina guests.
-- [EDK II](https://github.com/tianocore/edk2) provides the UEFI firmware and libraries used by the boot-policy driver.
-- [UTM](https://github.com/utmapp/UTM) provides references for split process graphics, networking and USB integration on macOS.
-- [OpenSSH Portable](https://www.openssh.org/portable.html) and [LibreSSL](https://www.libressl.org) provide the isolated SSH client for older OS X guests, without changing the host's SSH security policy.
-- [JSONKit](https://github.com/johnezang/JSONKit) provides JSON serialization for Snow Leopard's guest-control tools, outside the graphics hot path.
-- [Samba](https://www.samba.org) supplies SMB compatibility components for older guests.
-- The native SMB client backports include software developed by [Boris Popov](https://github.com/apple-oss-distributions/smb), with Apple's Darwin8/9 filesystem interfaces preserved.
-- [libusb](https://libusb.info) and [usbredir](https://www.spice-space.org/usbredir.html) provide the USB capture and redirection libraries used by the USB helper.
-- [XZ Utils](https://tukaani.org/xz/) provides compression for the bundled guest payloads.
-- [VMsvga2](https://sourceforge.net/projects/vmsvga2/) by Zenith432 provides the framebuffer and surface-driver foundation for PassthroughOpenGL.
-- [gfxCardStatus](https://github.com/codykrieger/gfxCardStatus) informs the physical-reference-only Intel GPU selection probe, not the shipped VM runtime.
+Expected result: `ALL 45 DIFFERENTIAL TESTS PASSED (0 bit differences)!`
+
+### 4. Launch an x86-64 Windows Guest
+
+```zsh
+LC_HVDBT=1 LC_HVDBT_FAST_FLAGS=1 \
+./Source/Build/qemu-win-hvdbt/qemu-system-x86_64 \
+  -name Windows-x64-HVDBT \
+  -M q35,accel=tcg,hpet=on \
+  -cpu Westmere,level=0xd,+sse4.2,+popcnt,+aes,+pclmulqdq,+vaes,+vpclmulqdq,+movbe,+xsave,+avx,+avx2,+f16c,+fma,+bmi1,+bmi2,+abm,+adx,+sha-ni,+x2apic,+invtsc,model=151,stepping=2,model-id="12th Gen Intel(R) Core(TM) i9-12900K" \
+  -smp 16,sockets=1,cores=16,threads=1 -m 16G \
+  -drive if=pflash,format=raw,readonly=on,file=/path/to/OVMF_CODE.fd \
+  -drive if=virtio,format=qcow2,file=/path/to/windows.qcow2 \
+  -device VGA,vgamem_mb=64,edid=on,xres=1920,yres=1080 \
+  -display cocoa,show-cursor=on \
+  -device qemu-xhci -device usb-kbd -device usb-tablet \
+  -netdev user,id=net0 -device virtio-net-pci,netdev=net0
+```
+
+> **Tip**: For rapid `CEngine` iteration on a running VM, [`Source/scripts/hot-reload-jit.sh`](Source/scripts/hot-reload-jit.sh) compiles the C translation emitters into a signed dylib for live reload. Keep hardware TSO enabled on Windows SMP guests (do not set `LC_HVDBT_NO_TSO=1`).
+
+---
+
+## Upstream Attribution & License
+
+This project is a fork of [**Virtual Intel Mac on Apple silicon**](https://github.com/nfzerox/VirtualIntelMacOnAppleSilicon) (`MIT License`, Copyright (c) 2026 [nfzerox](https://github.com/nfzerox)). See [LICENSE](LICENSE) for full license terms.
+
+Key upstream and third-party open-source projects powering this stack:
+
+- **[VirtualIntelMacOnAppleSilicon](https://github.com/nfzerox/VirtualIntelMacOnAppleSilicon)** by `nfzerox` — original Virtual Intel Mac application, macOS guest graphics stack, and [Hybrid Hypervisor](Source/HybridHypervisor) (invented by Sam Henri Gold).
+- **[QEMU](https://www.qemu.org)** — x86-64 platform/device emulation and [HVDBT handoff layer](Source/vendor/qemu/target/i386/tcg/system/hvdbt.c).
+- **[Zydis](https://github.com/zyantific/zydis)** (`v4.1.0`, MIT License) — vendored x86-64/VEX/EVEX instruction decoder in [`third_party/zydis`](Source/HybridHypervisor/Sources/CEngine/third_party/zydis).
+- **[Box64](https://github.com/ptitSeb/box64)** (MIT License) — ARM64/NEON emitter macros adapted in [`third_party/box64`](Source/HybridHypervisor/Sources/CEngine/third_party/box64).
