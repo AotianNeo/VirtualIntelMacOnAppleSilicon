@@ -64,7 +64,10 @@ final class CodeCacheGate: @unchecked Sendable {
     let condition = NSCondition()
     var inside = 0
     var flushing = false
+    var flushGeneration: UInt64 = 0
     var engines: [Engine] = []
+    var lastBackendPath = ""
+    var lastBackendCheckTicks: UInt64 = 0
 
     func enter() {
         condition.lock()
@@ -96,6 +99,14 @@ public final class Engine {
     public private(set) var exitCount: UInt64 = 0
     private nonisolated(unsafe) var watchdogFired = false
     private var trace = Int(ProcessInfo.processInfo.environment["ENGINE_TRACE"] ?? "") ?? 0
+    private let nativeWindowsImages: Set<String> = {
+        let env = ProcessInfo.processInfo.environment
+        if let explicit = env["LC_HVDBT_FEX_NATIVE_IMAGE"] {
+            return Set(explicit.lowercased().split(separator: ",").map(String.init))
+        }
+        return []
+    }()
+    private var windowsProcessImages: [UInt64: (parameters: UInt64, isNative: Bool)] = [:]
     public var exitCode: Int32?
     public var requestStop = false
     public internal(set) var boundaryRIP: UInt64 = 0
@@ -111,6 +122,8 @@ public final class Engine {
     private nonisolated(unsafe) var lastHostCall = 0
     private nonisolated(unsafe) var fallbackCount: UInt64 = 0
     private nonisolated(unsafe) var portCount: UInt64 = 0
+    private var r3ExcLogged: Int = 0
+    private var localBackendCheckTicks: UInt64 = 0
     // Explicit component-research diagnostic. Disabled in normal launches;
     // the host already times exits, so only a slow enabled event writes RAM.
     let latencyTracing = ProcessInfo.processInfo.environment["VIM_HYBRID_LATENCY_TRACE"] == "1"
@@ -230,18 +243,22 @@ public final class Engine {
         gate.condition.unlock()
     }
 
-    private var firstContext: UnsafeMutablePointer<EngineCtx> { (priv + Int(kOffCtx)).assumingMemoryBound(to: EngineCtx.self) }
+    var firstContext: UnsafeMutablePointer<EngineCtx> { (priv + Int(kOffCtx)).assumingMemoryBound(to: EngineCtx.self) }
     private var severalVCPUs: Bool { firstContext.pointee.vcpu_count > 1 }
 
     /// Resets the code cache with every other vCPU out of it. This vCPU is inside, in a host call, with the translator lock not held. Its monitor holds no pointer into the
     /// cache that it uses again, and nor does a vCPU at a boundary: each resumes through translate_here.
-    private func resetCodeCacheWithOthersOut() {
+    private func resetCodeCacheWithOthersOut(afterGeneration: UInt64? = nil, forceAll: Bool = false, forcePrivate: Bool = false) {
         gate.condition.lock()
         if gate.flushing { // another vCPU got here first: this one counts as out
             gate.inside -= 1
             gate.condition.broadcast()
             while gate.flushing { gate.condition.wait() }
             gate.inside += 1
+            gate.condition.unlock()
+            return
+        }
+        if let expected = afterGeneration, gate.flushGeneration != expected {
             gate.condition.unlock()
             return
         }
@@ -252,13 +269,68 @@ public final class Engine {
         }
         gate.condition.unlock()
         translatorLock.lock()
-        if tr_needs_flush() { tr_flush_parked(false) }
+        if tr_needs_flush() {
+            tr_flush_parked(false)
+        } else if forceAll {
+            tr_flush_parked(true)
+        } else if forcePrivate {
+            tr_flush_parked(false)
+        }
         for engine in gate.engines { engine.ctx.pointee.tr_flushed = 1 }
         translatorLock.unlock()
         gate.condition.lock()
+        gate.flushGeneration &+= 1
         gate.flushing = false
         gate.condition.broadcast()
         gate.condition.unlock()
+    }
+
+    private func reloadBackendWithOthersOut(_ path: String) {
+        if severalVCPUs {
+            gate.condition.lock()
+            if gate.flushing {
+                gate.inside -= 1
+                gate.condition.broadcast()
+                while gate.flushing { gate.condition.wait() }
+                gate.inside += 1
+                gate.condition.unlock()
+                return
+            }
+            gate.flushing = true
+            while gate.inside > 1 {
+                for engine in gate.engines where engine !== self { engine.requestBoundary() }
+                gate.condition.wait(until: Date(timeIntervalSinceNow: 0.001))
+            }
+            gate.condition.unlock()
+        }
+        translatorLock.lock()
+        let ok = path.withCString { tr_reload_backend($0) }
+        if ok {
+            tr_flush_parked(true)
+            for engine in gate.engines { engine.ctx.pointee.tr_flushed = 1 }
+            gate.lastBackendPath = path
+        }
+        translatorLock.unlock()
+        if severalVCPUs {
+            gate.condition.lock()
+            gate.flushing = false
+            gate.condition.broadcast()
+            gate.condition.unlock()
+        }
+    }
+
+    private func checkHotReloadBackend() {
+        let now = mach_absolute_time()
+        guard now &- localBackendCheckTicks >= 6_000_000 else { return } // ~0.25s at 24MHz, lock-free
+        localBackendCheckTicks = now
+        guard access("/tmp/hvdbt-reload.path", F_OK) == 0 else { return }
+        gate.condition.lock()
+        let prev = gate.lastBackendPath
+        gate.condition.unlock()
+        guard let raw = try? String(contentsOfFile: "/tmp/hvdbt-reload.path", encoding: .utf8) else { return }
+        let path = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !path.isEmpty && path != prev else { return }
+        reloadBackendWithOthersOut(path)
     }
 
     /// On the first vCPU, before any vCPU runs: how many this VM will have.
@@ -269,8 +341,11 @@ public final class Engine {
         let bytes = Array(UnsafeBufferPointer(start: engine_monitor_macho_ptr(), count: engine_monitor_macho_size()))
         let image = try MachOImage(bytes: bytes)
         image.copy(to: priv, origin: kPrivVA)
-        memcpy(priv + Int(kOffStubs2), priv + Int(kOffStubs), Int(kOffCC - kOffStubs)) // position independent, for the code cache's second part to reach
-        sys_icache_invalidate(priv + Int(kOffStubs2), Int(kOffCC - kOffStubs))
+        let stubsBytes = Int(kOffCC - kOffStubs) // 2 MiB: covers all EL0 stubs (0x000..0xfff+)
+        for dstOff in [kOffStubsHi, kOffStubs2, kOffStubs2Hi] {
+            memcpy(priv + Int(dstOff), priv + Int(kOffStubs), stubsBytes) // position independent, within ±128 MiB of each half
+            sys_icache_invalidate(priv + Int(dstOff), stubsBytes)
+        }
 
         // Static tables for the private slots, 2 MB blocks, shared by every shadow root.
         var next = kOffPT
@@ -309,11 +384,11 @@ public final class Engine {
             switch off {
             case kOffMonText..<kOffMonData: attrs = apEL1RO | uxn  // monitor text: EL1 execute
             case kOffStubs..<(kOffCC + kCCSize), kOffStubs2..<(kOffCC2 + kCCSize): attrs = apEL1RW | pxn  // stubs and code: EL0 execute-only
-            case kOffCtx..<kOffCtxEnd: attrs = apRW | uxn | pxn
+            case kOffCtx..<kOffCtxEnd, kOffFexL1..<kOffFexL1End: attrs = apRW | uxn | pxn
             case kOffHash..<kOffRStacks: attrs = apRO | uxn | pxn
             default: attrs = apEL1RW | uxn | pxn
             }
-            if off == kOffStubs || off == kOffStubs2 { attrs = apEL1RO | pxn }
+            if off == kOffStubs || off == kOffStubsHi || off == kOffStubs2 || off == kOffStubs2Hi { attrs = apEL1RO | pxn }
             block2M(off).pointee = ipa(off) | block | attrs
             off += 2 << 20
         }
@@ -411,6 +486,7 @@ public final class Engine {
         ctx.pointee.cr0 = 0x8001_0033
         ctx.pointee.cr4 = 0x620
         ctx.pointee.efer = 0xD01
+        ctx.pointee.xcr0 = 1
     }
 
     // ---- Running ----
@@ -529,8 +605,22 @@ public final class Engine {
                             + "ctx.elr \(hex(ctx.pointee.elr)) x16 \(hex(regs[16])) x30 \(hex(regs[30]))")
                 }
                 // A kick means a device interrupt, a posted vector or a stop request: the monitor sorts out which.
-                hv_vcpu_get_reg(vcpu, HV_REG_PC, &pcAtKick)  // the only live view of a vCPU that stays in the monitor, for the stall report
-                hv_vcpu_get_reg(vcpu, HV_REG_LR, &lrAtKick)
+                if tally != nil {
+                    hv_vcpu_get_reg(vcpu, HV_REG_PC, &pcAtKick)  // the only live view of a vCPU that stays in the monitor, for the stall report
+                    hv_vcpu_get_reg(vcpu, HV_REG_LR, &lrAtKick)
+                }
+                if options.hybrid {
+                    let line = machine?.hasInterruptWaiting() ?? false
+                    engine_ctx_set_irq_line(ctx, line)
+                    let ifOpen = (ctx.pointee.rflags_sys & 0x200) != 0
+                    let fc = firstContext.pointee
+                    if (line && ifOpen) || ctx.pointee.stop_requested != 0 || ctx.pointee.direct_flush != 0 ||
+                        (ctx.pointee.irq_pending != 0 && ifOpen) ||
+                        fc.note_head != fc.note_tail || fc.note_overflow != 0 {
+                        irqLine = true
+                    }
+                    continue
+                }
                 irqLine = true
                 continue
             case HV_EXIT_REASON_VTIMER_ACTIVATED:
@@ -576,6 +666,9 @@ public final class Engine {
     }
 
     private func hostCall(_ code: Int) throws -> RunOutcome? {
+        if code == Int(HC_TRANSLATE) || code == Int(HC_BOUNDARY) || code == Int(HC_HLT) {
+            checkHotReloadBackend()
+        }
         let c = ctx
         // The translator's tables are one set for the VM. Taken here, in the slow path of a host exit that costs far more.
         let translating = code == Int(HC_TRANSLATE) || code == Int(HC_SMC) || code == Int(HC_VIEW_INVALIDATE_VA) || code == Int(HC_VIEW_FORGET) || code == Int(HC_VIEW_DROP) || code == Int(HC_CALL_TAIL)
@@ -601,7 +694,21 @@ public final class Engine {
             let site = c.pointee.req_a.2
             let kind = Int32(c.pointee.req_a.3)
             let coldBefore = tally != nil ? tr_stats().blocks : 0
-            let result = tr_translate(view, c.pointee.req_a.5, Int32(c.pointee.cpl), c.pointee.compat != 0, rip, c.pointee.req_a.4 != 0)
+            var result: TrResult
+            while true {
+                let flushGen = gate.flushGeneration
+                let r = tr_translate(view, c.pointee.req_a.5, Int32(c.pointee.cpl), c.pointee.compat != 0, rip, c.pointee.req_a.4 != 0)
+                if r.needs_flush && severalVCPUs {
+                    let isSharedPart = (UInt32(bitPattern: r.key) & 0x4000_0000) != 0
+                    translatorLock.unlock()
+                    resetCodeCacheWithOthersOut(afterGeneration: flushGen, forceAll: isSharedPart, forcePrivate: !isSharedPart)
+                    cacheWasReset = true
+                    lockTranslator()
+                    continue
+                }
+                result = r
+                break
+            }
             if let tally, c.pointee.cpl == 3, tr_stats().blocks != coldBefore { tally.coldUserBlock(rip: rip, cr3: c.pointee.req_a.5) }
             if result.fetch_fault_va != 0 {
                 c.pointee.req_r.1 = result.fetch_fault_va + 1
@@ -618,11 +725,10 @@ public final class Engine {
             c.pointee.req_r.1 = 0
             c.pointee.req_r.2 = result.frames.0 == ~0 ? 0 : result.frames.0 | 1
             c.pointee.req_r.3 = result.frames.1 == ~0 ? 0 : result.frames.1 | 1
-            if result.flushed {
-                // The site was in the old cache; the monitor drops return stacks on seeing tr_flushed.
-            } else if kind == SVC_LOOKUP_MISS {
+            if kind == SVC_LOOKUP_MISS {
+                // Only the source site went away on a flush. The new target can be looked up.
                 tr_hash_insert(view, rip, result.arm)
-            } else if site != 0 {
+            } else if !result.flushed && site != 0 {
                 if !cacheWasReset { tr_link(site, kind, result.arm, result.key) } // or the site is in the old cache
                 tr_hash_insert(view, rip, result.arm) // so the next site with this target links in the monitor
             }
@@ -633,6 +739,14 @@ public final class Engine {
             defer { invalidations &+= 1; invalidationTicks &+= mach_absolute_time() &- start }
             _ = tr_invalidate_view_va(Int32(c.pointee.req_a.0), c.pointee.req_a.1, UInt32(c.pointee.req_a.2), c.pointee.req_a.3 != 0, c.pointee.req_a.4 != 0)
         case Int(HC_YIELD):
+            let waitTicks = c.pointee.req_a.1
+            if waitTicks > 5 * 24_000_000 && (waitTicks % (5 * 24_000_000)) < 500_000 {
+                let owner = Int(c.pointee.req_a.0)
+                let site = c.pointee.req_a.2
+                let ownerCtx = (priv + Int(kOffCtx + UInt64(owner) * kCtxSlot)).assumingMemoryBound(to: EngineCtx.self).pointee
+                let msg = "[hvdbt-monlock-stall] vCPU \(cpuIndex) waited \(waitTicks / 24_000_000)s for owner vCPU \(owner) lock_site=\(site) owner.elr=\(hex(ownerCtx.elr)) owner.esr=\(hex(ownerCtx.esr)) owner.far=\(hex(ownerCtx.far)) owner.cr3=\(hex(ownerCtx.cr3)) owner.cpl=\(ownerCtx.cpl)\n"
+                _ = msg.withCString { fputs($0, stderr) }
+            }
             sched_yield()
         case Int(HC_PARK):
             gate.leave()
@@ -724,6 +838,15 @@ public final class Engine {
             return .boundary(rip: boundaryRIP)
         case Int(HC_NOTE):
             tally?.processNote()
+            let noteKind = c.pointee.req_a.0
+            if (noteKind == 3 || noteKind == 4) && ProcessInfo.processInfo.environment["LC_HVDBT_LOG_R3_EXC"] != nil {
+                if r3ExcLogged < 16 {
+                    r3ExcLogged += 1
+                    let rip = c.pointee.req_a.1
+                    let b = bytes(at: rip, count: 16)
+                    fputs("[hvdbt-r3-exc] cpu=\(cpuIndex) kind=\(noteKind) fex=\(c.pointee.req_a.4) rip=0x\(String(rip, radix: 16)) a2=0x\(String(c.pointee.req_a.2, radix: 16)) err=0x\(String(c.pointee.req_a.3, radix: 16)) cr3=0x\(String(c.pointee.cr3, radix: 16)) bytes=\(b)\n", stderr)
+                }
+            }
         case Int(HC_FALLBACK):
             boundaryRIP = c.pointee.req_a.1
             fallbackCount += 1
@@ -742,14 +865,18 @@ public final class Engine {
             if options.hybrid {
                 // QEMU's APIC keeps a vector until it is taken, so take one only when it can go in at once. The monitor comes back here when IF opens.
                 c.pointee.req_r.0 = ~0
-                // Lower the line before asking, so a device's kick in between either sets it again or is seen by the question.
-                engine_ctx_set_irq_line(c, false)
-                let line = machine?.hasInterruptWaiting() ?? false
-                if line { engine_ctx_set_irq_line(c, true) }
-                if c.pointee.req_a.0 != 0 && line && c.pointee.irq_pending == 0 && c.pointee.rflags_sys & 0x200 != 0 {
-                    if let vector = machine?.acknowledgeInterrupt() { c.pointee.req_r.0 = UInt64(vector) }
+                // When req_a.0 == 0, mon_irq only needed a host exit to drop Hypervisor.framework's level-asserted virtual IRQ line;
+                // HV_EXIT_REASON_CANCELED already refreshed c->irq_line without extra BQL contention.
+                if c.pointee.req_a.0 != 0 {
+                    // Lower the line before asking, so a device's kick in between either sets it again or is seen by the question.
                     engine_ctx_set_irq_line(c, false)
-                    if machine?.hasInterruptWaiting() ?? false { engine_ctx_set_irq_line(c, true) }
+                    let line = machine?.hasInterruptWaiting() ?? false
+                    if line { engine_ctx_set_irq_line(c, true) }
+                    if line && c.pointee.irq_pending == 0 && c.pointee.rflags_sys & 0x200 != 0 {
+                        if let vector = machine?.acknowledgeInterrupt() { c.pointee.req_r.0 = UInt64(vector) }
+                        engine_ctx_set_irq_line(c, false)
+                        if machine?.hasInterruptWaiting() ?? false { engine_ctx_set_irq_line(c, true) }
+                    }
                 }
             } else if let vector = machine?.acknowledgeInterrupt() {
                 c.pointee.req_r.0 = UInt64(vector)
@@ -831,6 +958,41 @@ public final class Engine {
     }
 
     func hex(_ v: UInt64) -> String { "0x" + String(v, radix: 16) }
+
+    // Opt-in Win64 diagnosis. Identify the image from the current thread's TEB,
+    // and cache the classification only as long as that PEB parameter block is current.
+    private func useNativeWindowsImage(at rip: UInt64) -> Bool {
+        guard ctx.pointee.cpl == 3, ctx.pointee.compat == 0 else { return false }
+        let cr3 = ctx.pointee.cr3
+        func userPointer(_ address: UInt64) -> Bool { address >= 0x10000 && address < 0x0000_8000_0000_0000 }
+        func pointer(_ address: UInt64) -> UInt64? {
+            readGuest(address, count: 8)?.withUnsafeBytes { $0.loadUnaligned(as: UInt64.self) }
+        }
+        let teb = withUnsafeBytes(of: ctx.pointee.x) { $0.bindMemory(to: UInt64.self)[27] }
+        guard userPointer(teb), let peb = pointer(teb + 0x60), userPointer(peb),
+              let parameters = pointer(peb + 0x20), userPointer(parameters)
+        else { return false }
+        if let cached = windowsProcessImages[cr3], cached.parameters == parameters {
+            return cached.isNative
+        }
+        // RTL_USER_PROCESS_PARAMETERS.ImagePathName is a Win64 UNICODE_STRING.
+        guard let descriptor = readGuest(parameters + 0x60, count: 16) else { return false }
+        let count = Int(descriptor.withUnsafeBytes { $0.loadUnaligned(as: UInt16.self) })
+        let address = descriptor.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: 8, as: UInt64.self) }
+        guard count > 0, count <= 2048, count % 2 == 0, userPointer(address),
+              let data = readGuest(address, count: count),
+              let path = String(bytes: data, encoding: .utf16LittleEndian)
+        else { return false }
+        let image = path.split(separator: "\\").last?.lowercased() ?? ""
+        let isNative = nativeWindowsImages.contains(image)
+        if windowsProcessImages.count >= 512 { windowsProcessImages.removeAll(keepingCapacity: true) }
+        windowsProcessImages[cr3] = (parameters, isNative)
+        if isNative {
+            let message = "hvdbt: vCPU \(cpuIndex) selecting native JIT for \(image) cr3 \(hex(cr3)) at x86-rip \(hex(rip))\n"
+            _ = message.withCString { fputs($0, stderr) }
+        }
+        return isNative
+    }
 
     /// Guest bytes at a VA for error messages, through the current CR3.
     public func bytes(at va: UInt64, count: Int = 12, cr3: UInt64? = nil) -> String {

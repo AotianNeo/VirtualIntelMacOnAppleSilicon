@@ -87,6 +87,8 @@ typedef struct {
     uint32_t hybrid_icr_lo, hybrid_icr_hi;
     uint32_t hybrid_tpr;
     uint32_t irq_shadow; // the returned RIP is still protected by STI or MOV SS
+    uint64_t xcr0;
+    uint64_t ymm_hi[16][2];
 } EngineX86State;
 
 EngineHandle *engine_create(const EngineConfig *config, const EngineMachineOps *ops);
@@ -130,6 +132,15 @@ void engine_note_write(EngineHandle *engine, uint64_t gpa, uint64_t bytes);
 void engine_set_irq_line(EngineHandle *engine, bool level);
 // Hybrid: shared pointers to ctx->apic_tpr and ctx->apic_irr_prio for zero-exit CR8/TPR sync.
 void engine_apic_shared_ptrs(EngineHandle *engine, uint32_t **tpr_out, uint32_t **irr_prio_out);
+// Hybrid: shared pointers to ctx->apic_isr[8], ctx->apic_tmr[8], ctx->hybrid_apic_vapic, and ctx->hybrid_eoi_pending
+// for EL1 deferred edge-EOI synced on host/QEMU APIC access.
+void engine_apic_eoi_ptrs(EngineHandle *engine, uint32_t **isr_out, uint32_t **tmr_out,
+                          uint32_t **vapic_out, uint32_t **eoi_pending_out);
+// Hybrid: publish constant/rarely-changing platform MSR values for EL1 RDMSR fast path.
+void engine_set_platform_msrs(EngineHandle *engine, uint64_t apic_base_msr, uint64_t core_thread_count);
+// Hybrid: shared pointers into VM-wide c0 HPET fast-read seqlock fields (read-only from EL1).
+void engine_hpet_fast_ptrs(EngineHandle *engine, uint32_t **seq_out, uint32_t **enabled_out,
+                           int64_t **offset_ns_out, uint64_t **expire_ns_out, uint64_t **floor_tick_out);
 
 // While stopped. The guest's TSC in QEMU's terms: ns is the host's uptime clock plus ns_offset, TSC = ns + ns * num / den + tsc_offset.
 void engine_set_tsc(EngineHandle *engine, uint64_t ns_offset, uint64_t tsc_offset, uint64_t num, uint64_t den);
@@ -156,7 +167,7 @@ void engine_ctx_post_vector(void *ctx, uint8_t vector, bool level);
 void engine_ctx_set_stop(void *ctx);
 void engine_ctx_set_irq_line(void *ctx, bool level);
 void engine_spin_hint(void);
-bool engine_ctx_note_write(void *ctx, const unsigned char *page_info, uint64_t gpa, uint64_t bytes);
+bool engine_ctx_note_write(void *ctx, unsigned char *page_info, uint64_t gpa, uint64_t bytes);
 void *engine_test_shared_ram(uint64_t bytes);
 
 #ifdef __cplusplus

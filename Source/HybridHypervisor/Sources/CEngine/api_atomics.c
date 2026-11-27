@@ -22,19 +22,23 @@ void engine_ctx_set_stop(void *ctx) { __atomic_store_n(&((EngineCtx *)ctx)->stop
 void engine_ctx_set_irq_line(void *ctx, bool level) { __atomic_store_n(&((EngineCtx *)ctx)->irq_line, level, __ATOMIC_RELEASE); }
 
 // Puts each frame of a written range that holds code or page tables on the monitor's list. True if there were any: the vCPU then needs a kick.
-bool engine_ctx_note_write(void *ctx, const unsigned char *page_info, uint64_t gpa, uint64_t bytes) {
+bool engine_ctx_note_write(void *ctx, unsigned char *page_info, uint64_t gpa, uint64_t bytes) {
     EngineCtx *c = ctx;
     bool any = false;
     uint64_t top = gpa + bytes < c->ram_size ? gpa + bytes : c->ram_size;
     for (uint64_t at = gpa & ~0xFFFULL; at < top; at += 4096) {
-        if (!(__atomic_load_n(&page_info[at >> 12], __ATOMIC_ACQUIRE) & (PI_CODE | PI_PT)))
+        uint32_t fr = (uint32_t)(at >> 12);
+        unsigned char pi = __atomic_load_n(&page_info[fr], __ATOMIC_ACQUIRE);
+        if (!(pi & (PI_CODE | PI_PT)) || (pi & PI_NOTE))
+            continue;
+        if (__atomic_fetch_or(&page_info[fr], PI_NOTE, __ATOMIC_ACQ_REL) & PI_NOTE)
             continue;
         any = true;
         uint32_t slot = __atomic_fetch_add(&c->note_head, 1, __ATOMIC_ACQ_REL);
         if (slot - __atomic_load_n(&c->note_tail, __ATOMIC_ACQUIRE) >= 256)
             __atomic_store_n(&c->note_overflow, 1, __ATOMIC_RELEASE);
         else
-            __atomic_store_n(&c->note_ring[slot % 256], (uint32_t)(at >> 12) + 1, __ATOMIC_RELEASE);
+            __atomic_store_n(&c->note_ring[slot % 256], fr + 1, __ATOMIC_RELEASE);
     }
     return any;
 }

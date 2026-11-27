@@ -189,6 +189,45 @@ public func engine_apic_shared_ptrs(
     irrPrioOut.pointee = (raw + MemoryLayout<EngineCtx>.offset(of: \.apic_irr_prio)!).assumingMemoryBound(to: UInt32.self)
 }
 
+@_cdecl("engine_apic_eoi_ptrs")
+public func engine_apic_eoi_ptrs(
+    _ h: OpaquePointer,
+    _ isrOut: UnsafeMutablePointer<UnsafeMutablePointer<UInt32>?>,
+    _ tmrOut: UnsafeMutablePointer<UnsafeMutablePointer<UInt32>?>,
+    _ vapicOut: UnsafeMutablePointer<UnsafeMutablePointer<UInt32>?>,
+    _ eoiPendingOut: UnsafeMutablePointer<UnsafeMutablePointer<UInt32>?>
+) {
+    let raw = UnsafeMutableRawPointer(handle(h).engine.ctx)
+    isrOut.pointee = (raw + MemoryLayout<EngineCtx>.offset(of: \.apic_isr)!).assumingMemoryBound(to: UInt32.self)
+    tmrOut.pointee = (raw + MemoryLayout<EngineCtx>.offset(of: \.apic_tmr)!).assumingMemoryBound(to: UInt32.self)
+    vapicOut.pointee = (raw + MemoryLayout<EngineCtx>.offset(of: \.hybrid_apic_vapic)!).assumingMemoryBound(to: UInt32.self)
+    eoiPendingOut.pointee = (raw + MemoryLayout<EngineCtx>.offset(of: \.hybrid_eoi_pending)!).assumingMemoryBound(to: UInt32.self)
+}
+
+@_cdecl("engine_set_platform_msrs")
+public func engine_set_platform_msrs(_ h: OpaquePointer, _ apicBaseMsr: UInt64, _ coreThreadCount: UInt64) {
+    let c = handle(h).engine.ctx
+    c.pointee.hybrid_apic_base_msr = apicBaseMsr
+    c.pointee.msr_core_thread_count = coreThreadCount
+}
+
+@_cdecl("engine_hpet_fast_ptrs")
+public func engine_hpet_fast_ptrs(
+    _ h: OpaquePointer,
+    _ seqOut: UnsafeMutablePointer<UnsafeMutablePointer<UInt32>?>,
+    _ enabledOut: UnsafeMutablePointer<UnsafeMutablePointer<UInt32>?>,
+    _ offsetNsOut: UnsafeMutablePointer<UnsafeMutablePointer<Int64>?>,
+    _ expireNsOut: UnsafeMutablePointer<UnsafeMutablePointer<UInt64>?>,
+    _ floorTickOut: UnsafeMutablePointer<UnsafeMutablePointer<UInt64>?>
+) {
+    let raw = UnsafeMutableRawPointer(handle(h).engine.firstContext)
+    seqOut.pointee = (raw + MemoryLayout<EngineCtx>.offset(of: \.hpet_fast_seq)!).assumingMemoryBound(to: UInt32.self)
+    enabledOut.pointee = (raw + MemoryLayout<EngineCtx>.offset(of: \.hpet_fast_enabled)!).assumingMemoryBound(to: UInt32.self)
+    offsetNsOut.pointee = (raw + MemoryLayout<EngineCtx>.offset(of: \.hpet_fast_offset_ns)!).assumingMemoryBound(to: Int64.self)
+    expireNsOut.pointee = (raw + MemoryLayout<EngineCtx>.offset(of: \.hpet_fast_expire_ns)!).assumingMemoryBound(to: UInt64.self)
+    floorTickOut.pointee = (raw + MemoryLayout<EngineCtx>.offset(of: \.hpet_fast_floor_tick)!).assumingMemoryBound(to: UInt64.self)
+}
+
 @_cdecl("engine_set_tsc")
 public func engine_set_tsc(_ h: OpaquePointer, _ nsOffset: UInt64, _ tscOffset: UInt64, _ num: UInt64, _ den: UInt64) {
     handle(h).engine.setTSC(nsOffset: nsOffset, tscOffset: tscOffset, num: num, den: den)
@@ -295,6 +334,8 @@ extension Engine {
         s.cpl = c.pointee.cpl
         s.mxcsr = mxcsr()
         readXMM(into: &s)
+        s.xcr0 = c.pointee.xcr0
+        s.ymm_hi = c.pointee.ymm_hi
         s.mm = c.pointee.mm
         s.fp_exp = c.pointee.fp_exp
         s.fp_top = c.pointee.fp_top
@@ -373,6 +414,8 @@ extension Engine {
         c.pointee.apic_tpr = s.hybrid_tpr
         c.pointee.resume_mxcsr = s.mxcsr
         writeXMM(from: s)
+        c.pointee.xcr0 = s.xcr0
+        c.pointee.ymm_hi = s.ymm_hi
         c.pointee.mm = s.mm
         c.pointee.compat = s.compat
         c.pointee.seg_bad = s.seg_bad
