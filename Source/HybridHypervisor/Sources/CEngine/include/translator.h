@@ -41,6 +41,7 @@ typedef struct {
     uint64_t fetch_fault_va; // nonzero: the instruction runs onto this unmapped or non-executable page
     uint64_t frames[2]; // GPA frames the block was read from (second is ~0 when unused)
     bool flushed; // the code cache was reset to make room: every pointer into it is stale
+    bool needs_flush; // multi-vCPU translation saw cache/table full and requires host parked flush + retry
     int key; // the translation domain of the target: tr_link needs it
     uint64_t unprotected; // nonzero: nothing translated, as this frame must be write-protected first (gpa + 1)
 } TrResult;
@@ -50,6 +51,8 @@ void tr_init(const TrConfig *config);
 // Translates x86 `rip` in the given view. `cr3` and `cpl` describe the view. With `single` the block is exactly one
 // instruction, never registered for lookup: it runs once after a self-modifying write.
 TrResult tr_translate(int view, uint64_t cr3, int cpl, bool compat, uint64_t rip, bool single);
+// As above, but do not start a FEX translation for a cold block.
+TrResult tr_translate_native(int view, uint64_t cr3, int cpl, bool compat, uint64_t rip, bool single);
 
 // Patches an exit stub: site is the guest VA reported in the request, kind the svc number, arm the linked target.
 void tr_link(uint64_t site, int kind, uint64_t arm, int key);
@@ -75,6 +78,7 @@ void tr_flush_parked(bool everything);
 
 // Text for a stop reason written by the translator.
 const char *tr_stop_reason(uint32_t index);
+bool tr_reload_backend(const char *dylib_path);
 
 typedef struct {
     uint64_t blocks, insns, words;
@@ -116,4 +120,5 @@ typedef struct {
     uint64_t page_rep_enabled; // configuration state, global and repeated; not a counter or per-vCPU value
 } TrStats;
 TrStats tr_stats(void);
+void tr_set_lock_hooks(void (*unlock)(void *), void (*relock)(void *), void *ctx);
 

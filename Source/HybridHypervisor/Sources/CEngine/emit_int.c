@@ -68,8 +68,6 @@ static void and_imm_x(int rd, int rn, u64 imm) { // imm must encode
     E(0x92000000u | enc | rn << 5 | rd);
 }
 
-u64 tr_ad_page = ~0ULL;
-
 int addr_reg(const Insn *in) {
     tr_ad_page = ~0ULL;
     int cur = XZR;
@@ -90,6 +88,10 @@ int addr_reg(const Insn *in) {
                 add_imm(sf, 0, 0, AD, cur, (u32)in->disp);
             else if (in->disp < 0 && in->disp > -4096 && cur != XZR)
                 add_imm(sf, 1, 0, AD, cur, (u32)-in->disp);
+            else if (in->disp > 0 && !(in->disp & 0xfffLL) && (in->disp >> 12) < 4096 && cur != XZR)
+                add_imm_lsl12(sf, 0, 0, AD, cur, (u32)(in->disp >> 12));
+            else if (in->disp < 0 && !((-in->disp) & 0xfffLL) && ((-in->disp) >> 12) < 4096 && cur != XZR)
+                add_imm_lsl12(sf, 1, 0, AD, cur, (u32)((-in->disp) >> 12));
             else if (cur == XZR)
                 movimm(AD, tr_compat ? (u32)in->disp : (u64)in->disp);
             else {
@@ -120,7 +122,11 @@ int addr_reg(const Insn *in) {
 Addr addr_prepare(const Insn *in, int access) {
     Addr a = {0};
     int segr = in->seg == 1 ? R_FS : in->seg == 2 ? R_GS : -1;
-    if (in->op == OP_SSE && in->riprel && segr < 0 && !in->addr32 && !in->addr16 && !tr_compat) {
+    bool riprel_cache_op = in->op == OP_SSE || in->op == OP_EXT ||
+                           (tr_opt_peep && (in->op == OP_MOV || in->op == OP_ALU || in->op == OP_MOVZX ||
+                                            in->op == OP_MOVSX || in->op == OP_INCDEC || in->op == OP_CMOV ||
+                                            in->op == OP_SETCC));
+    if (riprel_cache_op && in->riprel && segr < 0 && !in->addr32 && !in->addr16 && !tr_compat) {
         u64 target = in->next + (u64)in->disp;
         u64 pg = target & ~0xfffULL;
         u32 off = (u32)(target & 0xfffULL);
@@ -353,7 +359,7 @@ static void alu_flags(int alu, int sz, int live, int a, int b, int r) {
     }
     if (!arith && (live & F_A))
         mov_reg(0, R_AF, r);
-    if (live & F_P)
+    if ((live & F_P) && r != R_PF)
         mov_reg(0, R_PF, r);
 }
 
@@ -486,12 +492,12 @@ static void emit_alu(const Insn *in, int live) {
                 if (rd == XZR && !sets)
                     return; // a dead compare
                 int eff_sub = sub ^ flip_sub;
-                int d_out = ((live & F_P) && rd == XZR) ? S2 : rd;
+                int d_out = (rd == XZR && (live & (F_P | F_A))) ? (tr_opt_peep ? R_PF : S2) : rd;
                 if (sh12)
                     E((u32)sf << 31 | (u32)eff_sub << 30 | (u32)sets << 29 | 0x11400000u | (imm12 & 0xfffu) << 10 | (u32)dst << 5 | (u32)d_out);
                 else
                     add_imm(sf, eff_sub, sets, d_out, dst, imm12);
-                if (live & F_P)
+                if ((live & (F_P | F_A)) && d_out != R_PF)
                     mov_reg(0, R_PF, d_out);
                 if (!sub && (live & F_C))
                     cfinv();
@@ -502,13 +508,13 @@ static void emit_alu(const Insn *in, int live) {
             u32 enc;
             if (logimm((u64)imm, sf, &enc)) {
                 u32 opc = alu == ALU_OR ? 1 : alu == ALU_XOR ? 2 : sets ? 3 : 0;
-                int d = rd == XZR ? (live & F_P ? S2 : XZR) : rd;
+                int d = (rd == XZR && (live & (F_P | F_A))) ? (tr_opt_peep ? R_PF : S2) : rd;
                 E((u32)sf << 31 | opc << 29 | 0x12000000u | enc | dst << 5 | d);
                 if (sets && (alu == ALU_OR || alu == ALU_XOR))
                     logic_reg(sf, 3, 0, XZR, d, d);
                 if (live & F_A)
                     mov_reg(0, R_AF, d);
-                if (live & F_P)
+                if ((live & (F_P | F_A)) && d != R_PF)
                     mov_reg(0, R_PF, d);
                 if (live & F_C)
                     cfinv();
@@ -517,6 +523,18 @@ static void emit_alu(const Insn *in, int live) {
         }
         if (use_imm)
             src = imm_to(in, S1);
+        if (tr_opt_peep && (alu == ALU_XOR || alu == ALU_SUB) && dst == src && dst_is_reg && !mem && !use_imm) {
+            mov_reg(sf, rd, XZR);
+            if (live) {
+                if (live & F_NZCV)
+                    add_reg(0, 1, 1, XZR, XZR, XZR, 0); // subs wzr, wzr, wzr -> N=0, Z=1, C=1(CF=0), V=0
+                if (live & (F_P | F_A))
+                    mov_reg(0, R_PF, XZR);
+                if (live & F_A)
+                    mov_reg(0, R_AF, XZR);
+            }
+            return;
+        }
         if (alu == ALU_XOR && dst == src && dst_is_reg && !mem && !(live & F_P) && !live) {
             mov_reg(sf, rd, XZR);
             return;
@@ -524,7 +542,7 @@ static void emit_alu(const Insn *in, int live) {
         if (arith || alu == ALU_ADC || alu == ALU_SBB) {
             if (live & F_A)
                 logic_reg(1, 2, 0, R_AF, dst, src);
-            int d = rd == XZR ? (live & F_P ? S2 : XZR) : rd;
+            int d = (rd == XZR && (live & (F_P | F_A))) ? (tr_opt_peep ? R_PF : S2) : rd;
             if (alu == ALU_ADC) {
                 cfinv();
                 adc(sf, 0, sets, d, dst, src);
@@ -537,11 +555,11 @@ static void emit_alu(const Insn *in, int live) {
                 if (alu == ALU_ADD && (live & F_C))
                     cfinv();
             }
-            if (live & F_P)
+            if ((live & (F_P | F_A)) && d != R_PF)
                 mov_reg(0, R_PF, d);
             return;
         }
-        int d = rd == XZR ? (live & F_P ? S2 : XZR) : rd;
+        int d = (rd == XZR && (live & (F_P | F_A))) ? (tr_opt_peep ? R_PF : S2) : rd;
         if (alu == ALU_AND || alu == ALU_TEST)
             logic_reg(sf, sets ? 3 : 0, 0, d, dst, src);
         else {
@@ -551,11 +569,52 @@ static void emit_alu(const Insn *in, int live) {
         }
         if (live & F_A)
             mov_reg(0, R_AF, d);
-        if (live & F_P)
+        if ((live & (F_P | F_A)) && d != R_PF)
             mov_reg(0, R_PF, d);
         if (live & F_C)
             cfinv();
         return;
+    }
+
+    // Narrow (8/16-bit) CMP fast path when N and V are dead and both operands are known zero-extended.
+    if (tr_opt_peep && narrow && alu == ALU_CMP && !(live & (F_N | F_V))) {
+        u16 zmask = sz == 1 ? tr_zext8 : tr_zext16;
+        bool dst_is_mem = !in->to_reg && mem;
+        bool dst_zext = dst_is_mem || (dst_is_reg && (dst_high || ((zmask >> dst_gpr) & 1u)));
+        bool src_is_mem = in->to_reg && mem;
+        int src_gpr = in->to_reg ? in->rm : in->reg;
+        bool src_high = in->to_reg ? in->high_rm : in->high_reg;
+        bool src_zext = use_imm || src_is_mem || src_high || ((zmask >> src_gpr) & 1u);
+        if (dst_zext && src_zext) {
+            int d_out = (live & (F_P | F_A)) ? R_PF : XZR;
+            if (use_imm) {
+                u32 iv = (u32)((u64)in->imm & (sz == 1 ? 0xffu : 0xffffu));
+                if (!live)
+                    return;
+                if (iv < 4096) {
+                    if (live & F_A) {
+                        u32 enc;
+                        if (logimm((u64)iv & 0x10, 1, &enc))
+                            E(0xD2000000u | enc | dst << 5 | R_AF);
+                        else
+                            mov_reg(1, R_AF, dst);
+                    }
+                    add_imm(0, 1, 1, d_out, dst, iv);
+                    return;
+                }
+                movimm(S1, iv);
+                if (live & F_A)
+                    logic_reg(1, 2, 0, R_AF, dst, S1);
+                add_reg(0, 1, 1, d_out, dst, S1, 0);
+                return;
+            }
+            if (!live)
+                return;
+            if (live & F_A)
+                logic_reg(1, 2, 0, R_AF, dst, src);
+            add_reg(0, 1, 1, d_out, dst, src, 0);
+            return;
+        }
     }
 
     // Narrow (8/16-bit) TEST/CMP immediate fast path when only Z (and optionally C) are live.
@@ -637,16 +696,17 @@ static void emit_alu(const Insn *in, int live) {
     if (use_imm)
         src = imm_to(in, S1);
     bool need_r = wb || (live & F_P) || alu == ALU_OR || alu == ALU_XOR;
+    int rv = (tr_opt_peep && !wb && (live & F_P)) ? R_PF : S2;
     if (need_r)
-        alu_value(alu, sz, S2, dst, src);
+        alu_value(alu, sz, rv, dst, src);
     if (wb && !dst_is_reg)
-        ldst(0, sz, S2, a);
+        ldst(0, sz, rv, a);
     if (live) {
         // A register destination must keep its old value until flags are done: dst may be a pinned register.
-        alu_flags(alu, sz, live, dst, src, S2);
+        alu_flags(alu, sz, live, dst, src, rv);
     }
     if (wb && dst_is_reg)
-        gpr_write(dst_gpr, sz, dst_high, S2);
+        gpr_write(dst_gpr, sz, dst_high, rv);
 }
 
 static void emit_incdec(const Insn *in, int live) {
@@ -677,10 +737,8 @@ static void emit_incdec(const Insn *in, int live) {
     if (sz >= 4 && !mem) {
         if (live & F_C)
             cset(S2, 2);
-        if (live & F_A) {
-            logic_reg(1, 2, 0, R_AF, d, XZR);
-            E(0xD2400000u | R_AF << 5 | R_AF); // eor x25, x25, #1
-        }
+        if (live & F_A)
+            mov_reg(1, R_AF, d); // bit 4 of 1 is 0, so (d ^ 1 ^ res)[4] == (d ^ res)[4]
         add_imm(sf, dec, live != 0, in->rm, d, 1);
         if (live & F_P)
             mov_reg(0, R_PF, in->rm);
@@ -694,10 +752,8 @@ static void emit_incdec(const Insn *in, int live) {
         if (live) {
             if (live & F_C)
                 cset(S4, 2);
-            if (live & F_A) {
-                logic_reg(1, 2, 0, R_AF, d, XZR);
-                E(0xD2400000u | R_AF << 5 | R_AF); // eor x25, x25, #1
-            }
+            if (live & F_A)
+                mov_reg(1, R_AF, d);
             add_imm(sf, dec, 1, XZR, d, 1);
             if (live & F_P)
                 mov_reg(0, R_PF, S2);
@@ -855,8 +911,8 @@ static void emit_shift(const Insn *in, int live) {
         if (live & F_C) {
             int bit = n < 16 ? n - 1 : 15;
             rmif(d, (bit - 1) & 63, 2);
+            cfinv(); // canonical C is inverse x86 CF
         }
-        cfinv(); // canonical C is inverse x86 CF
         if (live & F_P)
             mov_reg(0, R_PF, S0);
         if (live & F_A)
@@ -878,7 +934,8 @@ static void emit_shift(const Insn *in, int live) {
         logic_reg(0, 3, 0, XZR, S0, S0);
         if ((live & F_C) && n <= 16)
             rmif(S1, (n - 2) & 63, 2);
-        cfinv();
+        if (live & F_C)
+            cfinv();
         if (live & F_V)
             rmif(S1, 15, 1);
         if (live & (F_P | F_A))
@@ -900,7 +957,8 @@ static void emit_shift(const Insn *in, int live) {
         logic_reg(0, 3, 0, XZR, S0, S0); // N/Z, C=0, V=0
         if ((live & F_C) && n <= 8)
             rmif(S1, (n - 2) & 63, 2);
-        cfinv(); // CF is zero for counts above 8; canonical C is inverted
+        if (live & F_C)
+            cfinv(); // CF is zero for counts above 8; canonical C is inverted
         if (live & F_V)
             rmif(S1, 7, 1); // h_shift keeps the original bit 7 for every nonzero count
         if (live & (F_P | F_A))
@@ -953,13 +1011,13 @@ static void emit_shift(const Insn *in, int live) {
         return;
     }
     if (sz < 4 && !thru && !rot && in->has_imm) {
-        // Exact inline 8/16-bit SHL/SHR/SAR by immediate (1..bits-1) with live flags (reg or mem).
+        // Exact inline 8/16-bit SHL/SHR/SAR by immediate (1..31) with live flags (reg or mem).
         int n = (int)in->imm & 31;
+        if (kind == SH_SAR)
+            sbfx(0, S1, d, 0, bits);
+        else
+            ubfx(0, S1, d, 0, bits);
         if (n < bits) {
-            if (kind == SH_SAR)
-                sbfx(0, S1, d, 0, bits);
-            else
-                ubfx(0, S1, d, 0, bits);
             if (kind == SH_SHL) {
                 lsl_imm(0, S0, S1, n);
                 ubfx(0, S0, S0, 0, bits);
@@ -969,34 +1027,157 @@ static void emit_shift(const Insn *in, int live) {
                 asr_imm(0, S0, S1, n);
                 ubfx(0, S0, S0, 0, bits);
             }
-            if (mem)
-                ldst(0, sz, S0, a); // store before touching flags so faults are clean
-            lsl_imm(0, S2, S0, 32 - bits);
-            logic_reg(0, 3, 0, XZR, S2, S2); // N = MSB(res), Z = (res == 0), C = 0, V = 0
-            if (live & F_C) {
-                if (kind == SH_SHL)
-                    rmif(S1, (bits - n - 1) & 63, 2);
-                else
-                    rmif(S1, (n - 2) & 63, 2);
-            }
-            cfinv(); // canonical ARM64 C is inverted x86 CF
-            if (live & F_V) {
-                if (kind == SH_SHL) {
-                    logic_reg(0, 2, 0, S2, S1, S0); // bit (bits-1) = MSB(orig) ^ MSB(res)
-                    rmif(S2, bits - 1, 1);
-                } else if (kind == SH_SHR) {
-                    rmif(S1, bits - 1, 1);
-                }
-                // SH_SAR: OF = 0 (already 0 from ANDS)
-            }
-            if (live & (F_P | F_A))
-                mov_reg(0, R_PF, S0);
-            if (live & F_A)
-                mov_reg(1, R_AF, R_PF);
-            if (!mem)
-                gpr_write(in->rm, sz, in->high_rm, S0);
-            return;
+        } else if (kind == SH_SAR) {
+            asr_imm(0, S0, S1, bits - 1);
+            ubfx(0, S0, S0, 0, bits);
+        } else {
+            mov_reg(0, S0, XZR);
         }
+        if (mem)
+            ldst(0, sz, S0, a); // store before touching flags so faults are clean
+        lsl_imm(0, S2, S0, 32 - bits);
+        logic_reg(0, 3, 0, XZR, S2, S2); // N = MSB(res), Z = (res == 0), C = 0, V = 0
+        if (live & F_C) {
+            if (kind == SH_SHL) {
+                if (n <= bits) {
+                    rmif(S1, (bits - n - 1) & 63, 2);
+                    cfinv();
+                } else {
+                    cfinv(); // CF = 0 -> C = 1
+                }
+            } else if (kind == SH_SHR) {
+                if (n <= bits) {
+                    rmif(S1, (n - 2) & 63, 2);
+                    cfinv();
+                } else {
+                    cfinv();
+                }
+            } else {
+                rmif(S1, ((n >= bits ? bits - 1 : n - 1) - 1) & 63, 2);
+                cfinv();
+            }
+        }
+        if (live & F_V) {
+            if (kind == SH_SHL) {
+                if (n <= bits) {
+                    lsr_imm(0, S3, S1, bits - n);
+                    logic_sh(0, 2, 0, S2, S3, S0, 1, bits - 1);
+                    rmif(S2, 0, 1);
+                } else {
+                    rmif(S0, bits - 1, 1);
+                }
+            } else if (kind == SH_SHR) {
+                rmif(S1, bits - 1, 1);
+            }
+        }
+        if (live & (F_P | F_A))
+            mov_reg(0, R_PF, S0);
+        if (live & F_A)
+            mov_reg(1, R_AF, R_PF);
+        if (!mem)
+            gpr_write(in->rm, sz, in->high_rm, S0);
+        return;
+    }
+    if (sz < 4 && !thru && !rot && in->by_cl) {
+        // Exact inline 8/16-bit SHL/SHR/SAR by CL with live flags (reg or mem).
+        if (kind == SH_SAR)
+            sbfx(1, S2, d, 0, bits);
+        else
+            ubfx(1, S2, d, 0, bits);
+        and_imm_w(S1, 1, 31); // effective count = CL & 31
+        var_shift(0, kind == SH_SHL ? 0 : kind == SH_SHR ? 1 : 2, S0, S2, S1);
+        ubfx(0, S0, S0, 0, bits);
+        if (mem)
+            ldst(0, sz, S0, a); // store before touching flags
+        u32 *skip_flags = tr_cc;
+        cbz(0, 0, S1, 0);
+        // Compute CF bit into S3 before ANDS sets N,Z (so CMP wS1,#bits cannot clobber N,Z).
+        if (live & (F_C | F_V)) {
+            if (kind == SH_SHL) {
+                movimm(S4, (u64)bits);
+                add_reg(0, 1, 0, S3, S4, S1, 0); // bits - cnt
+                var_shift(1, 1, S3, S2, S3);     // S2 >> (bits - cnt)
+                add_imm(0, 1, 1, XZR, S1, (u32)bits);
+                csel(1, S3, S3, XZR, 9);         // LS (cnt <= bits) ? S3 : 0
+            } else if (kind == SH_SHR && (live & F_C)) {
+                add_imm(0, 1, 0, S3, S1, 1);
+                var_shift(1, 1, S3, S2, S3);
+                add_imm(0, 1, 1, XZR, S1, (u32)bits);
+                csel(1, S3, S3, XZR, 9);         // LS (cnt <= bits) ? S3 : 0
+            } else if (kind == SH_SAR && (live & F_C)) {
+                add_imm(0, 1, 0, S3, S1, 1);
+                var_shift(1, 2, S3, S2, S3);     // 64-bit signed ASR gives sign bit for cnt >= bits
+            }
+        }
+        lsl_imm(0, S4, S0, 32 - bits);
+        logic_reg(0, 3, 0, XZR, S4, S4); // N = MSB(res), Z = (res == 0), C = 0, V = 0
+        if (live & F_C) {
+            rmif(S3, 63, 2);
+            cfinv();
+        }
+        if (live & F_V) {
+            if (kind == SH_SHL) {
+                logic_sh(0, 2, 0, S4, S3, S0, 1, bits - 1);
+                rmif(S4, 0, 1);
+            } else if (kind == SH_SHR) {
+                rmif(S2, bits - 1, 1);
+            }
+        }
+        if (live & (F_P | F_A))
+            mov_reg(0, R_PF, S0);
+        if (live & F_A)
+            mov_reg(1, R_AF, R_PF);
+        *skip_flags |= ((u32)(tr_cc - skip_flags) & 0x7ffffu) << 5;
+        if (!mem)
+            gpr_write(in->rm, sz, in->high_rm, S0);
+        return;
+    }
+    if (sz < 4 && rot && !thru) {
+        // Exact inline 8/16-bit ROL/ROR (imm or CL, dead or live flags, reg or mem).
+        ubfx(0, S2, d, 0, bits);
+        logic_sh(0, 1, 0, S0, S2, S2, 0, bits); // S0 = S2 | (S2 << bits)
+        if (in->by_cl) {
+            and_imm_w(S1, 1, 31);          // effective count = CL & 31
+            and_imm_w(S3, S1, bits - 1);   // r = count % bits
+            if (kind == SH_ROL) {
+                movimm(S4, (u64)bits);
+                add_reg(0, 1, 0, S3, S4, S3, 0); // bits - r (works for r == 0 too)
+            }
+            var_shift(0, 1, S0, S0, S3);
+            ubfx(0, S0, S0, 0, bits);
+        } else {
+            int r = (int)in->imm & (bits - 1);
+            if (r)
+                lsr_imm(0, S0, S0, kind == SH_ROR ? r : bits - r);
+            ubfx(0, S0, S0, 0, bits);
+        }
+        if (mem)
+            ldst(0, sz, S0, a); // store before touching flags
+        if (live & (F_C | F_V)) {
+            u32 *skip_flags = NULL;
+            if (in->by_cl) {
+                skip_flags = tr_cc;
+                cbz(0, 0, S1, 0);
+            }
+            if (live & F_C) {
+                rmif(S0, kind == SH_ROL ? 63 : (bits - 2) & 63, 2);
+                cfinv();
+            }
+            if (live & F_V) {
+                if (kind == SH_ROL) {
+                    logic_sh(0, 2, 0, S3, S0, S0, 1, bits - 1);
+                    rmif(S3, 0, 1);
+                } else {
+                    logic_sh(0, 2, 0, S3, S0, S0, 1, 1);
+                    rmif(S3, bits - 2, 1);
+                }
+            }
+            if (skip_flags)
+                *skip_flags |= ((u32)(tr_cc - skip_flags) & 0x7ffffu) << 5;
+        }
+        if (!mem)
+            gpr_write(in->rm, sz, in->high_rm, S0);
+        return;
     }
     if (thru && in->has_imm && ((int)in->imm & (sz == 8 ? 63 : 31)) == 1) {
         // Exact inline RCL/RCR by 1 for 8/16/32/64-bit (reg or mem). Only CF and OF are affected.
@@ -1036,8 +1217,8 @@ static void emit_shift(const Insn *in, int live) {
             gpr_write(in->rm, sz, in->high_rm, S0);
         return;
     }
-    if (sz < 4 || thru || (in->by_cl && rot && live)) {
-        // Helper: exact semantics for the rare forms. Flags come back as data so a store can still fault first.
+    if (sz < 4 || thru) {
+        // Helper: exact semantics for multi-bit RCL/RCR. Flags come back as data so a store can still fault first.
         if (d != S0)
             mov_reg(1, S0, d);
         if (in->by_cl)
@@ -1061,14 +1242,39 @@ static void emit_shift(const Insn *in, int live) {
     }
     int rd = mem ? S2 : in->rm;
     if (in->by_cl) {
-        if (rot) { // flags are dead here
+        if (rot) {
+            bool count_in_dest = !mem && in->rm == 1 && (live & (F_C | F_V));
+            if (count_in_dest)
+                and_imm_w(S3, 1, bits - 1);
             if (kind == SH_ROL) {
                 add_reg(1, 1, 0, S1, XZR, 1, 0);
                 var_shift(sf, 3, rd, d, S1);
-            } else
+            } else {
                 var_shift(sf, 3, rd, d, 1);
+            }
             if (mem)
                 ldst(0, sz, rd, a);
+            if (live & (F_C | F_V)) {
+                int cnt_r = count_in_dest ? S3 : S1;
+                if (!count_in_dest)
+                    and_imm_w(S1, 1, bits - 1);
+                u32 *skip = tr_cc;
+                cbz(0, 0, cnt_r, 0);
+                if (live & F_C) {
+                    rmif(rd, kind == SH_ROL ? 63 : (bits - 2) & 63, 2);
+                    cfinv();
+                }
+                if (live & F_V) {
+                    if (kind == SH_ROL) {
+                        logic_sh(1, 2, 0, S4, rd, rd, 1, bits - 1);
+                        rmif(S4, 0, 1);
+                    } else {
+                        logic_sh(1, 2, 0, S4, rd, rd, 1, 1);
+                        rmif(S4, bits - 2, 1);
+                    }
+                }
+                *skip |= ((u32)(tr_cc - skip) & 0x7ffffu) << 5;
+            }
             return;
         }
         int op2 = kind == SH_SHL ? 0 : kind == SH_SHR ? 1 : 2;
@@ -1136,7 +1342,8 @@ static void emit_shift(const Insn *in, int live) {
     if (mem)
         ldst(0, sz, rd, a);
     if (live) {
-        logic_reg(sf, 3, 0, XZR, rd, rd);
+        if (live & (F_N | F_Z | F_V))
+            logic_reg(sf, 3, 0, XZR, rd, rd);
         if (live & F_C) {
             int bit = kind == SH_SHL ? bits - n : n - 1;
             rmif(d, (bit - 1) & 63, 2);
@@ -1186,8 +1393,8 @@ static void emit_shd(const Insn *in, int live) {
             if (live & F_C) {
                 int bit = right ? n - 1 : bits - n;
                 rmif(d, (bit - 1) & 63, 2);
+                cfinv();
             }
-            cfinv();
             if ((live & F_V) && n == 1) {
                 logic_reg(1, 2, 0, S3, d, rd);
                 rmif(S3, bits - 1, 1);
@@ -1286,6 +1493,34 @@ static void emit_imul(const Insn *in, int live) {
     if (!in->rm_reg)
         ldst(1, sz, S0, addr_prepare(in, sz));
     int s = in->rm_reg ? in->rm : S0;
+    if (tr_opt_peep && in->has_imm && !(live & (F_C | F_V)) && (sz == 4 || sz == 8)) {
+        int sf = sz == 8;
+        i64 iv = sf ? in->imm : (i64)(i32)in->imm;
+        if (iv == 0) {
+            mov_reg(sf, in->reg, XZR);
+            return;
+        }
+        if (iv == 1) {
+            if (!sf || in->reg != s)
+                mov_reg(sf, in->reg, s);
+            return;
+        }
+        if (iv == -1) {
+            add_reg(sf, 1, 0, in->reg, XZR, s, 0);
+            return;
+        }
+        if (iv > 0 && (iv & (iv - 1)) == 0) {
+            int sh = __builtin_ctzll((u64)iv);
+            if (sh < (sf ? 64 : 32)) {
+                lsl_imm(sf, in->reg, s, sh);
+                return;
+            }
+        }
+        if (iv == 3 || iv == 5 || iv == 9) {
+            add_reg(sf, 0, 0, in->reg, s, s, iv == 3 ? 1 : iv == 5 ? 2 : 3);
+            return;
+        }
+    }
     int a = in->has_imm ? S1 : in->reg;
     if (in->has_imm)
         movimm(S1, (u64)in->imm);
@@ -1395,21 +1630,39 @@ static void emit_div(const Insn *in) {
         }
         return;
     }
-    // 8 and 16 bits: helper.
-    mov_reg(1, S2, s);
-    uext(S0, 0, sz == 1 ? 2 : 2);
-    if (sz == 2)
-        uext(S1, 2, 2);
+    // 8-bit divides AX, 16-bit divides DX:AX. The quotient has to fit the low half.
+    if (sign)
+        sext64(S1, s, sz);
     else
-        mov_reg(1, S1, XZR);
-    movimm(S3, (u64)sz | (u64)sign << 8);
-    svc(SVC_H_DIV);
+        uext(S1, s, sz);
+    cbz(1, 1, S1, 2);
+    svc(SVC_DE);
+    uext(S0, 0, 2); // AX
     if (sz == 2) {
-        bfi(1, 0, S0, 0, 16);
-        bfi(1, 2, S1, 0, 16);
+        uext(S3, 2, 2); // DX
+        logic_sh(1, 1, 0, S0, S0, S3, 0, 16);
+        if (sign)
+            sext64(S0, S0, 4);
+    } else if (sign)
+        sext64(S0, S0, 2);
+    if (sign)
+        sdiv(1, S2, S0, S1);
+    else
+        udiv(1, S2, S0, S1);
+    if (sign)
+        sext64(S4, S2, sz);
+    else
+        uext(S4, S2, sz);
+    logic_reg(1, 2, 0, S4, S4, S2);
+    cbz(0, 1, S4, 2);
+    svc(SVC_DE);
+    msub(1, S3, S2, S1, S0);
+    if (sz == 2) {
+        bfi(1, 0, S2, 0, 16);
+        bfi(1, 2, S3, 0, 16);
     } else {
-        bfi(1, 0, S0, 0, 8);
-        bfi(1, 0, S1, 8, 8);
+        bfi(1, 0, S2, 0, 8);
+        bfi(1, 0, S3, 8, 8);
     }
 }
 
@@ -1703,6 +1956,8 @@ static void emit_lea(const Insn *in) {
         }
         if (has_idx) {
             int dst_idx = has_disp ? AD : rd;
+            if (has_disp)
+                tr_ad_page = ~0ULL;
             add_reg(sf, 0, 0, dst_idx, cur, in->index, in->scale);
             cur = dst_idx;
         }
@@ -1711,6 +1966,10 @@ static void emit_lea(const Insn *in) {
                 add_imm(sf, 0, 0, rd, cur, (u32)in->disp);
             else if (in->disp < 0 && in->disp > -4096 && cur != XZR)
                 add_imm(sf, 1, 0, rd, cur, (u32)-in->disp);
+            else if (in->disp > 0 && !(in->disp & 0xfffLL) && (in->disp >> 12) < 4096 && cur != XZR)
+                add_imm_lsl12(sf, 0, 0, rd, cur, (u32)(in->disp >> 12));
+            else if (in->disp < 0 && !((-in->disp) & 0xfffLL) && ((-in->disp) >> 12) < 4096 && cur != XZR)
+                add_imm_lsl12(sf, 1, 0, rd, cur, (u32)((-in->disp) >> 12));
             else if (cur == XZR)
                 movimm(rd, sf ? (u64)in->disp : ((u64)in->disp & 0xffffffffULL));
             else {

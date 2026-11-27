@@ -1,4 +1,5 @@
 // Block builder: decodes x86 into a superblock, runs flag liveness, emits AArch64 and side exits, and owns block bookkeeping.
+#include <dlfcn.h>
 #include <libkern/OSCacheControl.h>
 #include <mach/mach_time.h>
 #include <stdio.h>
@@ -7,8 +8,85 @@
 #include <sys/mman.h>
 #include "tr_internal.h"
 
-#define MAX_INSNS 96
+u64 tr_ad_page = ~0ULL;
+u16 tr_zext8 = 0, tr_zext16 = 0;
+bool tr_opt_peep = true, tr_opt_ymm_cache = true;
+static bool native_dag = true, native_l1 = true;
+u16 tr_aes_mask = 0;
+u8 tr_aes_key[16];
+
+typedef struct {
+    void (*x86_decode)(u64 rip, Insn *in);
+    bool (*insn_is_terminator)(const Insn *in);
+    void (*emit_int)(const Insn *in, int live);
+    void (*emit_sse)(const Insn *in, int live);
+    void (*sse_aes_flush_all)(void);
+    void (*emit_x87)(const Insn *in);
+    void (*emit_ext)(const Insn *in, int live);
+    void (*movimm)(int rd, u64 v);
+    void (*emit_parity)(int rd);
+} TrBackend;
+
+static TrBackend tr_be = {
+    .x86_decode = x86_decode,
+    .insn_is_terminator = insn_is_terminator,
+    .emit_int = emit_int,
+    .emit_sse = emit_sse,
+    .sse_aes_flush_all = sse_aes_flush_all,
+    .emit_x87 = emit_x87,
+    .emit_ext = emit_ext,
+    .movimm = movimm,
+    .emit_parity = emit_parity,
+};
+
+bool tr_reload_backend(const char *dylib_path) {
+    if (!dylib_path || !dylib_path[0])
+        return false;
+    void *h = dlopen(dylib_path, RTLD_NOW | RTLD_LOCAL);
+    if (!h) {
+        fprintf(stderr, "hvdbt: tr_reload_backend dlopen(%s) failed: %s\n", dylib_path, dlerror());
+        return false;
+    }
+    TrBackend next = {
+        .x86_decode = dlsym(h, "x86_decode"),
+        .insn_is_terminator = dlsym(h, "insn_is_terminator"),
+        .emit_int = dlsym(h, "emit_int"),
+        .emit_sse = dlsym(h, "emit_sse"),
+        .sse_aes_flush_all = dlsym(h, "sse_aes_flush_all"),
+        .emit_x87 = dlsym(h, "emit_x87"),
+        .emit_ext = dlsym(h, "emit_ext"),
+        .movimm = dlsym(h, "movimm"),
+        .emit_parity = dlsym(h, "emit_parity"),
+    };
+    if (!next.x86_decode || !next.insn_is_terminator || !next.emit_int || !next.emit_sse ||
+        !next.sse_aes_flush_all || !next.emit_x87 || !next.emit_ext || !next.movimm || !next.emit_parity) {
+        fprintf(stderr, "hvdbt: tr_reload_backend(%s) missing required backend symbols\n", dylib_path);
+        dlclose(h);
+        return false;
+    }
+    tr_be = next;
+    fprintf(stderr, "hvdbt: hot-reloaded JIT backend from %s\n", dylib_path);
+    return true;
+}
+
+#define x86_decode tr_be.x86_decode
+#define insn_is_terminator tr_be.insn_is_terminator
+#define emit_int tr_be.emit_int
+#define emit_sse tr_be.emit_sse
+#define sse_aes_flush_all tr_be.sse_aes_flush_all
+#define emit_x87 tr_be.emit_x87
+#define emit_ext tr_be.emit_ext
+#define movimm tr_be.movimm
+#define emit_parity tr_be.emit_parity
+
+#define MAX_INSNS 256
 #define MAX_PENDING (MAX_INSNS * 2)
+#define MAX_FWD_FIX (MAX_INSNS * 2)
+#define MAX_L1_MISS MAX_INSNS
+#define MAX_DAG_BLOCKS 12
+#define MAX_DAG_SPAN 1024
+#define STUB_OFF_LOOKUP_L1 0x860ULL
+#define STUB_OFF_LOOKUP_L1_FAST 0x900ULL
 #define MAP_BITS 22
 #define MAP_SIZE (1u << MAP_BITS)
 
@@ -59,6 +137,7 @@ static u32 hblock_count[2];
 // Bits are a superset: replacement, forgetting and view reuse may leave stale bits, never omit a published target.
 static u64 (*shared_hash_views)[MAX_VIEWS / 64];
 #define BLOCK_BASE(part) ((part) ? BLOCKS_MAX : 0)
+#define PART_BLOCKS_MAX(part) ((part) ? BLOCKS_MAX_PRIV : BLOCKS_MAX)
 #define BLOCK_TABLE_PART2 ((OFF_BLOCKS2 - OFF_BLOCKS) / sizeof(BlockEntry))
 #define KEY_PART(key) (((key) & KEY_DOMAIN) ? 0 : 1)
 static u32 *frame_head; // per GPA frame: block index + 1
@@ -129,6 +208,7 @@ static bool is_ram(u64 gpa) { return gpa < cfg.ram_size && (cfg.priv[OFF_PAGEINF
 // Ring-0 code in the high half is shared by every address space that reaches it through the same PML4 entry target: an x86 kernel keeps
 // those entries identical, and a change to them invalidates through the page-table write path. Everything else belongs to one view.
 #define KEY_DOMAIN 0x40000000
+#define KEY_USER_FRAME (KEY_DOMAIN | 0x20000000)
 static int view_high;
 // A rip under a page directory that several address spaces share maps the same bytes in all of them, so one translation serves them all. The last page stays out,
 // as a block starting there could run into the next directory.
@@ -167,6 +247,56 @@ static int shared_user_key(u64 cr3, int cpl, u64 rip) {
     return 0;
 }
 
+static int shared_user_frame_key(u64 cr3, int cpl, u64 rip) {
+    static int no_uframe = -1;
+    if (no_uframe < 0)
+        no_uframe = getenv("LC_HVDBT_NO_USER_FRAME_SHARE") != NULL;
+    if (no_uframe || cpl != 3 || tr_compat || (rip >> 47) || (rip & 0xfffULL) >= 4096 - 16)
+        return 0;
+    u64 table = cr3 & 0x000FFFFFFFFFF000ULL;
+    if (!is_ram(table))
+        return 0;
+    u64 e = *(u64 *)(ram_at(table) + ((rip >> 39) & 0x1ff) * 8);
+    table = e & 0x000FFFFFFFFFF000ULL;
+    if (!(e & 1) || !(e & 4) || (e & (1ULL << 63)) || !is_ram(table))
+        return 0;
+    e = *(u64 *)(ram_at(table) + ((rip >> 30) & 0x1ff) * 8);
+    if (!(e & 1) || !(e & 4) || (e & (1ULL << 63)))
+        return 0;
+    u64 gpa;
+    if (e & 0x80) {
+        if (e & 2)
+            return 0;
+        gpa = (e & 0x000FFFFFC0000000ULL) | (rip & 0x3ffff000ULL);
+    } else {
+        table = e & 0x000FFFFFFFFFF000ULL;
+        if (!is_ram(table))
+            return 0;
+        e = *(u64 *)(ram_at(table) + ((rip >> 21) & 0x1ff) * 8);
+        if (!(e & 1) || !(e & 4) || (e & (1ULL << 63)))
+            return 0;
+        if (e & 0x80) {
+            if (e & 2)
+                return 0;
+            gpa = (e & 0x000FFFFFFFE00000ULL) | (rip & 0x1ff000ULL);
+        } else {
+            table = e & 0x000FFFFFFFFFF000ULL;
+            if (!is_ram(table))
+                return 0;
+            e = *(u64 *)(ram_at(table) + ((rip >> 12) & 0x1ff) * 8);
+            if (!(e & 1) || !(e & 4) || (e & (1ULL << 63)) || (e & 2))
+                return 0;
+            gpa = e & 0x000FFFFFFFFFF000ULL;
+        }
+    }
+    if (!is_ram(gpa))
+        return 0;
+    u64 pfn = gpa >> 12;
+    if (pfn >= (1ULL << 29))
+        return 0;
+    return KEY_USER_FRAME | (int)pfn;
+}
+
 static int block_key(int view, u64 cr3, int cpl, u64 rip) {
     if (cpl == 0 && (rip >> 47)) {
         u64 table = cr3 & 0x000FFFFFFFFFF000ULL;
@@ -176,7 +306,10 @@ static int block_key(int view, u64 cr3, int cpl, u64 rip) {
         }
     }
     int shared = shared_user_key(cr3, cpl, rip);
-    return shared ? shared : view;
+    if (shared)
+        return shared;
+    int uframe = shared_user_frame_key(cr3, cpl, rip);
+    return uframe ? uframe : view;
 }
 
 // ---- Guest memory, host's read-only view ----
@@ -462,7 +595,7 @@ static int flags_needed_at(u64 rip, u64 page, int depth, const Insn *block, int 
         written |= in.writes;
         if ((written & F_ARITH) == F_ARITH)
             return need;
-        if (in.op == OP_JCC) {
+        if (in.op == OP_JCC || in.op == OP_JRCXZ) {
             if (!depth)
                 return need | (F_ARITH & ~written);
             return need | ((flags_needed_at(in.target, page, depth - 1, block, count) | flags_needed_at(in.next, page, depth - 1, block, count)) & ~written);
@@ -471,7 +604,11 @@ static int flags_needed_at(u64 rip, u64 page, int depth, const Insn *block, int 
             rip = in.target;
             continue;
         }
-        if (insn_is_terminator(&in) || in.op == OP_CALL || in.op == OP_CALLI || in.op == OP_JRCXZ)
+        if (in.op == OP_CALL && !tr_precise_flags && depth > 0 &&
+            (in.target & ~0xfffULL) == page && ((in.target + 15) & ~0xfffULL) == page) {
+            return need | (flags_needed_at(in.target, page, depth - 1, block, count) & ~written);
+        }
+        if (insn_is_terminator(&in) || in.op == OP_CALL || in.op == OP_CALLI)
             return need | (F_ARITH & ~written);
         rip = in.next;
     }
@@ -519,9 +656,56 @@ static void stub_lit(u64 target) {
     E((u32)(target >> 32));
 }
 
+static inline bool use_native_l1(int cpl, bool compat) {
+    return native_l1 && cpl == 3 && !compat;
+}
+
+typedef struct {
+    u32 *site1; // cbz x16, miss
+    u32 *site2; // cbnz x23, miss
+    u32 *blr_site; // for OP_CALLI: jump back to blr x22
+    bool is_call;
+} L1Miss;
+static L1Miss l1_miss[MAX_L1_MISS];
+static int l1_miss_count;
+
+static int cur_key;
+static u64 cur_entry_rip, cur_page;
+static bool cur_single;
+
+static u32 *try_direct_link_target(int key, u64 entry_rip, u64 page, u64 target, bool single) {
+    if (single || target == entry_rip)
+        return NULL;
+    if ((key & KEY_USER_FRAME) == KEY_USER_FRAME && (target & ~0xfffULL) != page)
+        return NULL;
+    u32 hit = map_find(key, target);
+    if (!hit)
+        return NULL;
+    HostBlock *hb = &hblocks[hit - 1];
+    if (hb->dead || hb->view != (u32)key || hb->cpl != (u8)tr_cpl || hb->compat != tr_compat)
+        return NULL;
+    return cc_base + hb->entry_word;
+}
+
 static void emit_indirect_tail(void) {
     // x16 holds the x86 target. Lookup returns the translation in x22, and the branch stays here so that each site has
     // its own predictor entry.
+    if (use_native_l1(tr_cpl, tr_compat) && l1_miss_count < MAX_L1_MISS) {
+        tr_ad_page = ~0ULL;
+        u32 *s1 = tr_cc;
+        cbz(0, 1, S0, 0);
+        add_imm_lsl12(1, 0, 0, AD, CTX, 0x400);
+        logic_sh(1, 2, 0, S1, S0, S0, 1, 4); // eor x17, x16, x16, lsr #4
+        ubfiz(1, S1, S1, 4, 12);
+        add_reg(1, 0, 0, AD, AD, S1, 0);
+        E(0xA9400000u | (u32)S3 << 10 | (u32)AD << 5 | (u32)S2); // ldp x22, x23, [x20]
+        logic_reg(1, 2, 0, S3, S3, S0);
+        u32 *s2 = tr_cc;
+        cbz(1, 1, S3, 0);
+        br(S2);
+        l1_miss[l1_miss_count++] = (L1Miss){s1, s2, NULL, false};
+        return;
+    }
     bl_rel((int)((i64)(STUB(tr_stub_lookup) - tr_cc_va(tr_cc)) / 4));
     br(S2);
 }
@@ -535,7 +719,7 @@ typedef struct {
     int target_idx;
     int form;
 } FwdFix;
-static FwdFix fwd_fix[MAX_INSNS];
+static FwdFix fwd_fix[MAX_FWD_FIX];
 static int fwd_count;
 
 // If target is an instruction already emitted in this block, returns where.
@@ -555,7 +739,7 @@ static int forward_target_idx(u64 target, int from) {
 }
 
 static void add_fwd(u32 *site, int target_idx, int form) {
-    if (fwd_count < MAX_INSNS)
+    if (fwd_count < MAX_FWD_FIX)
         fwd_fix[fwd_count++] = (FwdFix){site, target_idx, form};
 }
 
@@ -566,32 +750,46 @@ static void emit_control(const Insn *in, int idx, int live_after) {
         case OP_JCC: {
             u32 *back = internal_target(in->target, idx);
             int fwd = back ? -1 : forward_target_idx(in->target, idx);
+            u32 *direct = (back || fwd >= 0) ? NULL : try_direct_link_target(cur_key, cur_entry_rip, cur_page, in->target, cur_single);
             int acc = x86_to_arm_cc[in->cc];
             if (acc < 0) {
                 emit_parity(S4);
+                i64 dd = direct ? (direct - tr_cc) : 0;
+                if (direct && (dd < -(1 << 18) || dd >= (1 << 18)))
+                    direct = NULL;
                 if (back) {
                     cbz(in->cc == 10, 0, S4, (int)(back - tr_cc));
                 } else if (fwd >= 0) {
                     add_fwd(tr_cc, fwd, 0);
                     cbz(in->cc == 10, 0, S4, 0);
+                } else if (direct) {
+                    cbz(in->cc == 10, 0, S4, (int)dd);
                 } else {
                     add_pending(tr_cc, in->target, SVC_JCC, 0);
                     cbz(in->cc == 10, 0, S4, 0);
                 }
-            } else if (back) {
-                b_cond(acc, (int)(back - tr_cc));
-            } else if (fwd >= 0) {
-                add_fwd(tr_cc, fwd, 0);
-                b_cond(acc, 0);
             } else {
-                add_pending(tr_cc, in->target, SVC_JCC, 0);
-                b_cond(acc, 0);
+                i64 dd = direct ? (direct - tr_cc) : 0;
+                if (direct && (dd < -(1 << 18) || dd >= (1 << 18)))
+                    direct = NULL;
+                if (back) {
+                    b_cond(acc, (int)(back - tr_cc));
+                } else if (fwd >= 0) {
+                    add_fwd(tr_cc, fwd, 0);
+                    b_cond(acc, 0);
+                } else if (direct) {
+                    b_cond(acc, (int)dd);
+                } else {
+                    add_pending(tr_cc, in->target, SVC_JCC, 0);
+                    b_cond(acc, 0);
+                }
             }
             break;
         }
         case OP_JRCXZ: {
             u32 *back = internal_target(in->target, idx);
             int fwd = back ? -1 : forward_target_idx(in->target, idx);
+            u32 *direct = (back || fwd >= 0) ? NULL : try_direct_link_target(cur_key, cur_entry_rip, cur_page, in->target, cur_single);
             int sub = in->sub;
             int sf = in->addr32 ? 0 : 1; // with 67h the count is ecx
             if (in->addr16) { // 32-bit code with 67h: the count is cx, and ecx's top half stays
@@ -605,13 +803,16 @@ static void emit_control(const Insn *in, int idx, int live_after) {
                     over = tr_cc;
                     b_cond(sub == 3 ? 1 : 0, 0);
                 }
-                if (!back) {
+                i64 dd = direct ? (direct - tr_cc) : 0;
+                if (direct && (dd < -(1 << 18) || dd >= (1 << 18)))
+                    direct = NULL;
+                if (!back && !direct) {
                     if (fwd >= 0)
                         add_fwd(tr_cc, fwd, 0);
                     else
                         add_pending(tr_cc, in->target, SVC_JCC, 0);
                 }
-                cbz(sub >= 2, 0, S0, back ? (int)(back - tr_cc) : 0);
+                cbz(sub >= 2, 0, S0, back ? (int)(back - tr_cc) : direct ? (int)dd : 0);
                 if (over)
                     *over |= ((u32)(tr_cc - over) & 0x7ffff) << 5;
                 break;
@@ -619,31 +820,40 @@ static void emit_control(const Insn *in, int idx, int live_after) {
             if (sub >= 2)
                 add_imm(sf, 1, 0, 1, 1, 1);
             if (sub == 0 || sub == 1) {
-                if (!back) {
+                i64 dd = direct ? (direct - tr_cc) : 0;
+                if (direct && (dd < -(1 << 18) || dd >= (1 << 18)))
+                    direct = NULL;
+                if (!back && !direct) {
                     if (fwd >= 0)
                         add_fwd(tr_cc, fwd, 0);
                     else
                         add_pending(tr_cc, in->target, SVC_JCC, 0);
                 }
-                cbz(0, sub == 1 ? 0 : 1, 1, back ? (int)(back - tr_cc) : 0);
+                cbz(0, sub == 1 ? 0 : 1, 1, back ? (int)(back - tr_cc) : direct ? (int)dd : 0);
             } else if (sub == 2) {
-                if (!back) {
+                i64 dd = direct ? (direct - tr_cc) : 0;
+                if (direct && (dd < -(1 << 18) || dd >= (1 << 18)))
+                    direct = NULL;
+                if (!back && !direct) {
                     if (fwd >= 0)
                         add_fwd(tr_cc, fwd, 0);
                     else
                         add_pending(tr_cc, in->target, SVC_JCC, 0);
                 }
-                cbz(1, sf, 1, back ? (int)(back - tr_cc) : 0);
+                cbz(1, sf, 1, back ? (int)(back - tr_cc) : direct ? (int)dd : 0);
             } else {
                 u32 *over = tr_cc;
                 b_cond(sub == 3 ? 1 : 0, 0); // loope leaves when ZF is clear, loopne when it is set
-                if (!back) {
+                i64 dd = direct ? (direct - tr_cc) : 0;
+                if (direct && (dd < -(1 << 18) || dd >= (1 << 18)))
+                    direct = NULL;
+                if (!back && !direct) {
                     if (fwd >= 0)
                         add_fwd(tr_cc, fwd, 0);
                     else
                         add_pending(tr_cc, in->target, SVC_JCC, 0);
                 }
-                cbz(1, sf, 1, back ? (int)(back - tr_cc) : 0);
+                cbz(1, sf, 1, back ? (int)(back - tr_cc) : direct ? (int)dd : 0);
                 *over |= ((u32)(tr_cc - over) & 0x7ffff) << 5;
             }
             break;
@@ -657,8 +867,15 @@ static void emit_control(const Insn *in, int idx, int live_after) {
                 add_fwd(tr_cc, fwd, 1);
                 b_rel(0);
             } else {
-                add_pending(tr_cc, in->target, SVC_DIRECT, 1);
-                b_rel(0);
+                u32 *direct = try_direct_link_target(cur_key, cur_entry_rip, cur_page, in->target, cur_single);
+                i64 dd = direct ? (direct - tr_cc) : 0;
+                if (direct && dd >= -(1 << 25) && dd < (1 << 25)) {
+                    b_rel((int)dd);
+                } else {
+                    // Inline direct-link stub avoids b stub -> b target double-jump once linked.
+                    svc(SVC_DIRECT);
+                    stub_lit(in->target);
+                }
             }
             break;
         }
@@ -671,8 +888,14 @@ static void emit_control(const Insn *in, int idx, int live_after) {
                 E(0xF8000C00u | ((u32)-8 & 0x1ff) << 12 | 4 << 5 | S0);
             adr_words(S1, 3);
             E(0xA9800000u | ((u32)-2 & 0x7f) << 15 | S1 << 10 | RS << 5 | S0); // stp x16, x17, [x26, #-16]!
-            add_pending(tr_cc, in->target, SVC_CALL, 1);
-            bl_rel(0);
+            u32 *direct = try_direct_link_target(cur_key, cur_entry_rip, cur_page, in->target, cur_single);
+            i64 dd = direct ? (direct - tr_cc) : 0;
+            if (direct && dd >= -(1 << 25) && dd < (1 << 25)) {
+                bl_rel((int)dd);
+            } else {
+                add_pending(tr_cc, in->target, SVC_CALL, 1);
+                bl_rel(0);
+            }
             break;
         }
         case OP_CALLI: {
@@ -685,6 +908,14 @@ static void emit_control(const Insn *in, int idx, int live_after) {
                 E(0xB8000C00u | ((u32)-4 & 0x1ff) << 12 | 4 << 5 | S1);
             else
                 E(0xF8000C00u | ((u32)-8 & 0x1ff) << 12 | 4 << 5 | S1);
+            if (use_native_l1(tr_cpl, tr_compat)) {
+                tr_ad_page = ~0ULL;
+                adr_words(AD, 4);
+                E(0xA9800000u | ((u32)-2 & 0x7f) << 15 | AD << 10 | RS << 5 | S1);
+                bl_rel((int)((i64)(STUB(PRIV_VA + OFF_STUBS + STUB_OFF_LOOKUP_L1_FAST) - tr_cc_va(tr_cc)) / 4));
+                blr(S2);
+                break;
+            }
             adr_words(AD, 4);
             E(0xA9800000u | ((u32)-2 & 0x7f) << 15 | AD << 10 | RS << 5 | S1);
             bl_rel((int)((i64)(STUB(tr_stub_lookup) - tr_cc_va(tr_cc)) / 4));
@@ -735,6 +966,8 @@ static void fix(u32 *site, int form, u32 *to) {
     i64 d = to - site;
     if (form == 0)
         *site = (*site & ~(0x7ffffu << 5)) | ((u32)d & 0x7ffff) << 5;
+    else if (form == 2)
+        *site = (*site & ~(0x3fffu << 5)) | ((u32)d & 0x3fff) << 5;
     else
         *site = (*site & 0xFC000000u) | ((u32)d & 0x3ffffff);
 }
@@ -742,8 +975,9 @@ static void fix(u32 *site, int form, u32 *to) {
 static bool part_full(int part) {
     u32 *start = cc_base + part * CC_PART2_WORD;
     u32 first_map = part ? (OFF_PCMAP2 - OFF_PCMAP) / sizeof(PcMap) : 0;
-    return (u8 *)cc_cursor[part] - (u8 *)start > (long)(cc_limit - 0x40000) || hblock_count[part] >= BLOCKS_MAX - 2 ||
-           pc_map_used[part] + MAX_INSNS >= first_map + PCMAP_ENTRIES;
+    return (u8 *)cc_cursor[part] - (u8 *)start > (long)(cc_limit - 0x80000) ||
+           hblock_count[part] >= PART_BLOCKS_MAX(part) - 32 ||
+           pc_map_used[part] + MAX_INSNS + 1024 >= first_map + PCMAP_ENTRIES;
 }
 
 bool tr_needs_flush(void) { return part_full(0) || part_full(1); }
@@ -831,6 +1065,10 @@ static bool reuse_dead_block(u32 key, int cpl, u64 rip, TrResult *res) {
     if (!__atomic_compare_exchange_n(entry, &dead, hb->first_word, false, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
         return reuse_rejected(TR_REUSE_ENTRY_CAS); // something that ran into it has since been sent on to a newer block, for good
     sys_icache_invalidate(entry, 4);
+    if (entry[1] == 0x10000050u) {
+        entry[3] = WORD_NOP;
+        sys_icache_invalidate(entry + 3, 4);
+    }
     code_published();
     hb->dead = false;
     u32 idx = it - 1;
@@ -883,16 +1121,367 @@ static void link_block(u32 idx) {
     hb->on_frame = hb->on_page = hb->on_view = true;
 }
 
+void tr_set_lock_hooks(void (*unlock)(void *), void (*relock)(void *), void *ctx) {
+    (void)unlock;
+    (void)relock;
+    (void)ctx;
+}
+
+static bool is_monitor_or_stop_op(u8 op) {
+    switch (op) {
+        case OP_BAD: case OP_UD:
+        case OP_SYSCALL: case OP_SYSRET: case OP_IRET: case OP_INT: case OP_INT3:
+        case OP_HLT: case OP_CPUID: case OP_RDTSC: case OP_RDTSCP:
+        case OP_RDMSR: case OP_WRMSR: case OP_CLI: case OP_STI:
+        case OP_MOV_CR: case OP_MOV_DR: case OP_INVLPG: case OP_INVPCID:
+        case OP_WBINVD: case OP_CLTS: case OP_LGDT: case OP_LTR:
+        case OP_MOV_SEG: case OP_IN: case OP_OUT: case OP_SWAPGS:
+        case OP_SYSENTER: case OP_SYSEXIT: case OP_FAR:
+        case OP_FXSAVE: case OP_FXRSTOR:
+            return true;
+        default:
+            return false;
+    }
+}
+
+static inline bool is_uncond_term_op(u8 op) {
+    return op == OP_JMP || op == OP_JMPI || op == OP_RET || op == OP_BAD || op == OP_UD || op == OP_IRET;
+}
+
+static int idx_of_rip(const Insn *list, int count, u64 target) {
+    int lo = 0, hi = count;
+    while (lo < hi) {
+        int mid = lo + (hi - lo) / 2;
+        if (list[mid].rip < target)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    return (lo < count && list[lo].rip == target) ? lo : -1;
+}
+
+static int linear_find_rip(const Insn *list, int count, u64 target) {
+    for (int i = 0; i < count; i++)
+        if (list[i].rip == target)
+            return i;
+    return -1;
+}
+
+static bool overlaps_any(const Insn *list, int count, u64 start_rip, u64 end_rip) {
+    for (int i = 0; i < count; i++)
+        if (!(end_rip <= list[i].rip || start_rip >= list[i].next))
+            return true;
+    return false;
+}
+
+static int est_insn_words(const Insn *in) {
+    if (in->op == OP_EXT) return 24;
+    if (in->op == OP_SSE || in->op == OP_X87 || in->op == OP_STRING) return 16;
+    return 4;
+}
+
+static void expand_forward_dag(Insn *list, int *count_p, int key, u64 entry_rip, u64 page) {
+    int count = *count_p;
+    int max_dag_blocks = tr_cpl == 0 ? 4 : 8;
+    int max_dag_insns = tr_cpl == 0 ? 96 : 192;
+    u64 max_dag_span = tr_cpl == 0 ? 384 : 640;
+    int max_est_words = tr_cpl == 0 ? 1200 : 2200;
+    if (count <= 0 || count >= max_dag_insns)
+        return;
+    int est_words = 0;
+    u64 max_end = entry_rip;
+    for (int i = 0; i < count; i++) {
+        if (is_monitor_or_stop_op(list[i].op) || list[i].op == OP_POPF)
+            return;
+        est_words += est_insn_words(&list[i]);
+        if (list[i].next > max_end)
+            max_end = list[i].next;
+    }
+    if (est_words >= max_est_words)
+        return;
+
+    u64 q[MAX_DAG_BLOCKS * 2];
+    int qh = 0, qt = 0;
+    for (int i = 0; i < count; i++) {
+        u8 op = list[i].op;
+        if (op != OP_JCC && op != OP_JRCXZ && op != OP_JMP)
+            continue;
+        u64 t = list[i].target;
+        if (t <= list[i].rip || t < entry_rip || t >= entry_rip + max_dag_span)
+            continue;
+        if ((t & ~0xfffULL) != page || (t & 0xfffULL) > 4096 - 16)
+            continue;
+        if (t < max_end && linear_find_rip(list, count, t) >= 0)
+            continue;
+        bool dup = false;
+        for (int k = 0; k < qt; k++)
+            if (q[k] == t) { dup = true; break; }
+        if (!dup && qt < MAX_DAG_BLOCKS * 2)
+            q[qt++] = t;
+    }
+
+    int blocks_added = 0;
+    Insn tmp[MAX_INSNS];
+    while (qh < qt && blocks_added < max_dag_blocks && count < max_dag_insns && est_words < max_est_words) {
+        u64 t = q[qh++];
+        if (t < max_end && linear_find_rip(list, count, t) >= 0)
+            continue;
+        if (!cfg.profile_compile_inputs && count >= 12) {
+            u32 hit = map_find(key, t);
+            if (hit && !hblocks[hit - 1].dead)
+                continue;
+        }
+        int tc = 0, test_w = 0;
+        u64 spc = t;
+        bool ok = true;
+        while (count + tc < max_dag_insns && est_words + test_w < max_est_words) {
+            if (spc < max_end && linear_find_rip(list, count, spc) >= 0)
+                break;
+            if ((spc & ~0xfffULL) != page || (spc & 0xfffULL) > 4096 - 15) {
+                ok = false;
+                break;
+            }
+            x86_decode(spc, &tmp[tc]);
+            Insn *in = &tmp[tc];
+            if (in->next > page + 4096 || in->next <= in->rip ||
+                is_monitor_or_stop_op(in->op) || in->op == OP_POPF) {
+                ok = false;
+                break;
+            }
+            if (in->rip < max_end && overlaps_any(list, count, in->rip, in->next)) {
+                ok = false;
+                break;
+            }
+            test_w += est_insn_words(in);
+            spc = in->next;
+            tc++;
+            if (insn_is_terminator(in))
+                break;
+        }
+        if (!ok || tc == 0)
+            continue;
+        memcpy(&list[count], tmp, (size_t)tc * sizeof(Insn));
+        int base = count;
+        count += tc;
+        est_words += test_w;
+        blocks_added++;
+        if (tmp[tc - 1].next > max_end)
+            max_end = tmp[tc - 1].next;
+        for (int i = base; i < count; i++) {
+            u8 op = list[i].op;
+            if (op != OP_JCC && op != OP_JRCXZ && op != OP_JMP)
+                continue;
+            u64 nt = list[i].target;
+            if (nt <= list[i].rip || nt < entry_rip || nt >= entry_rip + max_dag_span)
+                continue;
+            if ((nt & ~0xfffULL) != page || (nt & 0xfffULL) > 4096 - 16)
+                continue;
+            if (nt < max_end && linear_find_rip(list, count, nt) >= 0)
+                continue;
+            bool dup = false;
+            for (int k = 0; k < qt; k++)
+                if (q[k] == nt) { dup = true; break; }
+            if (!dup && qt < MAX_DAG_BLOCKS * 2)
+                q[qt++] = nt;
+        }
+    }
+
+    if (blocks_added > 0) {
+        for (int i = 1; i < count; i++) {
+            Insn cur = list[i];
+            int j = i - 1;
+            while (j >= 0 && list[j].rip > cur.rip) {
+                list[j + 1] = list[j];
+                j--;
+            }
+            list[j + 1] = cur;
+        }
+        *count_p = count;
+    }
+}
+
+static inline bool ad_page_safe_op(u8 op) {
+    switch (op) {
+        case OP_SSE: case OP_EXT:
+        case OP_MOV: case OP_ALU: case OP_LEA: case OP_MOVZX: case OP_MOVSX:
+        case OP_INCDEC: case OP_CMOV: case OP_SETCC:
+        case OP_SHIFT: case OP_SHD: case OP_NEG: case OP_NOT:
+        case OP_PUSH: case OP_POP: case OP_LEAVE:
+        case OP_BSWAP: case OP_CBW: case OP_CWD:
+        case OP_JCC: case OP_JRCXZ: case OP_JMP:
+        case OP_NOP: case OP_CLC: case OP_STC: case OP_CMC: case OP_CLD: case OP_STD:
+        case OP_PREFETCH: case OP_FENCE:
+        case OP_BSF: case OP_BSR: case OP_TZCNT: case OP_LZCNT: case OP_POPCNT: case OP_CRC32:
+        case OP_MOVBE: case OP_XCHG: case OP_XADD: case OP_CMPXCHG:
+            return true;
+        default:
+            return false;
+    }
+}
+
+static inline int gpr_phys(int r, bool high) {
+    return high ? (r - 4) : r;
+}
+
+static void update_zext(const Insn *in) {
+    switch (in->op) {
+        case OP_NOP: case OP_FENCE: case OP_PREFETCH: case OP_CLFLUSH:
+        case OP_JCC: case OP_JMP: case OP_PUSHF: case OP_POPF:
+        case OP_SAHF: case OP_CMC: case OP_CLC: case OP_STC: case OP_CLD: case OP_STD:
+        case OP_LDMXCSR: case OP_STMXCSR:
+            return;
+        case OP_MOV: {
+            if (!in->to_reg && !in->rm_reg)
+                return;
+            bool high = in->to_reg ? in->high_reg : in->high_rm;
+            int d = gpr_phys(in->to_reg ? in->reg : in->rm, high);
+            u16 bit = (u16)(1u << d);
+            tr_zext8 &= (u16)~bit;
+            tr_zext16 &= (u16)~bit;
+            if (in->has_imm && !high && in->sz >= 4) {
+                u64 v = in->sz == 4 ? (u32)in->imm : (u64)in->imm;
+                if (v <= 0xffULL) { tr_zext8 |= bit; tr_zext16 |= bit; }
+                else if (v <= 0xffffULL) tr_zext16 |= bit;
+            } else if (!in->has_imm && in->rm_reg && !high && in->sz >= 4) {
+                int s = in->to_reg ? in->rm : in->reg;
+                bool sh = in->to_reg ? in->high_rm : in->high_reg;
+                if (!sh) {
+                    if (tr_zext8 & (1u << s)) tr_zext8 |= bit;
+                    if (tr_zext16 & (1u << s)) tr_zext16 |= bit;
+                }
+            }
+            return;
+        }
+        case OP_MOVZX: {
+            u16 bit = (u16)(1u << in->reg);
+            tr_zext8 &= (u16)~bit;
+            tr_zext16 &= (u16)~bit;
+            if (in->sz >= 4) {
+                if (in->srcsz == 1) { tr_zext8 |= bit; tr_zext16 |= bit; }
+                else if (in->srcsz == 2) tr_zext16 |= bit;
+            }
+            return;
+        }
+        case OP_ALU: {
+            if (in->sub == ALU_CMP || in->sub == ALU_TEST)
+                return;
+            if (!in->to_reg && !in->rm_reg)
+                return;
+            bool high = in->to_reg ? in->high_reg : in->high_rm;
+            int d = gpr_phys(in->to_reg ? in->reg : in->rm, high);
+            u16 bit = (u16)(1u << d);
+            tr_zext8 &= (u16)~bit;
+            tr_zext16 &= (u16)~bit;
+            if (!high && in->sz >= 4) {
+                if ((in->sub == ALU_XOR || in->sub == ALU_SUB) && !in->has_imm && in->rm_reg &&
+                    in->reg == in->rm && !in->high_reg && !in->high_rm) {
+                    tr_zext8 |= bit;
+                    tr_zext16 |= bit;
+                } else if (in->sub == ALU_AND && in->has_imm) {
+                    u64 m = in->sz == 4 ? (u32)in->imm : (u64)in->imm;
+                    if ((m & ~0xffULL) == 0) { tr_zext8 |= bit; tr_zext16 |= bit; }
+                    else if ((m & ~0xffffULL) == 0) tr_zext16 |= bit;
+                }
+            }
+            return;
+        }
+        case OP_SHIFT: {
+            if (!in->rm_reg)
+                return;
+            int d = gpr_phys(in->rm, in->high_rm);
+            u16 bit = (u16)(1u << d);
+            tr_zext8 &= (u16)~bit;
+            tr_zext16 &= (u16)~bit;
+            if (in->sub == SH_SHR && !in->by_cl && !in->high_rm) {
+                int amt = (int)(in->imm & (in->sz == 8 ? 63 : 31));
+                if ((in->sz == 4 && amt >= 24) || (in->sz == 8 && amt >= 56)) {
+                    tr_zext8 |= bit;
+                    tr_zext16 |= bit;
+                } else if ((in->sz == 4 && amt >= 16) || (in->sz == 8 && amt >= 48)) {
+                    tr_zext16 |= bit;
+                }
+            }
+            return;
+        }
+        case OP_INCDEC: case OP_NEG: case OP_NOT: case OP_BSWAP: case OP_SETCC: case OP_SHD:
+            if (in->rm_reg) {
+                int d = gpr_phys(in->rm, in->high_rm);
+                tr_zext8 &= (u16)~(1u << d);
+                tr_zext16 &= (u16)~(1u << d);
+            }
+            return;
+        case OP_BT:
+            if (in->sub != 0 && in->rm_reg) {
+                tr_zext8 &= (u16)~(1u << in->rm);
+                tr_zext16 &= (u16)~(1u << in->rm);
+            }
+            return;
+        case OP_LEA: case OP_MOVSX: case OP_CMOV: case OP_IMUL:
+        case OP_BSF: case OP_BSR: case OP_TZCNT: case OP_LZCNT: case OP_POPCNT: case OP_CRC32:
+            tr_zext8 &= (u16)~(1u << in->reg);
+            tr_zext16 &= (u16)~(1u << in->reg);
+            return;
+        case OP_MOVBE:
+            if (in->to_reg) {
+                tr_zext8 &= (u16)~(1u << in->reg);
+                tr_zext16 &= (u16)~(1u << in->reg);
+            }
+            return;
+        case OP_PUSH:
+            tr_zext8 &= (u16)~(1u << 4);
+            tr_zext16 &= (u16)~(1u << 4);
+            return;
+        case OP_POP: {
+            u16 clr = (u16)(1u << 4) | (in->rm_reg ? (u16)(1u << in->rm) : 0);
+            tr_zext8 &= (u16)~clr;
+            tr_zext16 &= (u16)~clr;
+            return;
+        }
+        case OP_LEAVE: case OP_ENTER:
+            tr_zext8 &= (u16)~((1u << 4) | (1u << 5));
+            tr_zext16 &= (u16)~((1u << 4) | (1u << 5));
+            return;
+        case OP_XCHG: case OP_XADD: {
+            int dr = gpr_phys(in->reg, in->high_reg);
+            u16 clr = (u16)(1u << dr) | (in->rm_reg ? (u16)(1u << gpr_phys(in->rm, in->high_rm)) : 0);
+            tr_zext8 &= (u16)~clr;
+            tr_zext16 &= (u16)~clr;
+            return;
+        }
+        case OP_CBW: case OP_XLAT: case OP_LAHF:
+            tr_zext8 &= (u16)~1u;
+            tr_zext16 &= (u16)~1u;
+            return;
+        case OP_CWD:
+            tr_zext8 &= (u16)~(1u << 2);
+            tr_zext16 &= (u16)~(1u << 2);
+            return;
+        case OP_JRCXZ:
+            if (in->sub >= 2) {
+                tr_zext8 &= (u16)~(1u << 1);
+                tr_zext16 &= (u16)~(1u << 1);
+            }
+            return;
+        default:
+            tr_zext8 = tr_zext16 = 0;
+            return;
+    }
+}
+
 static TrResult do_translate(int key, int view, u64 cr3, int cpl, u64 rip, bool single) {
     (void)view;
     u64 t0 = mach_absolute_time();
     TrResult res = {0};
     res.frames[0] = res.frames[1] = ~0ULL;
-    static Insn list[MAX_INSNS];
+    Insn list[MAX_INSNS];
     walk_cr3 = cr3;
     walk_cpl = cpl;
     tr_cpl = cpl;
     if (tr_needs_flush()) {
+        if (ctx_ptr->vcpu_count > 1) {
+            res.needs_flush = true;
+            return res;
+        }
         flush_everything();
         res.flushed = true;
     }
@@ -941,6 +1530,8 @@ static TrResult do_translate(int key, int view, u64 cr3, int cpl, u64 rip, bool 
         }
         if (in->op == OP_BAD || in->op == OP_UD)
             compile_inputs_reject(TR_CI_UNSUPPORTED);
+        if ((key & KEY_USER_FRAME) == KEY_USER_FRAME && in->next > page + 4096 && count > 0)
+            break;
         pc = in->next;
         count++;
         if (in->next > page + 4096 && count > 0) {
@@ -954,38 +1545,6 @@ static TrResult do_translate(int key, int view, u64 cr3, int cpl, u64 rip, bool 
     Insn *last = &list[count - 1];
     bool fallthrough_end = !(last->op == OP_JMP || last->op == OP_JMPI || last->op == OP_RET || last->op == OP_BAD ||
                              last->op == OP_UD || last->op == OP_IRET);
-    int live;
-    if (last->op == OP_JMP)
-        live = flags_needed_at(last->target, page, 3, list, count);
-    else if (!fallthrough_end)
-        live = F_ARITH;
-    else
-        live = flags_needed_at(last->next, page, 3, list, count);
-    static u8 live_after[MAX_INSNS];
-    static u8 live_before[MAX_INSNS];
-    for (int i = count - 1; i >= 0; i--) {
-        Insn *in = &list[i];
-        if (in->op == OP_JCC || in->op == OP_JRCXZ) {
-            int fwd = -1;
-            for (int j = i + 1; j < count; j++) {
-                if (list[j].rip == in->target) {
-                    fwd = j;
-                    break;
-                }
-            }
-            if (fwd >= 0)
-                live |= live_before[fwd];
-            else
-                live |= flags_needed_at(in->target, page, 2, list, count);
-        } else if (in->op == OP_CALL || in->op == OP_CALLI)
-            live = F_ARITH; // the callee and the landing pad are unknown
-        else if (in->op == OP_JMP || in->op == OP_JMPI || in->op == OP_RET)
-            live = i == count - 1 ? live : F_ARITH;
-        live_after[i] = (u8)(cfg.all_flags_live ? F_ARITH : live);
-        live = (live & ~in->writes) | insn_reads(in);
-        live_before[i] = (u8)live;
-    }
-
     block_insns = list;
     insn_total = count;
     pend_count = 0;
@@ -993,127 +1552,450 @@ static TrResult do_translate(int key, int view, u64 cr3, int cpl, u64 rip, bool 
     tr_ad_page = ~0ULL;
     tr_aes_mask = 0;
     u32 *start = tr_cc;
+    u32 *tail = tr_cc;
     if (ctx_ptr->vcpu_count > 1) // a kill patches the entry word under peers running it: nop to svc is a change the architecture allows, an arbitrary word isn't
         E(0xD503201Fu);
     u32 map0 = pc_map_used[cur_part];
+    if (native_dag && !single && count > 0 && count < MAX_INSNS && res.frames[1] == ~0ULL) {
+        expand_forward_dag(list, &count, key, rip, page);
+        insn_total = count;
+        last = &list[count - 1];
+        fallthrough_end = !is_uncond_term_op(last->op);
+    }
+    cur_key = key;
+    cur_entry_rip = rip;
+    cur_page = page;
+    cur_single = single;
+    l1_miss_count = 0;
+    tr_zext8 = tr_zext16 = 0;
+    ext_ymm_cache_reset();
+
+    int tgt_idx[MAX_INSNS], fall_idx[MAX_INSNS];
+    u8 ext_tgt_live[MAX_INSNS], ext_fall_live[MAX_INSNS];
+    bool is_target[MAX_INSNS];
+    memset(is_target, 0, (size_t)count * sizeof(bool));
     for (int i = 0; i < count; i++) {
         const Insn *in = &list[i];
-        // Any branch target inside the block can be reached with an unknown AD value.
-        for (int j = 0; j < count; j++) {
-            int jop = list[j].op;
-            if ((jop == OP_JCC || jop == OP_JRCXZ || jop == OP_JMP) && list[j].target == in->rip) {
-                tr_ad_page = ~0ULL;
-                if (tr_aes_mask)
-                    sse_aes_flush_all();
-                break;
+        tgt_idx[i] = -1;
+        fall_idx[i] = -1;
+        ext_tgt_live[i] = 0;
+        ext_fall_live[i] = 0;
+        if (in->op == OP_JCC || in->op == OP_JRCXZ || in->op == OP_JMP) {
+            int ti = idx_of_rip(list, count, in->target);
+            tgt_idx[i] = ti;
+            if (ti >= 0)
+                is_target[ti] = true;
+            else
+                ext_tgt_live[i] = (u8)flags_needed_at(in->target, page, in->op == OP_JMP ? 3 : 2, list, count);
+        } else if (in->op == OP_CALL) {
+            if (!tr_precise_flags && (in->target & ~0xfffULL) == page && ((in->target + 15) & ~0xfffULL) == page)
+                ext_tgt_live[i] = (u8)flags_needed_at(in->target, page, 2, list, count);
+            else
+                ext_tgt_live[i] = F_ARITH;
+        }
+        if (!is_uncond_term_op(in->op)) {
+            if (i + 1 < count && list[i + 1].rip == in->next) {
+                fall_idx[i] = i + 1;
+            } else {
+                int fi = idx_of_rip(list, count, in->next);
+                fall_idx[i] = fi;
+                if (fi >= 0)
+                    is_target[fi] = true;
+                else
+                    ext_fall_live[i] = (u8)flags_needed_at(in->next, page, 3, list, count);
             }
         }
-        if (in->op != OP_SSE) {
-            tr_ad_page = ~0ULL;
-            if (tr_aes_mask)
-                sse_aes_flush_all();
+        if (i > 0 && (is_uncond_term_op(list[i - 1].op) || list[i - 1].next != in->rip))
+            is_target[i] = true;
+    }
+
+    u8 live_after[MAX_INSNS];
+    u8 live_before[MAX_INSNS];
+    if (cfg.all_flags_live) {
+        memset(live_after, F_ARITH, (size_t)count);
+        memset(live_before, F_ARITH, (size_t)count);
+    } else {
+        memset(live_after, 0, (size_t)count);
+        memset(live_before, 0, (size_t)count);
+        bool changed = true;
+        for (int pass = 0; pass < 8 && changed; pass++) {
+            changed = false;
+            for (int i = count - 1; i >= 0; i--) {
+                const Insn *in = &list[i];
+                u8 out;
+                if (in->op == OP_JMP) {
+                    out = tgt_idx[i] >= 0 ? live_before[tgt_idx[i]] : ext_tgt_live[i];
+                } else if (is_uncond_term_op(in->op) || in->op == OP_CALLI) {
+                    out = F_ARITH;
+                } else if (in->op == OP_CALL) {
+                    out = ext_tgt_live[i];
+                } else if (in->op == OP_JCC || in->op == OP_JRCXZ) {
+                    u8 f = fall_idx[i] >= 0 ? live_before[fall_idx[i]] : ext_fall_live[i];
+                    u8 t = tgt_idx[i] >= 0 ? live_before[tgt_idx[i]] : ext_tgt_live[i];
+                    out = f | t;
+                } else {
+                    out = fall_idx[i] >= 0 ? live_before[fall_idx[i]] : ext_fall_live[i];
+                }
+                u8 lb = (u8)((out & ~in->writes) | insn_reads(in));
+                if (out != live_after[i] || lb != live_before[i]) {
+                    live_after[i] = out;
+                    live_before[i] = lb;
+                    changed = true;
+                }
+            }
         }
+        if (changed) {
+            memset(live_after, F_ARITH, (size_t)count);
+            memset(live_before, F_ARITH, (size_t)count);
+        }
+    }
+
+    for (int i = 0; i < count; i++) {
+        const Insn *in = &list[i];
+        bool prev_fell_through = i > 0 && !is_uncond_term_op(list[i - 1].op) && list[i - 1].next == in->rip;
+        if (is_target[i]) {
+            if (prev_fell_through) {
+                if (tr_aes_mask)
+                    sse_aes_flush_all();
+                if (ext_ymm_cache_has_dirty())
+                    ext_ymm_cache_flush_dirty();
+            }
+            tr_ad_page = ~0ULL;
+            tr_zext8 = tr_zext16 = 0;
+            ext_ymm_cache_reset();
+        }
+        if (ext_ymm_cache_has_dirty() &&
+            (in->op != OP_EXT || in->memop || is_target[i] || ext_ymm_cache_dirty_run() >= 8)) {
+            ext_ymm_cache_flush_dirty();
+        }
+        if (in->op == OP_SSE || in->op == OP_LDMXCSR || in->op == OP_STMXCSR ||
+            in->op == OP_X87 || in->op == OP_POPCNT) {
+            ext_ymm_cache_flush_and_drop();
+        }
+        if ((!tr_opt_peep && in->op != OP_SSE && in->op != OP_EXT) ||
+            (tr_opt_peep && !ad_page_safe_op(in->op))) {
+            tr_ad_page = ~0ULL;
+        }
+        if (in->op != OP_SSE && tr_aes_mask)
+            sse_aes_flush_all();
         insn_arm[i] = tr_cc;
         if (i)
             stats.op_words[list[i - 1].op & 127] += (u64)(tr_cc - insn_arm[i - 1]);
         stats.op_insns[in->op & 127]++;
-        pc_map[pc_map_used[cur_part]].arm_word = (u16)(tr_cc - start);
-        pc_map[pc_map_used[cur_part]].rip_off = (u16)(in->rip - rip);
-        pc_map_used[cur_part]++;
+        if (!ext_ymm_cache_has_dirty()) {
+            pc_map[pc_map_used[cur_part]].arm_word = (u16)(tr_cc - start);
+            pc_map[pc_map_used[cur_part]].rip_off = (u16)(in->rip - rip);
+            pc_map_used[cur_part]++;
+        }
         stats.insns++;
-        switch (in->op) {
-            case OP_JCC:
-            case OP_JRCXZ:
-            case OP_JMP:
-            case OP_CALL:
-            case OP_CALLI:
-            case OP_JMPI:
-            case OP_RET:
-                emit_control(in, i, live_after[i]);
-                break;
-            case OP_BAD:
-                emit_stop(in->rip, in->why);
-                break;
-            case OP_UD:
-                svc(SVC_UD);
-                break;
-            case OP_SSE:
-            case OP_LDMXCSR:
-            case OP_STMXCSR:
-                emit_sse(in, live_after[i]);
-                break;
-            case OP_X87:
-                emit_x87(in);
-                break;
-            case OP_SYSCALL:
-            case OP_SYSRET:
-            case OP_IRET:
-            case OP_INT:
-            case OP_INT3:
-            case OP_HLT:
-            case OP_CPUID:
-            case OP_RDTSC:
-            case OP_RDTSCP:
-            case OP_RDMSR:
-            case OP_WRMSR:
-            case OP_CLI:
-            case OP_STI:
-            case OP_MOV_CR:
-                if (i && in->reg == 3 && !in->to_reg && in->rm == 0 && !cfg.keep_kernel_tables && tr_cpl == 0) {
-                    // XNU's Meltdown fix, from 10.13.2: a process runs on tables holding little of the kernel, and every way in and out changes between them and the full ones,
-                    // through two fields of its per-CPU data. Those are the same to a process, which can't read the kernel's pages either way, so it stays on the full tables.
-                    // Going out, that is nothing to do. Coming in, the tables may be the other ones if TCG took it out, so look.
-                    const Insn *p = &list[i - 1];
-                    if (p->op == OP_MOV && p->seg == 2 && p->to_reg && p->reg == 0 && !p->rm_reg) {
-                        if (p->disp == 0x138)
-                            break;
-                        if (p->disp == 0x140) {
-                            Addr a = {.base = CTX, .imm = __builtin_offsetof(EngineCtx, cr3)};
-                            ldst(1, 8, S0, a);
-                            logic_sh(1, 2, 0, S0, S0, 0, 0, 0); // eor with rax
-                            ubfx(1, S0, S0, 12, 40); // the tables, whatever the PCID
-                            u32 *same = tr_cc;
-                            cbz(0, 1, S0, 0);
-                            emit_monitor_op(in);
-                            *same |= ((u32)(tr_cc - same) & 0x7ffff) << 5;
-                            break;
+
+        // P1-A multi-instruction peephole fusions (adjacent non-target pairs).
+        bool fused = false;
+        if (tr_opt_peep && !single && i + 1 < count && !is_target[i + 1] && in->next == list[i + 1].rip) {
+            const Insn *nx = &list[i + 1];
+            // 1) TEST r, r / CMP r, 0 + JE/JNE -> CBZ/CBNZ (flags dead after Jcc).
+            if (in->op == OP_ALU && nx->op == OP_JCC && (nx->cc == 4 || nx->cc == 5) && live_after[i + 1] == 0) {
+                int cbz_reg = -1, cbz_sf = 0;
+                if (in->sub == ALU_TEST && !in->has_imm && in->rm_reg && !in->high_reg && !in->high_rm && in->reg == in->rm) {
+                    if (in->sz == 4 || in->sz == 8) {
+                        cbz_reg = in->rm;
+                        cbz_sf = in->sz == 8;
+                    } else if (in->sz == 1 && (tr_zext8 & (1u << in->rm))) {
+                        cbz_reg = in->rm;
+                        cbz_sf = 0;
+                    } else if (in->sz == 2 && (tr_zext16 & (1u << in->rm))) {
+                        cbz_reg = in->rm;
+                        cbz_sf = 0;
+                    }
+                } else if (in->sub == ALU_CMP && in->has_imm && in->imm == 0 && in->rm_reg && !in->high_rm) {
+                    if (in->sz == 4 || in->sz == 8) {
+                        cbz_reg = in->rm;
+                        cbz_sf = in->sz == 8;
+                    } else if (in->sz == 1 && (tr_zext8 & (1u << in->rm))) {
+                        cbz_reg = in->rm;
+                        cbz_sf = 0;
+                    } else if (in->sz == 2 && (tr_zext16 & (1u << in->rm))) {
+                        cbz_reg = in->rm;
+                        cbz_sf = 0;
+                    }
+                }
+                if (cbz_reg >= 0) {
+                    u32 *back = internal_target(nx->target, i);
+                    int fwd = back ? -1 : forward_target_idx(nx->target, i + 1);
+                    u32 *direct = (back || fwd >= 0) ? NULL : try_direct_link_target(cur_key, cur_entry_rip, cur_page, nx->target, cur_single);
+                    i64 dd = direct ? (direct - tr_cc) : 0;
+                    if (direct && (dd < -(1 << 18) || dd >= (1 << 18)))
+                        direct = NULL;
+                    if (back) {
+                        cbz(nx->cc == 5, cbz_sf, cbz_reg, (int)(back - tr_cc));
+                    } else if (fwd >= 0) {
+                        add_fwd(tr_cc, fwd, 0);
+                        cbz(nx->cc == 5, cbz_sf, cbz_reg, 0);
+                    } else if (direct) {
+                        cbz(nx->cc == 5, cbz_sf, cbz_reg, (int)dd);
+                    } else {
+                        add_pending(tr_cc, nx->target, SVC_JCC, 0);
+                        cbz(nx->cc == 5, cbz_sf, cbz_reg, 0);
+                    }
+                    insn_arm[i + 1] = insn_arm[i];
+                    stats.op_insns[nx->op & 127]++;
+                    stats.insns++;
+                    i++;
+                    fused = true;
+                } else if (in->sub == ALU_TEST && in->has_imm && (in->rm_reg || !tr_precise_flags)) {
+                    // 2) TEST r/m, #(1<<k) + JE/JNE -> TBZ/TBNZ (STRICTLY internal targets only; 14-bit range!).
+                    u64 m = in->sz == 1 ? (u8)in->imm : in->sz == 2 ? (u16)in->imm : in->sz == 4 ? (u32)in->imm : (u64)in->imm;
+                    if (m != 0 && (m & (m - 1)) == 0) {
+                        u32 *back = internal_target(nx->target, i);
+                        int fwd = back ? -1 : forward_target_idx(nx->target, i + 1);
+                        bool back_ok = back && (back - tr_cc) >= -(1 << 13) + 16 && (back - tr_cc) < (1 << 13) - 16;
+                        bool fwd_ok = false;
+                        if (fwd >= 0 && (fwd - (i + 1)) <= 48 && fwd_count < MAX_FWD_FIX) {
+                            fwd_ok = true;
+                            for (int k = i + 2; k < fwd; k++) {
+                                u8 kop = list[k].op;
+                                if (kop == OP_EXT || kop == OP_SSE || kop == OP_X87 || kop == OP_STRING) {
+                                    fwd_ok = false;
+                                    break;
+                                }
+                            }
+                        }
+                        if (back_ok || fwd_ok) {
+                            int bit = __builtin_ctzll(m);
+                            int treg;
+                            if (in->rm_reg) {
+                                treg = gpr_phys(in->rm, in->high_rm);
+                                if (in->high_rm)
+                                    bit += 8;
+                            } else {
+                                ldst(1, in->sz, S0, addr_prepare(in, in->sz));
+                                treg = S0;
+                            }
+                            if (back_ok) {
+                                tbz(nx->cc == 5, treg, bit, (int)(back - tr_cc));
+                            } else {
+                                add_fwd(tr_cc, fwd, 2);
+                                tbz(nx->cc == 5, treg, bit, 0);
+                            }
+                            insn_arm[i + 1] = insn_arm[i];
+                            stats.op_insns[nx->op & 127]++;
+                            stats.insns++;
+                            i++;
+                            fused = true;
                         }
                     }
                 }
-                emit_monitor_op(in);
-                break;
-            case OP_MOV_DR:
-            case OP_INVLPG:
-            case OP_INVPCID:
-            case OP_WBINVD:
-            case OP_CLTS:
-            case OP_LGDT:
-            case OP_LTR:
-            case OP_MOV_SEG:
-            case OP_IN:
-            case OP_OUT:
-            case OP_SWAPGS:
-            case OP_SYSENTER:
-            case OP_SYSEXIT:
-            case OP_FAR:
-            case OP_FXSAVE:
-            case OP_FXRSTOR:
-                emit_monitor_op(in);
-                break;
-            default:
-                emit_int(in, live_after[i]);
-                break;
+            } else if (!tr_compat && !tr_precise_flags) {
+                // 3) PUSH r1; PUSH r2 -> stp r2, r1, [x4, #-16]!
+                if (in->op == OP_PUSH && in->rm_reg && !in->has_imm && !in->sub && in->sz == 8 && in->rm != 4 &&
+                    nx->op == OP_PUSH && nx->rm_reg && !nx->has_imm && !nx->sub && nx->sz == 8 && nx->rm != 4) {
+                    E(0xA9800000u | ((u32)-2 & 0x7fu) << 15 | (u32)in->rm << 10 | 4u << 5 | (u32)nx->rm);
+                    tr_zext8 &= (u16)~(1u << 4);
+                    tr_zext16 &= (u16)~(1u << 4);
+                    insn_arm[i + 1] = insn_arm[i];
+                    stats.op_insns[nx->op & 127]++;
+                    stats.insns++;
+                    i++;
+                    fused = true;
+                } else if (in->op == OP_POP && in->rm_reg && !in->sub && in->sz == 8 && in->rm != 4 &&
+                           nx->op == OP_POP && nx->rm_reg && !nx->sub && nx->sz == 8 && nx->rm != 4 &&
+                           in->rm != nx->rm) {
+                    // 4) POP r1; POP r2 -> ldp r1, r2, [x4], #16 (r1 != r2 required by ARM64)
+                    E(0xA8C00000u | (2u << 15) | (u32)nx->rm << 10 | 4u << 5 | (u32)in->rm);
+                    u16 clr = (u16)((1u << 4) | (1u << in->rm) | (1u << nx->rm));
+                    tr_zext8 &= (u16)~clr;
+                    tr_zext16 &= (u16)~clr;
+                    insn_arm[i + 1] = insn_arm[i];
+                    stats.op_insns[nx->op & 127]++;
+                    stats.insns++;
+                    i++;
+                    fused = true;
+                } else if (in->op == OP_POP && in->rm_reg && !in->sub && in->sz == 8 && in->rm != 4 &&
+                           nx->op == OP_RET && nx->imm == 0) {
+                    // 5) POP r1; RET -> ldp r1, x16, [x4], #16 + 4-insn RAS return
+                    E(0xA8C00000u | (2u << 15) | (u32)S0 << 10 | 4u << 5 | (u32)in->rm);
+                    if (cfg.no_return_prediction) {
+                        b_rel((int)((i64)(STUB(tr_stub_ret_miss) - tr_cc_va(tr_cc)) / 4));
+                    } else {
+                        E(0xA8C00000u | 2 << 15 | LR << 10 | RS << 5 | S1); // ldp x17, x30, [x26], #16
+                        logic_reg(1, 2, 0, S1, S1, S0);
+                        cbz(1, 1, S1, 2);
+                        ret_reg(LR);
+                        b_rel((int)((i64)(STUB(tr_stub_ret_miss) - tr_cc_va(tr_cc)) / 4));
+                    }
+                    tr_ad_page = ~0ULL;
+                    tr_zext8 = tr_zext16 = 0;
+                    ext_ymm_cache_reset();
+                    insn_arm[i + 1] = insn_arm[i];
+                    stats.op_insns[nx->op & 127]++;
+                    stats.insns++;
+                    i++;
+                    fused = true;
+                }
+            }
+        }
+
+        if (!fused) {
+            switch (in->op) {
+                case OP_JCC:
+                case OP_JRCXZ:
+                case OP_JMP:
+                case OP_CALL:
+                case OP_CALLI:
+                case OP_JMPI:
+                case OP_RET:
+                    emit_control(in, i, live_after[i]);
+                    if (in->op == OP_CALL || in->op == OP_CALLI || in->op == OP_JMPI || in->op == OP_RET) {
+                        ext_ymm_cache_reset();
+                        tr_ad_page = ~0ULL;
+                        tr_zext8 = tr_zext16 = 0;
+                    } else {
+                        update_zext(in);
+                    }
+                    break;
+                case OP_BAD:
+                    emit_stop(in->rip, in->why);
+                    tr_zext8 = tr_zext16 = 0;
+                    break;
+                case OP_UD:
+                    svc(SVC_UD);
+                    tr_zext8 = tr_zext16 = 0;
+                    break;
+                case OP_SSE:
+                case OP_LDMXCSR:
+                case OP_STMXCSR:
+                    emit_sse(in, live_after[i]);
+                    tr_zext8 = tr_zext16 = 0;
+                    break;
+                case OP_X87:
+                    emit_x87(in);
+                    tr_ad_page = ~0ULL;
+                    tr_zext8 = tr_zext16 = 0;
+                    break;
+                case OP_EXT:
+                    emit_ext(in, live_after[i]);
+                    tr_zext8 = tr_zext16 = 0;
+                    break;
+                case OP_SYSCALL:
+                case OP_SYSRET:
+                case OP_IRET:
+                case OP_INT:
+                case OP_INT3:
+                case OP_HLT:
+                case OP_CPUID:
+                case OP_RDTSC:
+                case OP_RDTSCP:
+                case OP_RDMSR:
+                case OP_WRMSR:
+                case OP_CLI:
+                case OP_STI:
+                case OP_MOV_CR:
+                    if (i && in->reg == 3 && !in->to_reg && in->rm == 0 && !cfg.keep_kernel_tables && tr_cpl == 0) {
+                        // XNU's Meltdown fix, from 10.13.2: a process runs on tables holding little of the kernel, and every way in and out changes between them and the full ones,
+                        // through two fields of its per-CPU data. Those are the same to a process, which can't read the kernel's pages either way, so it stays on the full tables.
+                        // Going out, that is nothing to do. Coming in, the tables may be the other ones if TCG took it out, so look.
+                        const Insn *p = &list[i - 1];
+                        if (p->op == OP_MOV && p->seg == 2 && p->to_reg && p->reg == 0 && !p->rm_reg) {
+                            if (p->disp == 0x138) {
+                                tr_zext8 = tr_zext16 = 0;
+                                break;
+                            }
+                            if (p->disp == 0x140) {
+                                Addr a = {.base = CTX, .imm = __builtin_offsetof(EngineCtx, cr3)};
+                                ldst(1, 8, S0, a);
+                                logic_sh(1, 2, 0, S0, S0, 0, 0, 0); // eor with rax
+                                ubfx(1, S0, S0, 12, 40); // the tables, whatever the PCID
+                                u32 *same = tr_cc;
+                                cbz(0, 1, S0, 0);
+                                emit_monitor_op(in);
+                                *same |= ((u32)(tr_cc - same) & 0x7ffff) << 5;
+                                ext_ymm_cache_reset();
+                                tr_ad_page = ~0ULL;
+                                tr_zext8 = tr_zext16 = 0;
+                                break;
+                            }
+                        }
+                    }
+                    emit_monitor_op(in);
+                    ext_ymm_cache_reset();
+                    tr_ad_page = ~0ULL;
+                    tr_zext8 = tr_zext16 = 0;
+                    break;
+                case OP_MOV_DR:
+                case OP_INVLPG:
+                case OP_INVPCID:
+                case OP_WBINVD:
+                case OP_CLTS:
+                case OP_LGDT:
+                case OP_LTR:
+                case OP_MOV_SEG:
+                case OP_IN:
+                case OP_OUT:
+                case OP_SWAPGS:
+                case OP_SYSENTER:
+                case OP_SYSEXIT:
+                case OP_FAR:
+                case OP_FXSAVE:
+                case OP_FXRSTOR:
+                    emit_monitor_op(in);
+                    ext_ymm_cache_reset();
+                    tr_ad_page = ~0ULL;
+                    tr_zext8 = tr_zext16 = 0;
+                    break;
+                default:
+                    emit_int(in, live_after[i]);
+                    update_zext(in);
+                    break;
+            }
+        }
+
+        // Non-adjacent fallthrough inside Forward-DAG: emit exit/branch before next disconnected sub-block.
+        const Insn *end_in = &list[i];
+        if (i + 1 < count && !is_uncond_term_op(end_in->op) && end_in->next != list[i + 1].rip) {
+            if (tr_aes_mask)
+                sse_aes_flush_all();
+            if (ext_ymm_cache_has_dirty())
+                ext_ymm_cache_flush_dirty();
+            u32 *back = internal_target(end_in->next, i);
+            int fwd = back ? -1 : forward_target_idx(end_in->next, i);
+            if (back) {
+                b_rel((int)(back - tr_cc));
+            } else if (fwd >= 0) {
+                add_fwd(tr_cc, fwd, 1);
+                b_rel(0);
+            } else {
+                u32 *direct = (!is_monitor_or_stop_op(end_in->op) && end_in->op != OP_POPF)
+                                  ? try_direct_link_target(cur_key, cur_entry_rip, cur_page, end_in->next, cur_single)
+                                  : NULL;
+                i64 dd = direct ? (direct - tr_cc) : 0;
+                if (direct && dd >= -(1 << 25) && dd < (1 << 25)) {
+                    b_rel((int)dd);
+                } else {
+                    svc(SVC_DIRECT);
+                    stub_lit(end_in->next);
+                }
+            }
         }
     }
     if (tr_aes_mask)
         sse_aes_flush_all();
+    if (ext_ymm_cache_has_dirty())
+        ext_ymm_cache_flush_dirty();
     for (int i = 0; i < fwd_count; i++)
         fix(fwd_fix[i].site, fwd_fix[i].form, insn_arm[fwd_fix[i].target_idx]);
-    u32 *tail = tr_cc;
+    tail = tr_cc;
     stats.op_words[last->op & 127] += (u64)(tr_cc - insn_arm[count - 1]);
     if (fallthrough_end) {
-        svc(SVC_DIRECT);
-        stub_lit(last->next);
+        u32 *direct = (!is_monitor_or_stop_op(last->op) && last->op != OP_POPF)
+                          ? try_direct_link_target(cur_key, cur_entry_rip, cur_page, last->next, cur_single)
+                          : NULL;
+        i64 dd = direct ? (direct - tr_cc) : 0;
+        if (direct && dd >= -(1 << 25) && dd < (1 << 25)) {
+            b_rel((int)dd);
+        } else {
+            svc(SVC_DIRECT);
+            stub_lit(last->next);
+        }
     }
     for (int i = 0; i < pend_count; i++) {
         u32 *stub = tr_cc;
@@ -1122,6 +2004,16 @@ static TrResult do_translate(int key, int view, u64 cr3, int cpl, u64 rip, bool 
         if (pend[i].kind == SVC_JCC)
             E((u32)(stub - pend[i].site));
         fix(pend[i].site, pend[i].form, stub);
+    }
+    for (int i = 0; i < l1_miss_count; i++) {
+        u32 *miss = tr_cc;
+        bl_rel((int)((i64)(STUB(PRIV_VA + OFF_STUBS + STUB_OFF_LOOKUP_L1) - tr_cc_va(tr_cc)) / 4));
+        if (l1_miss[i].is_call)
+            b_rel((int)(l1_miss[i].blr_site - tr_cc));
+        else
+            br(S2);
+        fix(l1_miss[i].site1, 0, miss);
+        fix(l1_miss[i].site2, 0, miss);
     }
     compile_inputs_finish();
     (void)tail;
@@ -1148,6 +2040,11 @@ static TrResult do_translate(int key, int view, u64 cr3, int cpl, u64 rip, bool 
     }
 
     // Registers the block.
+    if (hblock_count[cur_part] >= PART_BLOCKS_MAX(cur_part)) {
+        fprintf(stderr, "engine stop: block table overflow part=%d count=%u max=%llu\n",
+                cur_part, hblock_count[cur_part], (unsigned long long)PART_BLOCKS_MAX(cur_part));
+        abort();
+    }
     u32 idx = BLOCK_BASE(cur_part) + hblock_count[cur_part]++;
     HostBlock *hb = &hblocks[idx];
     memset(hb, 0, sizeof *hb);
@@ -1169,7 +2066,7 @@ static TrResult do_translate(int key, int view, u64 cr3, int cpl, u64 rip, bool 
     be->arm_off = (u32)(start - cc_base);
     be->arm_words = (u32)(tr_cc - start);
     be->map_off = map0;
-    be->map_count = (u32)count;
+    be->map_count = pc_map_used[cur_part] - map0;
     if (!single) {
         map_insert((int)hb->view, rip, idx + 1);
         hb->registered = true;
@@ -1262,9 +2159,30 @@ static void emit_monitor_op(const Insn *in) {
         case OP_HLT:
             svc(SVC_HLT);
             break;
-        case OP_CPUID:
+        case OP_CPUID: {
+            u32 *to_slow1 = tr_cc;
+            cbz(1, 0, 0, 0); // cbnz w0, slow
+            Addr ac = {.base = CTX, .imm = __builtin_offsetof(EngineCtx, cpuid0_cached)};
+            ldst(1, 8, S0, ac);
+            u32 *to_slow2 = tr_cc;
+            cbz(0, 1, S0, 0); // cbz xS0, slow
+            Addr a0 = {.base = CTX, .imm = __builtin_offsetof(EngineCtx, cpuid0_eax_ebx)};
+            ldst(1, 8, S0, a0);
+            mov_reg(0, 0, S0);
+            lsr_imm(1, 3, S0, 32);
+            Addr a1 = {.base = CTX, .imm = __builtin_offsetof(EngineCtx, cpuid0_ecx_edx)};
+            ldst(1, 8, S0, a1);
+            mov_reg(0, 1, S0);
+            lsr_imm(1, 2, S0, 32);
+            u32 *to_done = tr_cc;
+            b_rel(0);
+            u32 *slow = tr_cc;
             svc(SVC_CPUID);
+            *to_slow1 |= ((u32)(slow - to_slow1) & 0x7ffffu) << 5;
+            *to_slow2 |= ((u32)(slow - to_slow2) & 0x7ffffu) << 5;
+            *to_done |= (u32)(tr_cc - to_done) & 0x3ffffffu;
             break;
+        }
         case OP_RDTSC: {
             // tsc_now(), in place. CNTKCTL lets EL0 read the virtual counter, and nothing else runs ARM at EL0.
             Addr a = {.base = CTX};
@@ -1349,8 +2267,14 @@ static void emit_monitor_op(const Insn *in) {
                 svc(SVC_UD);
                 break;
             }
-            if (in->to_reg && cr != 8) { // the context holds them, and only the monitor changes them
+            if (in->to_reg) { // the context holds them, and only the monitor/fast-path changes them
                 Addr a = {.base = CTX};
+                if (cr == 8) {
+                    a.imm = __builtin_offsetof(EngineCtx, apic_tpr);
+                    ldst(1, 4, in->rm, a);
+                    lsr_imm(1, in->rm, in->rm, 4);
+                    break;
+                }
                 a.imm = cr == 0   ? __builtin_offsetof(EngineCtx, cr0)
                         : cr == 2 ? __builtin_offsetof(EngineCtx, cr2)
                         : cr == 3 ? __builtin_offsetof(EngineCtx, cr3)
@@ -1358,30 +2282,48 @@ static void emit_monitor_op(const Insn *in) {
                 ldst(1, 8, in->rm, a);
                 break;
             }
-            movimm(S0, (u64)cr);
-            if (in->to_reg) {
-                svc(SVC_MOV_CR_READ);
-                mov_reg(1, in->rm, S0);
-            } else {
+            if (cr == 8 && tr_hybrid) {
+                // Fast-path CR8/TPR write without EL1 trap; preserves NZCV.
+                ubfx(0, S1, in->rm, 0, 4);
+                lsl_imm(0, S1, S1, 4);
+                movimm(S2, __builtin_offsetof(EngineCtx, apic_tpr));
+                add_reg(1, 0, 0, S2, CTX, S2, 0);
+                ldst(1, 4, S0, (Addr){.base = S2});
+                logic_reg(0, 2, 0, S3, S1, S0); // eor wS3, new_tpr, old_tpr
+                u32 *same = tr_cc;
+                cbz(0, 0, S3, 0);
+                E(0x889FFC00u | (u32)S2 << 5 | (u32)S1); // stlr wS1, [xS2]
+                add_reg(0, 1, 0, S3, S1, S0, 0); // sub wS3, new_tpr, old_tpr (bit 31 set iff new < old)
+                u32 *raised = tr_cc;
+                tbz(0, S3, 31, 0);
+                movimm(S2, __builtin_offsetof(EngineCtx, apic_irr_prio));
+                add_reg(1, 0, 0, S2, CTX, S2, 0);
+                E(0x88DFFC00u | (u32)S2 << 5 | (u32)S0); // ldar wS0, [xS2]
+                add_reg(0, 1, 0, S3, S1, S0, 0); // sub wS3, new_tpr, irr_prio (bit 31 set iff new < irr)
+                u32 *masked = tr_cc;
+                tbz(0, S3, 31, 0);
+                movimm(S0, 8);
                 mov_reg(1, S1, in->rm);
                 svc(SVC_MOV_CR_WRITE);
+                *same |= ((u32)(tr_cc - same) & 0x7ffffu) << 5;
+                *raised |= ((u32)(tr_cc - raised) & 0x3fffu) << 5;
+                *masked |= ((u32)(tr_cc - masked) & 0x3fffu) << 5;
+                break;
             }
+            movimm(S0, (u64)cr);
+            mov_reg(1, S1, in->rm);
+            svc(SVC_MOV_CR_WRITE);
             break;
         }
         case OP_MOV_DR:
             emit_stop(in->rip, "debug registers");
             break;
-        case OP_INVLPG: {
-            Insn t = *in;
-            mov_reg(1, S0, addr_reg(&t));
-            svc(SVC_INVLPG);
+        case OP_INVLPG:
+        case OP_WBINVD:
+            // CPL != 0 already trapped #GP(0) above; shadow tables stay coherent via PT write-protection.
             break;
-        }
         case OP_INVPCID:
             svc(SVC_INVPCID);
-            break;
-        case OP_WBINVD:
-            svc(SVC_WBINVD);
             break;
         case OP_CLTS:
             svc(SVC_CLTS);
@@ -1492,14 +2434,23 @@ static void emit_monitor_op(const Insn *in) {
             int r = addr_reg(in);
             if (r != S0)
                 mov_reg(1, S0, r);
-            movimm(S2, in->sz == 8);
-            ubfx(1, S1, S0, 0, 4);
+            movimm(S2, (u64)(in->sz == 8) | ((u64)in->sub << 1));
+            ubfx(1, S1, S0, 0, in->sub ? 6 : 4);
             cbz(0, 1, S1, 2);
             svc(SVC_GP0);
             Addr a = {.base = S0};
             ldst(1, 8, XZR, a);
             a.imm = 504;
             ldst(1, 8, XZR, a);
+            if (in->sub) {
+                a.imm = 568;
+                ldst(1, 8, XZR, a);
+                u32 *no_ymm_r = tr_cc;
+                tbz(0, 0, 2, 0); // skip probing offset 824 if EAX[2] == 0
+                a.imm = 824;
+                ldst(1, 8, XZR, a);
+                *no_ymm_r |= ((u32)(tr_cc - no_ymm_r) & 0x3fff) << 5;
+            }
             if (in->op == OP_FXSAVE) {
                 a.imm = 0;
                 ldst(1, 8, S1, a);
@@ -1507,6 +2458,17 @@ static void emit_monitor_op(const Insn *in) {
                 a.imm = 504;
                 ldst(1, 8, S1, a);
                 ldst(0, 8, S1, a);
+                if (in->sub) {
+                    a.imm = 568;
+                    ldst(1, 8, S1, a);
+                    ldst(0, 8, S1, a);
+                    u32 *no_ymm_w = tr_cc;
+                    tbz(0, 0, 2, 0); // skip probing offset 824 if EAX[2] == 0
+                    a.imm = 824;
+                    ldst(1, 8, S1, a);
+                    ldst(0, 8, S1, a);
+                    *no_ymm_w |= ((u32)(tr_cc - no_ymm_w) & 0x3fff) << 5;
+                }
             }
             svc(in->op == OP_FXSAVE ? SVC_FXSAVE : SVC_FXRSTOR);
             break;
@@ -1517,6 +2479,14 @@ static void emit_monitor_op(const Insn *in) {
 }
 
 void tr_init(const TrConfig *config) {
+    const char *no_dag = getenv("LC_HVDBT_NO_NATIVE_DAG");
+    native_dag = !(no_dag && !strcmp(no_dag, "1"));
+    const char *no_l1 = getenv("LC_HVDBT_NO_NATIVE_L1");
+    native_l1 = !(no_l1 && !strcmp(no_l1, "1"));
+    const char *no_peep = getenv("LC_HVDBT_NO_NATIVE_PEEP");
+    tr_opt_peep = !(no_peep && !strcmp(no_peep, "1"));
+    const char *no_ymm = getenv("LC_HVDBT_NO_YMM_CACHE");
+    tr_opt_ymm_cache = !(no_ymm && !strcmp(no_ymm, "1"));
     cfg = *config;
     if (cfg.profile_invalidations && (mach_timebase_info(&invalidation_timebase) != KERN_SUCCESS || !invalidation_timebase.denom))
         cfg.profile_invalidations = false;
@@ -1545,7 +2515,7 @@ void tr_init(const TrConfig *config) {
     tr_stub_ret_miss = cfg.stub_ret_miss;
     tr_stub_pushf = cfg.stub_pushf;
     tr_stub_sahf = cfg.stub_sahf;
-    hblocks = calloc(BLOCKS_MAX * 2, sizeof(HostBlock));
+    hblocks = calloc(BLOCKS_MAX + BLOCKS_MAX_PRIV, sizeof(HostBlock));
     free(shared_hash_views);
     shared_hash_views = NULL;
     stats.invalidation_membership_enabled = cfg.invalidation_membership;
@@ -1565,7 +2535,7 @@ void tr_init(const TrConfig *config) {
     page_head = calloc(PAGE_HEADS, sizeof(u32));
 }
 
-TrResult tr_translate(int view, uint64_t cr3, int cpl, bool compat, uint64_t rip, bool single) {
+static TrResult translate(int view, uint64_t cr3, int cpl, bool compat, uint64_t rip, bool single) {
     tr_compat = compat; // the asking vCPU's: ctx_ptr is the first vCPU's, whatever it is running
     tr_fpcr_merges_scalar = ctx_ptr->fpcr_merges_scalar != 0;
     if (view > view_high)
@@ -1585,10 +2555,18 @@ TrResult tr_translate(int view, uint64_t cr3, int cpl, bool compat, uint64_t rip
         }
     }
     TrResult r = do_translate(key, view, cr3, cpl, rip, single);
-    if ((key & KEY_DOMAIN) && cpl == 3 && !r.unprotected)
+    if ((key & KEY_DOMAIN) && cpl == 3 && !r.unprotected && !r.needs_flush)
         stats.shared_blocks++;
     r.key = key;
     return r;
+}
+
+TrResult tr_translate(int view, uint64_t cr3, int cpl, bool compat, uint64_t rip, bool single) {
+    return translate(view, cr3, cpl, compat, rip, single);
+}
+
+TrResult tr_translate_native(int view, uint64_t cr3, int cpl, bool compat, uint64_t rip, bool single) {
+    return translate(view, cr3, cpl, compat, rip, single);
 }
 
 // The block holding a code cache word. Blocks only grow upward, so the table is sorted.
@@ -1616,14 +2594,44 @@ void tr_lookup_tail(uint64_t site, uint64_t target) {
     bool jump = was == (0xD4000001u | SVC_DIRECT << 5) || was == (0xD4000001u | SVC_JCC << 5);
     if (!call && !jump)
         return;
+    HostBlock *from = block_at((u32)(s - cc_base));
     cur_part = (u32)(s - cc_base) >= CC_PART2_WORD; // in reach of its site
+    i64 d_chk = (i64)(cc_cursor[cur_part] - s);
+    if (d_chk < -(1 << 25) || d_chk >= (1 << 25))
+        return;
+    u32 *part_start = cc_base + cur_part * CC_PART2_WORD;
+    if ((u64)((u8 *)cc_cursor[cur_part] - (u8 *)part_start) + 128 > cc_limit)
+        return;
     tr_cc = cc_cursor[cur_part];
     u32 *tail = tr_cc;
     movimm(S0, target);
-    mov_reg(1, S4, LR);
-    bl_rel((int)((i64)(STUB(tr_stub_lookup) - tr_cc_va(tr_cc)) / 4));
-    mov_reg(1, LR, S4);
-    br(S2);
+    if (from && use_native_l1(from->cpl, from->compat) && target != 0) {
+        // Constant-folded inline per-vCPU L1 probe: preserves NZCV and LR on hit.
+        u32 slot = (u32)((target ^ (target >> 4)) & (FEX_L1_ENTRIES - 1));
+        u32 byte_off = slot << 4;
+        add_imm_lsl12(1, 0, 0, AD, CTX, 0x400u + (byte_off >> 12));
+        u32 lo = byte_off & 0xfffu;
+        if (lo <= 504) {
+            E(0xA9400000u | ((lo / 8) & 0x7fu) << 15 | (u32)S3 << 10 | (u32)AD << 5 | (u32)S2);
+        } else {
+            add_imm(1, 0, 0, AD, AD, lo);
+            E(0xA9400000u | (u32)S3 << 10 | (u32)AD << 5 | (u32)S2);
+        }
+        logic_reg(1, 2, 0, S3, S3, S0);
+        u32 *miss = tr_cc;
+        cbz(1, 1, S3, 0);
+        br(S2);
+        *miss |= ((u32)(tr_cc - miss) & 0x7ffffu) << 5;
+        mov_reg(1, S4, LR);
+        bl_rel((int)((i64)(STUB(PRIV_VA + OFF_STUBS + STUB_OFF_LOOKUP_L1) - tr_cc_va(tr_cc)) / 4));
+        mov_reg(1, LR, S4);
+        br(S2);
+    } else {
+        mov_reg(1, S4, LR);
+        bl_rel((int)((i64)(STUB(tr_stub_lookup) - tr_cc_va(tr_cc)) / 4));
+        mov_reg(1, LR, S4);
+        br(S2);
+    }
     cc_cursor[cur_part] = tr_cc;
     sys_icache_invalidate(tail, (u8 *)tr_cc - (u8 *)tail);
     code_published();
@@ -1683,6 +2691,7 @@ static void hash_empty(int view) {
     u64 *t = hash_table(view);
     for (u32 i = 0; i < HASH_ENTRIES; i++)
         t[i * 2] = 0;
+    __sync_synchronize();
 }
 
 // Called under the existing translator lock, before publishing any hash value/key. Unknown targets disable the
@@ -1722,6 +2731,15 @@ void tr_hash_insert(int view, uint64_t rip, uint64_t arm) {
         membership_track(view, rip, arm);
         __atomic_thread_fence(__ATOMIC_RELEASE); // Publish membership before an existing-key value as well as a new key.
     }
+    u64 val = arm;
+    {
+        u64 base = PRIV_VA + OFF_CC;
+        if (arm >= base && ((arm - base) & 3) == 0) {
+            u32 *entry = cc_base + (u32)((arm - base) / 4);
+            if (entry[1] == 0x10000050u)
+                val |= 1ULL;
+        }
+    }
     u64 *t = hash_table(view);
     if (hash_slots_used[view] >= HASH_ENTRIES / 4 * 3) {
         hash_empty(view);
@@ -1733,7 +2751,7 @@ void tr_hash_insert(int view, uint64_t rip, uint64_t arm) {
     for (u32 n = 0; n < HASH_ENTRIES; n++, h = (h + 1) & (HASH_ENTRIES - 1)) {
         u64 key = t[h * 2];
         if (key == rip) {
-            t[h * 2 + 1] = arm;
+            t[h * 2 + 1] = val;
             return;
         }
         if (key == 1 && tombstone == ~0u)
@@ -1743,7 +2761,7 @@ void tr_hash_insert(int view, uint64_t rip, uint64_t arm) {
                 h = tombstone;
             else
                 hash_slots_used[view]++;
-            t[h * 2 + 1] = arm;
+            t[h * 2 + 1] = val;
             __sync_synchronize();
             t[h * 2] = rip;
             return;
@@ -1797,7 +2815,7 @@ static void hash_remove_entry(int view, u64 rip, u64 arm, bool sample) {
         if (!key)
             break;
         if (key == rip) {
-            if (t[h * 2 + 1] == arm) {
+            if ((t[h * 2 + 1] & ~1ULL) == arm) {
                 t[h * 2] = 1;
                 removed = 1;
             }
@@ -1837,6 +2855,8 @@ static void invalidate_shared_hashes(u32 idx, bool sample) {
     }
 }
 
+static void fex_l1_remove_rip(u64 rip);
+
 static void kill_block(u32 idx) {
     HostBlock *hb = &hblocks[idx];
     if (hb->dead)
@@ -1869,16 +2889,26 @@ static void kill_block(u32 idx) {
     }
     if (shared_hash_views && idx < BLOCKS_MAX)
         memset(shared_hash_views[idx], 0, sizeof(*shared_hash_views));
+    if (use_native_l1(hb->cpl, hb->compat))
+        fex_l1_remove_rip(hb->rip);
     // Keep eager removal of every lookup to this entry and entry poisoning: SVC_DEAD starts with view_lookup,
     // and dead-block reuse can revive an entry. Conservative membership never makes lookup entries lazy.
     u32 *entry = cc_base + hb->entry_word;
     *entry = WORD_DEAD;
+    bool is_fex = entry[1] == 0x10000050u;
+    if (is_fex)
+        entry[3] = WORD_DEAD;
     if (sample) {
         u64 began = mach_absolute_time();
         sys_icache_invalidate(entry, 4);
+        if (is_fex)
+            sys_icache_invalidate(entry + 3, 4);
         stats.invalidation_icache_ns += invalidation_ns(mach_absolute_time() - began);
-    } else
+    } else {
         sys_icache_invalidate(entry, 4);
+        if (is_fex)
+            sys_icache_invalidate(entry + 3, 4);
+    }
     stats.invalidated++;
     if (hb->read_bytes)
         dead_slots[dead_slot(hb->view, hb->rip)] = idx + 1;
@@ -1907,14 +2937,47 @@ int tr_invalidate_frame(uint64_t gpa, uint32_t why) {
     return n;
 }
 
+static void fex_l1_remove_rip(u64 rip) {
+    // Pairs with _stub_lookup_l1's stp -> dmb ish -> ldr [hash_slot] (Dekker):
+    // ensures prior hash_remove store is visible before loading l1[idx + 1].
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    u32 vc = ctx_ptr->vcpu_count ? ctx_ptr->vcpu_count : 1;
+    u64 slot = (rip ^ (rip >> 4)) & (FEX_L1_ENTRIES - 1);
+    u64 idx = slot * 2;
+    for (u32 vi = 0; vi < vc && vi < MAX_VCPUS; vi++) {
+        u64 *l1 = (u64 *)(cfg.priv + OFF_FEX_L1 + (u64)vi * FEX_L1_BYTES);
+        if (__atomic_load_n(&l1[idx + 1], __ATOMIC_RELAXED) == rip)
+            __atomic_store_n(&l1[idx + 1], 0ULL, __ATOMIC_RELEASE);
+    }
+}
+
+static void fex_l1_clear_view(int view) {
+    u32 vc = ctx_ptr->vcpu_count ? ctx_ptr->vcpu_count : 1;
+    if (vc > MAX_VCPUS)
+        vc = MAX_VCPUS;
+    // Pairs with monitor.c bumping fex_view_gen[view] (SEQ_CST) before HC_VIEW_FORGET
+    // and view_activate_core storing c->view (SEQ_CST) before loading fex_view_gen.
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    for (u32 vi = 0; vi < vc; vi++) {
+        const EngineCtx *vc_ctx = (const EngineCtx *)(cfg.priv + OFF_CTX + (u64)vi * CTX_SLOT);
+        if (__atomic_load_n(&vc_ctx->view, __ATOMIC_ACQUIRE) != (u32)view)
+            continue;
+        u64 *l1 = (u64 *)(cfg.priv + OFF_FEX_L1 + (u64)vi * FEX_L1_BYTES);
+        for (size_t i = 0; i < FEX_L1_ENTRIES; i++)
+            __atomic_store_n(&l1[i * 2 + 1], 0ULL, __ATOMIC_RELEASE);
+    }
+}
+
 void tr_view_forget(int view) {
     hash_empty(view);
     hash_slots_used[view] = 0;
+    fex_l1_clear_view(view);
     stats.hash_forgets++;
 }
 
 int tr_invalidate_view_va(int view, uint64_t va, uint32_t why, bool unmoved, bool keeper) {
     int n = 0;
+    bool unmapped_shared = false;
     u64 page = va & ~0xfffULL;
     u32 slot = page_slot(page);
     u32 *link = &page_head[slot];
@@ -1928,8 +2991,10 @@ int tr_invalidate_view_va(int view, uint64_t va, uint32_t why, bool unmoved, boo
         }
         u64 first = hb->rip & ~0xfffULL;
         bool here = first == page || (hb->frame[1] != ~0ULL && first + 4096 == page);
-        if (here && (hb->view & KEY_DOMAIN) && !keeper) { // only this view's sight of it changed: the block stands for the others
+        if (here && (hb->view & KEY_DOMAIN) && ((hb->view & KEY_USER_FRAME) == KEY_USER_FRAME || !keeper)) { // only this view's sight of it changed: the block stands for the others
             hash_remove(view, hb->rip);
+            fex_l1_remove_rip(hb->rip);
+            unmapped_shared = true;
         } else if (here && ((int)hb->view == view || (hb->view & KEY_DOMAIN))) {
             kill_block(*link - 1);
             n++;
@@ -1939,6 +3004,8 @@ int tr_invalidate_view_va(int view, uint64_t va, uint32_t why, bool unmoved, boo
         }
         link = next;
     }
+    if (unmapped_shared)
+        __atomic_thread_fence(__ATOMIC_SEQ_CST);
     stats.kill_calls[why]++;
     stats.killed[why] += (u64)n;
     if (unmoved)
@@ -1958,6 +3025,7 @@ void tr_view_drop(int view) {
     view_head[view] = 0;
     memset(hash_table(view), 0, HASH_BYTES);
     hash_slots_used[view] = 0;
+    fex_l1_clear_view(view);
     ctx_ptr->tr_flushed = 1;
 }
 
@@ -1974,8 +3042,11 @@ void tr_flush_all(void) {
 static void code_published(void) {
     static u64 generation;
     u64 g = ++generation;
-    for (u64 i = 0; i < MAX_VCPUS; i++)
-        __atomic_store_n(&((EngineCtx *)(cfg.priv + OFF_CTX + i * CTX_SLOT))->code_gen, g, __ATOMIC_RELAXED);
+    u32 vc = ctx_ptr->vcpu_count ? ctx_ptr->vcpu_count : 1;
+    if (vc > MAX_VCPUS)
+        vc = MAX_VCPUS;
+    for (u32 i = 0; i < vc; i++)
+        __atomic_store_n(&((EngineCtx *)(cfg.priv + OFF_CTX + (u64)i * CTX_SLOT))->code_gen, g, __ATOMIC_RELAXED);
     __atomic_thread_fence(__ATOMIC_SEQ_CST); // before a hash key or an existing key's new value
 }
 
@@ -1988,6 +3059,13 @@ static void clear_code(u32 *from, u32 *to) {
 
 void tr_flush_parked(bool everything) {
     everything = everything || part_full(0);
+    fprintf(stderr, "[hvdbt-flush] all=%d p0(cc=%ld/%llu blk=%u/%llu pcm=%u/%zu) p1(cc=%ld/%llu blk=%u/%llu pcm=%u/%zu)\n",
+            everything ? 1 : 0,
+            (long)((u8 *)cc_cursor[0] - (u8 *)cc_base), (unsigned long long)cc_limit,
+            hblock_count[0], (unsigned long long)PART_BLOCKS_MAX(0), pc_map_used[0], (size_t)PCMAP_ENTRIES,
+            (long)((u8 *)cc_cursor[1] - (u8 *)(cc_base + CC_PART2_WORD)), (unsigned long long)cc_limit,
+            hblock_count[1], (unsigned long long)PART_BLOCKS_MAX(1),
+            pc_map_used[1] - (u32)((OFF_PCMAP2 - OFF_PCMAP) / sizeof(PcMap)), (size_t)PCMAP_ENTRIES);
     ctx_ptr->tr_flushed = 1;
     memset(frame_head, 0, (cfg.ram_size >> 12) * sizeof(u32));
     memset(page_head, 0, PAGE_HEADS * sizeof(u32));
@@ -1996,6 +3074,7 @@ void tr_flush_parked(bool everything) {
     flush_dead_slots(everything);
     for (int v = 0; v <= view_high; v++)
         memset(hash_table(v), 0, HASH_BYTES);
+    memset(cfg.priv + OFF_FEX_L1, 0, MAX_VCPUS * FEX_L1_BYTES);
     memset(hash_slots_used, 0, sizeof hash_slots_used);
     membership_clear_all(); // Both full and private-part flushes empty ALL view hashes before any block index is reused.
     // Return the reused span to zeros (UDF). A core may prefetch past the

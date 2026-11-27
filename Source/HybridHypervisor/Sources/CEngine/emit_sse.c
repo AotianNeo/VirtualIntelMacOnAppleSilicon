@@ -1,10 +1,8 @@
 // SSE and SSE2 to NEON. Where supported, FPCR.AH selects alternate FP behavior for min/max and NaNs.
 // MXCSR status lives in FPSR. Unmasked FP exceptions cannot be trapped on this hardware, so the monitor stops on them.
+#include <stddef.h>
 #include "engine_api.h"
 #include "tr_internal.h"
-
-u16 tr_aes_mask;
-u8 tr_aes_key[16];
 
 static inline void sse_aes_flush_one(int r) {
     if (tr_aes_mask & (1u << r)) {
@@ -19,6 +17,110 @@ void sse_aes_flush_all(void) {
     for (int r = 0; m; r++, m >>= 1)
         if (m & 1)
             E(0x6E201C00u | (u32)tr_aes_key[r] << 16 | (u32)r << 5 | (u32)r);
+}
+
+static void logic_imm(int sf, int opc, int rd, int rn, u64 imm) {
+    u32 enc = 0;
+    logimm(imm, sf, &enc);
+    u32 base = opc == 0 ? 0x12000000u : opc == 1 ? 0x32000000u : 0x52000000u;
+    if (sf)
+        base |= 0x80000000u;
+    E(base | enc | (u32)rn << 5 | (u32)rd);
+}
+
+static void patch_tb(u32 *at, const u32 *target) {
+    *at |= ((u32)(target - at) & 0x3fffu) << 5;
+}
+
+static void patch_cb(u32 *at, const u32 *target) {
+    *at |= ((u32)(target - at) & 0x7ffffu) << 5;
+}
+
+static void patch_b(u32 *at, const u32 *target) {
+    *at |= (u32)(target - at) & 0x3ffffffu;
+}
+
+// Monitor mxcsr_apply, for the value Geekbench actually writes: exceptions masked,
+// no reserved bits, CR0.TS clear. Anything else is still the SVC.
+void emit_ldmxcsr_s0(void) {
+    ldst(1, 8, S1, (Addr){.base = CTX, .imm = offsetof(EngineCtx, cr0)});
+    u32 *to_slow_ts = tr_cc;
+    tbz(1, S1, 3, 0);
+    lsr_imm(0, S1, S0, 16);
+    u32 *to_slow_hi = tr_cc;
+    cbz(1, 0, S1, 0);
+    logic_imm(1, 0, S1, S0, 0x1F80);
+    logic_imm(1, 2, S1, S1, 0x1F80);
+    u32 *to_slow_mask = tr_cc;
+    cbz(1, 1, S1, 0);
+
+    logic_imm(1, 0, S2, S0, 0xFFC0);
+    ldst(1, 4, S3, (Addr){.base = CTX, .imm = offsetof(EngineCtx, mxcsr)});
+    logic_reg(0, 2, 0, S3, S2, S3);
+    u32 *skip_fpcr = tr_cc;
+    cbz(0, 0, S3, 0);
+
+    movimm(S1, 6);
+    u32 *skip_daz = tr_cc;
+    tbz(0, S0, 6, 0);
+    logic_imm(1, 1, S1, S1, 1);
+    patch_tb(skip_daz, tr_cc);
+    u32 *skip_ftz = tr_cc;
+    tbz(0, S0, 15, 0);
+    logic_imm(1, 1, S1, S1, 1ULL << 24);
+    patch_tb(skip_ftz, tr_cc);
+    ubfx(0, S2, S0, 13, 2);
+    lsr_imm(0, S3, S2, 1);
+    logic_imm(1, 0, S2, S2, 1);
+    logic_sh(0, 1, 0, S2, S3, S2, 0, 1);
+    logic_sh(1, 1, 0, S1, S1, S2, 0, 22);
+    E(0xD51B4400u | S1); // msr fpcr, x
+    logic_imm(1, 0, S1, S0, 0xFFC0);
+    ldst(0, 4, S1, (Addr){.base = CTX, .imm = offsetof(EngineCtx, mxcsr)});
+    patch_cb(skip_fpcr, tr_cc);
+
+    logic_imm(1, 0, S1, S0, 1);
+    ubfx(0, S2, S0, 2, 4);
+    logic_sh(0, 1, 0, S1, S1, S2, 0, 1);
+    u32 *skip_de = tr_cc;
+    tbz(0, S0, 1, 0);
+    logic_imm(1, 1, S1, S1, 128);
+    patch_tb(skip_de, tr_cc);
+    E(0xD53B4420u | S2); // mrs x, fpsr
+    logic_reg(1, 2, 0, S2, S2, S1);
+    u32 *skip_fpsr = tr_cc;
+    cbz(0, 1, S2, 0);
+    E(0xD51B4420u | S1); // msr fpsr, x
+    patch_cb(skip_fpsr, tr_cc);
+    u32 *skip_svc = tr_cc;
+    b_rel(0);
+
+    u32 *slow = tr_cc;
+    svc(SVC_LDMXCSR);
+    patch_tb(to_slow_ts, slow);
+    patch_cb(to_slow_hi, slow);
+    patch_cb(to_slow_mask, slow);
+    patch_b(skip_svc, tr_cc);
+}
+
+void emit_stmxcsr_s0(void) {
+    ldst(1, 8, S1, (Addr){.base = CTX, .imm = offsetof(EngineCtx, cr0)});
+    u32 *to_slow = tr_cc;
+    tbz(1, S1, 3, 0);
+    E(0xD53B4420u | S0); // mrs x, fpsr
+    ldst(1, 4, S1, (Addr){.base = CTX, .imm = offsetof(EngineCtx, mxcsr)});
+    logic_imm(1, 0, S2, S0, 1);
+    ubfx(0, S3, S0, 7, 1);
+    logic_sh(0, 1, 0, S2, S2, S3, 0, 1);
+    ubfx(0, S3, S0, 1, 4);
+    logic_sh(0, 1, 0, S2, S2, S3, 0, 2);
+    logic_reg(0, 1, 0, S0, S1, S2);
+    u32 *skip_svc = tr_cc;
+    b_rel(0);
+    u32 *slow = tr_cc;
+    svc(SVC_STMXCSR);
+    patch_tb(to_slow, slow);
+    patch_b(skip_svc, tr_cc);
 }
 
 // kind: 2 s, 3 d, 4 q
@@ -386,11 +488,31 @@ static void emit_addsub(const Insn *in) {
 static void fmov_to_d(int v, int x) { RR(0x9E670000u, v, x); }
 static void ins_x(int v, int lane, int x) { E(0x4E081C00u | (u32)lane << 20 | (u32)x << 5 | v); } // ins v.d[lane], x
 
-// SSE4.1, AES and PCLMUL, the forms libraries and kexts reach for, each with an exact NEON or crypto counterpart.
-static void emit_sse41(const Insn *in, int live) {
-    int opc = in->opc, d = in->reg, imm = (int)(in->imm & 0xff);
-    if (in->sub == 5) {
-        int s = src_op(in, 4, false);
+static void pcmp_mask_from_cmp(int rd_gpr, int cmp_vec, int v_mask, int vt, bool words) {
+    RRR(0x4E201C00u, vt, cmp_vec, v_mask); // and vt.16b, cmp_vec.16b, v_mask.16b
+    if (words) {
+        RR(0x4E71B800u, vt, vt); // addv h_vt, vt.8h
+    } else {
+        RRR(0x4E20BC00u, vt, vt, vt); // addp vt.16b, vt.16b, vt.16b
+        RRR(0x4E20BC00u, vt, vt, vt); // addp vt.16b, vt.16b, vt.16b
+        RRR(0x0E20BC00u, vt, vt, vt); // addp vt.8b, vt.8b, vt.8b
+    }
+    E(0x0E023C00u | (u32)vt << 5 | (u32)rd_gpr); // umov w_rd, vt.h[0]
+}
+
+// Inline EL0 PCMPISTRI / VPCMPISTRI for hot aggregation modes:
+// - agg == 2 (Equal Each, 8-bit & 16-bit, all polarities, LSB & MSB) -> strlen, wcslen, strcmp, strncmp
+// - agg == 0 (Equal Any, 8-bit, all polarities, LSB & MSB) -> strchr, strpbrk, strcspn, strspn
+// - agg == 1 (Ranges, 8-bit unsigned, all polarities, LSB & MSB) -> lexer/tokenizer ranges
+// Falls back to SVC_H_PCMPISTRI for rare modes (agg == 3 Equal Ordered, 16-bit Equal Any/Ranges, signed Ranges).
+void emit_pcmpistri_el0(int d, int s, u8 imm, int live) {
+    bool words = (imm & 1) != 0;
+    bool is_signed = (imm & 2) != 0;
+    int agg = (imm >> 2) & 3;
+    int pol = (imm >> 4) & 3;
+    bool msb = (imm & 0x40) != 0;
+    bool supported = (agg == 2) || (agg == 0 && !words) || (agg == 1 && !words && !is_signed);
+    if (!supported) {
         umov_d(S0, d, 0);
         umov_d(S1, d, 1);
         umov_d(S2, s, 0);
@@ -401,6 +523,135 @@ static void emit_sse41(const Insn *in, int live) {
         msr_nzcv(S2);
         mov_reg(1, R_PF, S3);
         mov_reg(1, R_AF, S4);
+        return;
+    }
+
+    int n = words ? 8 : 16;
+    u32 all = (1u << n) - 1;
+    u32 sz = words ? 1u : 0u;
+    enum { VT = 27, VM = 28 };
+    if (words) {
+        movimm(S0, 0x0008000400020001ULL);
+        fmov_to_d(VM, S0);
+        movimm(S0, 0x0080004000200010ULL);
+        ins_x(VM, 1, S0);
+    } else {
+        movimm(S0, 0x8040201008040201ULL);
+        fmov_to_d(VM, S0);
+        ins_x(VM, 1, S0);
+    }
+
+    // S0 = za (zero mask of a), S1 = zb (zero mask of b)
+    RR(0x4E209800u | sz << 22, VT, d); // cmeq #0
+    pcmp_mask_from_cmp(S0, VT, VM, VT, words);
+    RR(0x4E209800u | sz << 22, VT, s); // cmeq #0
+    pcmp_mask_from_cmp(S1, VT, VM, VT, words);
+
+    // S3 = valid_a = (za - 1) & ~za & all, S4 = valid_b = (zb - 1) & ~zb & all
+    add_imm(0, 1, 0, S3, S0, 1);
+    logic_reg(0, 0, 1, S3, S3, S0);
+    logic_imm(0, 0, S3, S3, all);
+    add_imm(0, 1, 0, S4, S1, 1);
+    logic_reg(0, 0, 1, S4, S4, S1);
+    logic_imm(0, 0, S4, S4, all);
+
+    // Compute raw match bitmask in S2.
+    if (agg == 2) {
+        RRR(0x6E208C00u | sz << 22, VT, d, s); // cmeq d, s
+        pcmp_mask_from_cmp(S2, VT, VM, VT, words);
+        logic_reg(0, 0, 0, S5, S3, S4); // valid_a & valid_b
+        logic_reg(0, 0, 0, S2, S2, S5); // eq & valid_a & valid_b
+        movimm(S5, all);
+        logic_reg(0, 0, 1, S5, S5, S3); // all & ~valid_a
+        logic_reg(0, 0, 1, S5, S5, S4); // all & ~valid_a & ~valid_b
+        logic_reg(0, 1, 0, S2, S2, S5); // res
+    } else if (agg == 0) {
+        vmov(V_S0, d);
+        E(0x6E201C00u | V_S1 << 16 | V_S1 << 5 | V_S1); // eor V_S1, V_S1, V_S1
+        u32 *skip_loop = tr_cc;
+        cbz(0, 0, S3, 0);
+        u32 *loop = tr_cc;
+        E(0x4E010400u | (u32)V_S0 << 5 | V_S2);          // dup V_S2.16b, V_S0.b[0]
+        RRR(0x6E208C00u, V_S2, V_S2, s);                 // cmeq V_S2.16b, V_S2.16b, s.16b
+        RRR(0x4EA01C00u, V_S1, V_S1, V_S2);              // orr V_S1.16b, V_S1.16b, V_S2.16b
+        E(0x6E000800u | (u32)V_S0 << 16 | (u32)V_S0 << 5 | V_S0); // ext V_S0, V_S0, V_S0, #1
+        lsr_imm(0, S3, S3, 1);
+        cbz(1, 0, S3, (int)(loop - tr_cc));
+        patch_cb(skip_loop, tr_cc);
+        pcmp_mask_from_cmp(S2, V_S1, VM, VT, false);
+        logic_reg(0, 0, 0, S2, S2, S4); // res &= valid_b
+    } else {
+        // agg == 1, unsigned 8-bit Ranges
+        vmov(V_S0, d);
+        E(0x6E201C00u | V_S1 << 16 | V_S1 << 5 | V_S1);
+        lsr_imm(0, S5, S3, 1);
+        u32 *skip_loop = tr_cc;
+        cbz(0, 0, S5, 0);
+        u32 *loop = tr_cc;
+        E(0x4E010400u | (u32)V_S0 << 5 | V_S2);          // dup V_S2.16b, V_S0.b[0] (lo)
+        E(0x4E030400u | (u32)V_S0 << 5 | VT);            // dup VT.16b, V_S0.b[1] (hi)
+        RRR(0x6E203C00u, V_S2, s, V_S2);                 // cmhs V_S2.16b, s.16b, lo.16b (s >= lo)
+        RRR(0x6E203C00u, VT, VT, s);                     // cmhs VT.16b, hi.16b, s.16b (hi >= s)
+        RRR(0x4E201C00u, V_S2, V_S2, VT);                // and V_S2, V_S2, VT
+        RRR(0x4EA01C00u, V_S1, V_S1, V_S2);              // orr V_S1, V_S1, V_S2
+        E(0x6E001000u | (u32)V_S0 << 16 | (u32)V_S0 << 5 | V_S0); // ext V_S0, V_S0, V_S0, #2
+        lsr_imm(0, S3, S3, 2);
+        lsr_imm(0, S5, S3, 1);
+        cbz(1, 0, S5, (int)(loop - tr_cc));
+        patch_cb(skip_loop, tr_cc);
+        pcmp_mask_from_cmp(S2, V_S1, VM, VT, false);
+        logic_reg(0, 0, 0, S2, S2, S4); // res &= valid_b
+    }
+
+    // Apply polarity (1: invert all, 3: invert valid_b only).
+    if (pol == 1) {
+        movimm(S5, all);
+        logic_reg(0, 2, 0, S2, S2, S5);
+    } else if (pol == 3) {
+        logic_reg(0, 2, 0, S2, S2, S4);
+    }
+
+    // Write result index into ECX (zero-extended to RCX).
+    if (!msb) {
+        logic_imm(0, 1, S5, S2, 1ULL << n);
+        rbit(0, S5, S5);
+        clz(0, 1, S5);
+    } else {
+        clz(0, S5, S2);
+        movimm(S3, 31);
+        add_reg(0, 1, 0, S5, S3, S5, 0);
+        add_imm(0, 1, 1, XZR, S2, 0);
+        movimm(S3, (u64)n);
+        csel(0, 1, S3, S5, 0);
+    }
+
+    // Flags: SF=(za!=0), ZF=(zb!=0), CF=(res!=0) [Arm64 C=(res==0)], OF=(res&1), PF=0, AF=0.
+    if (live) {
+        add_imm(0, 1, 1, XZR, S0, 0);
+        cset(S5, 1); // NE: za != 0 -> N
+        lsl_imm(1, S5, S5, 31);
+        add_imm(0, 1, 1, XZR, S1, 0);
+        cset(S3, 1); // NE: zb != 0 -> Z
+        logic_sh(1, 1, 0, S5, S5, S3, 0, 30);
+        add_imm(0, 1, 1, XZR, S2, 0);
+        cset(S3, 0); // EQ: res == 0 -> C (inverted x86 CF)
+        logic_sh(1, 1, 0, S5, S5, S3, 0, 29);
+        ubfx(1, S3, S2, 0, 1);
+        logic_sh(1, 1, 0, S5, S5, S3, 0, 28);
+        msr_nzcv(S5);
+        if (live & (F_P | F_A))
+            movimm(R_PF, 1);
+        if (live & F_A)
+            mov_reg(1, R_AF, R_PF);
+    }
+}
+
+// SSE4.1, AES and PCLMUL, the forms libraries and kexts reach for, each with an exact NEON or crypto counterpart.
+static void emit_sse41(const Insn *in, int live) {
+    int opc = in->opc, d = in->reg, imm = (int)(in->imm & 0xff);
+    if (in->sub == 5) {
+        int s = src_op(in, 4, false);
+        emit_pcmpistri_el0(d, s, (u8)imm, live);
         return;
     }
     if (in->sub == 4) {
@@ -461,6 +712,52 @@ static void emit_sse41(const Insn *in, int live) {
                     s = S0;
                 }
                 E(0x4E001C00u | (u32)(lane << (log2sz(bytes) + 1) | bytes) << 16 | (u32)s << 5 | d);
+                return;
+            }
+            case 0x40: // dpps
+            case 0x41: { // dppd. Same product-mask / pairwise-add / broadcast as FEX VDPPSOpImpl.
+                bool dbl = opc == 0x41;
+                int s = src_op(in, 4, true);
+                unsigned srcm = dbl ? ((unsigned)imm >> 4) & 3u : ((unsigned)imm >> 4) & 0xfu;
+                unsigned dstm = dbl ? (unsigned)imm & 3u : (unsigned)imm & 0xfu;
+                unsigned full = dbl ? 3u : 0xfu;
+                if (srcm == 0 || dstm == 0) {
+                    E(0x6E201C00u | d << 16 | d << 5 | d);
+                    return;
+                }
+                RRR(dbl ? 0x6E60DC00u : 0x6E20DC00u, V_S0, d, s);
+                if (srcm != full) {
+                    u64 lo, hi;
+                    if (dbl) {
+                        lo = (srcm & 1) ? ~0ULL : 0;
+                        hi = (srcm & 2) ? ~0ULL : 0;
+                    } else {
+                        lo = ((srcm & 1) ? 0xffffffffULL : 0) | ((srcm & 2) ? 0xffffffffULL << 32 : 0);
+                        hi = ((srcm & 4) ? 0xffffffffULL : 0) | ((srcm & 8) ? 0xffffffffULL << 32 : 0);
+                    }
+                    movimm(S0, lo);
+                    RR(0x9E670000u, V_S1, S0);
+                    movimm(S0, hi);
+                    E(0x4E081C00u | 1u << 20 | (u32)S0 << 5 | V_S1);
+                    RRR(0x4E201C00u, V_S0, V_S0, V_S1); // and
+                }
+                E(0x6E201C00u | V_S1 << 16 | V_S1 << 5 | V_S1);
+                RRR(dbl ? 0x6E60D400u : 0x6E20D400u, V_S0, V_S0, V_S1);
+                if (!dbl)
+                    RRR(0x6E20D400u, V_S0, V_S0, V_S1);
+                if (dstm == full) {
+                    if (dbl)
+                        E(0x4E080400u | (u32)V_S0 << 5 | d); // dup.2d
+                    else
+                        E(0x4E040400u | (u32)V_S0 << 5 | d); // dup.4s
+                    return;
+                }
+                E(0x6E201C00u | V_S1 << 16 | V_S1 << 5 | V_S1);
+                int lanes = dbl ? 2 : 4, es = dbl ? 8 : 4;
+                for (int i = 0; i < lanes; i++)
+                    if (dstm & (1u << i))
+                        ins_elem(V_S1, i, V_S0, 0, es);
+                vmov(d, V_S1);
                 return;
             }
             case 0x21: { // insertps: count_s, count_d, zero mask
@@ -800,13 +1097,13 @@ void emit_sse(const Insn *in, int live) {
     }
     if (in->op == OP_LDMXCSR) {
         ldst(1, 4, S0, addr_prepare(in, 4));
-        svc(SVC_LDMXCSR);
+        emit_ldmxcsr_s0();
         return;
     }
     if (in->op == OP_STMXCSR) {
         Addr a = addr_prepare(in, 4);
-        // The monitor returns the value in x16: compute the address first, so a fault here is precise.
-        svc(SVC_STMXCSR);
+        // The value comes back in x16. The address is ready first, so a fault on the store is precise.
+        emit_stmxcsr_s0();
         ldst(0, 4, S0, a);
         return;
     }
@@ -1218,10 +1515,30 @@ void emit_sse(const Insn *in, int live) {
                 emit_lanes32(d, s, s, imm);
                 break;
             } else {
-                int base = pfx == 0xF3 ? 4 : 0;
-                ins_elem(V_S0, pfx == 0xF3 ? 0 : 1, s, pfx == 0xF3 ? 0 : 1, 8);
+                bool hi = pfx == 0xF3;
+                int im = imm & 0xff;
+                if (im == 0xE4) {
+                    vmov(d, s);
+                    break;
+                }
+                if (im == 0x00 || im == 0x55 || im == 0xAA || im == 0xFF) {
+                    int k = (hi ? 4 : 0) + (im & 3);
+                    E(0x4E020400u | (u32)k << 18 | (u32)s << 5 | V_S0); // dup v24.8h, vs.h[k]
+                    ins_elem(V_S0, hi ? 0 : 1, s, hi ? 0 : 1, 8);
+                    vmov(d, V_S0);
+                    break;
+                }
+                if (im == 0x1B || im == 0xB1 || im == 0x4E) {
+                    u32 rev = im == 0x1B ? 0x4E600800u : im == 0xB1 ? 0x6E600800u : 0x4EA00800u;
+                    RR(rev, V_S0, s); // rev64.8h / rev32.8h / rev64.4s
+                    ins_elem(V_S0, hi ? 0 : 1, s, hi ? 0 : 1, 8);
+                    vmov(d, V_S0);
+                    break;
+                }
+                int base = hi ? 4 : 0;
+                ins_elem(V_S0, hi ? 0 : 1, s, hi ? 0 : 1, 8);
                 for (int i = 0; i < 4; i++)
-                    ins_elem(V_S0, base + i, s, base + ((imm >> (2 * i)) & 3), 2);
+                    ins_elem(V_S0, base + i, s, base + ((im >> (2 * i)) & 3), 2);
             }
             vmov(d, V_S0);
             break;
