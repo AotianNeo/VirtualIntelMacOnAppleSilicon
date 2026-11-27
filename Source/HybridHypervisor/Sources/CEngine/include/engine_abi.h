@@ -28,14 +28,20 @@
 
 #define OFF_MON_TEXT 0ULL // EL1 rx: vectors, monitor text and rodata
 #define OFF_MON_DATA (2ULL << 20) // EL1 rw: monitor data, stack
-#define OFF_STUBS (4ULL << 20) // EL0 execute-only: lookup and helper stubs, within bl reach of the code cache
-#define OFF_CC (6ULL << 20) // EL0 execute-only, EL1 rw: translated code
-#define CC_SIZE (118ULL << 20)
-#define OFF_CTX (124ULL << 20) // EL0 rw: one EngineCtx per vCPU, CTX_SLOT apart. x18 holds this vCPU's
+#define OFF_STUBS (4ULL << 20) // EL0 execute-only: lookup and helper stubs, within bl reach of lower code cache
+#define OFF_CC (6ULL << 20) // EL0 execute-only, EL1 rw: translated code (part 0, shared)
+#define CC_SIZE (248ULL << 20)
+#define OFF_STUBS_HI (OFF_CC + CC_SIZE) // 254 MB: EL0 execute-only stub copy within ±128 MB of upper half of OFF_CC
+#define OFF_CTX (784ULL << 20) // EL0 rw: one EngineCtx per vCPU, CTX_SLOT apart. x18 holds this vCPU's
 #define MAX_VCPUS 16
 #define CTX_SLOT (64ULL << 10)
 #define OFF_MON_CPU (OFF_MON_DATA + (1ULL << 20)) // EL1 rw: per vCPU, CTX_SLOT apart too, the monitor's own state and stack
-#define OFF_CTX_END (126ULL << 20)
+#define OFF_CTX_END (OFF_CTX + (2ULL << 20))
+#define OFF_FEX_L1 (OFF_CTX + (4ULL << 20)) // 788 MB: EL0 rw, per vCPU 64 KB direct-mapped L1 lookup table (x18 + 4 MiB invariant)
+#define FEX_L1_ENTRIES 4096ULL
+#define FEX_L1_BYTES (FEX_L1_ENTRIES * 16ULL)
+#define FEX_L1_MASK ((FEX_L1_ENTRIES - 1ULL) << 4)
+#define OFF_FEX_L1_END (OFF_FEX_L1 + (2ULL << 20))
 #define OFF_HASH (1024ULL << 20) // EL0 ro, per view: indirect-branch table
 #define HASH_ENTRIES (1ULL << 16)
 #define HASH_BYTES (HASH_ENTRIES * 16)
@@ -55,22 +61,31 @@ static inline uint64_t engine_shared_compat_domain(uint64_t rip, uint64_t table)
     return SHARED_COMPAT_TAG | ((rip >> 21) << 35) | table;
 }
 #define MAX_VIEWS 256 // two or three per x86 address space, and one that goes takes its blocks with it: a desktop has a hundred processes
-#define OFF_RSTACKS (OFF_HASH + MAX_VIEWS * HASH_BYTES) // EL0 rw, per vCPU and view: 16 KB guard (unmapped), then a 16 KB shadow return stack
-#define OFF_BLOCKS (196ULL << 20) // EL1 ro: block table, pc maps
-#define BLOCKS_MAX (1ULL << 19) // the table has 16 MB
-#define OFF_PCMAP (212ULL << 20)
-#define PCMAP_BYTES (44ULL << 20)
+#define OFF_RSTACKS (OFF_HASH + MAX_VIEWS * HASH_BYTES) // EL0 rw, per vCPU and view: 16 KB guard (unmapped), then a 16 KB shadow return stack (1280..1408 MB)
+#define OFF_BLOCKS (792ULL << 20) // EL1 ro: block table (32 MB for shared part 0), then pc maps at 824 MB
+#define BLOCKS_MAX (1ULL << 20) // 1,048,576 shared blocks = 32 MB (matches 248 MB p0)
+#define BLOCKS_MAX_PRIV (1ULL << 19) // 524,288 private blocks = 16 MB
+#define OFF_PCMAP (824ULL << 20)
+#define PCMAP_BYTES (128ULL << 20) // 33,554,432 PcMap entries per partition
 #define OFF_PT (256ULL << 20) // EL1 rw: static hole tables, then the shadow pool
 #define PT_STATIC_BYTES (1ULL << 20)
 #define SHADOW_POOL_BYTES (255ULL << 20) // after the static tables, up to OFF_SHADOW_META
 #define OFF_SHADOW_META (512ULL << 20) // EL1 rw: shadow page descriptors, hash, rmap
-#define OFF_PAGEINFO (768ULL << 20) // EL1 rw, one byte per guest page frame (4 GB of RAM per MB)
-// The code cache's second part, for blocks of one view: as far as this is from the first, so with stubs of its own in reach, and tables of its own.
-#define OFF_STUBS2 (816ULL << 20)
-#define OFF_CC2 (818ULL << 20)
-#define OFF_BLOCKS2 (936ULL << 20)
-#define OFF_PCMAP2 (952ULL << 20)
+#define OFF_PAGEINFO (768ULL << 20) // EL1 rw, one byte per guest page frame (16 MB = 64 GB RAM, covers all < PRIV_IPA)
+// The code cache's second part, for blocks of one view: stubs at both ends so ±128 MB B/BL reaches every word, plus its own block/pcmap tables.
+#define OFF_STUBS2 (1408ULL << 20)
+#define OFF_CC2 (1410ULL << 20)
+#define OFF_STUBS2_HI (OFF_CC2 + CC_SIZE) // 1658 MB: stub copy for upper half of OFF_CC2
+#define OFF_BLOCKS2 (1660ULL << 20) // 16 MB (1660..1676 MB)
+#define OFF_PCMAP2 (1676ULL << 20) // 128 MB (1676..1804 MB < 2048 MB PRIV_SIZE)
 #define CC_PART2_WORD ((OFF_CC2 - OFF_CC) / 4)
+_Static_assert(OFF_FEX_L1 - OFF_CTX == (4ULL << 20), "OFF_FEX_L1 must remain exactly 4 MiB past OFF_CTX for vectors.s and L1 inline probes");
+_Static_assert(OFF_STUBS_HI + (2ULL << 20) <= OFF_PT, "part 0 code cache + high stubs run past OFF_PT");
+_Static_assert(OFF_PCMAP + PCMAP_BYTES <= OFF_HASH, "part 0 pcmap runs past OFF_HASH");
+_Static_assert(OFF_RSTACKS + MAX_VCPUS * MAX_VIEWS * (32ULL << 10) <= OFF_STUBS2, "return stacks run past OFF_STUBS2");
+_Static_assert(OFF_STUBS2_HI + (2ULL << 20) <= OFF_BLOCKS2, "part 1 code cache + high stubs run past OFF_BLOCKS2");
+_Static_assert(OFF_BLOCKS2 + BLOCKS_MAX_PRIV * 32ULL <= OFF_PCMAP2, "part 1 blocks run past OFF_PCMAP2");
+_Static_assert(OFF_PCMAP2 + PCMAP_BYTES <= PRIV_SIZE, "part 1 pcmap runs past PRIV_SIZE");
 
 // RAM alias, EL1 only: x86 GPA + RAM_ALIAS_VA reaches guest RAM for the monitor's walker.
 #define RAM_ALIAS_VA 0xF10000000000ULL
@@ -87,6 +102,10 @@ static inline uint64_t engine_shared_compat_domain(uint64_t rip, uint64_t table)
 #define STUB_OFF_REP_PAGE_STOS 0x380ULL
 #define STUB_OFF_REP_PAGE_STOS_HEAD 0x3C0ULL
 #define STUB_OFF_REP_PAGE_END 0x400ULL
+#define STUB_OFF_FEX_ENTER 0x400ULL
+#define STUB_OFF_FEX_EXIT_LINKER 0x5F8ULL
+#define STUB_OFF_FEX_EXIT 0x600ULL
+#define STUB_OFF_FEX_EXIT_NATIVE 0x690ULL
 
 #define RSTACK_BYTES (16ULL << 10)
 #define RSTACK_SLOT (32ULL << 10)
@@ -97,6 +116,7 @@ static inline uint64_t engine_off_rstacks(uint32_t cpu) { return OFF_RSTACKS + (
 #define PI_PT 2 // a shadow page tracks this frame as a guest page table
 #define PI_RAM 4 // RAM, as opposed to a device hole
 #define PI_DIRECT 8 // device memory mapped straight into the VM: shadows may point at it, and nothing else about RAM holds
+#define PI_NOTE 16 // pending DMA/TCG write notification in note_ring / overflow scan
 
 // svc immediates from translated code and stubs. Translator requests come first, then x86 events and helpers.
 enum {
@@ -107,6 +127,7 @@ enum {
     SVC_DEAD, // this block was invalidated; ELR-4 finds it
     SVC_STOP, // literal: u32 stop reason index
     SVC_SINGLE_DONE, // end of a one-off single-instruction block, literal target follows
+    SVC_FEX_LINK, // FEX direct branch lazy linker: ELR points to 4 movz/movk words
     // x86 events
     SVC_SYSCALL = 16, // x16 next rip
     SVC_SYSRET,
@@ -378,13 +399,35 @@ typedef struct {
     // Lazy-flushed back to mm[p]/fp_exp[p] on SVC_X87, FXSAVE, HC_FALLBACK, and HC_BOUNDARY.
     uint64_t fp_d_valid;
     uint64_t fp_d[8];
+    uint64_t xcr0;
+    uint64_t pad_ymm;
+    uint64_t ymm_hi[16][2] __attribute__((aligned(16)));
+    uint64_t cpuid0_cached;
+    uint64_t cpuid0_eax_ebx;
+    uint64_t cpuid0_ecx_edx;
+    uint32_t mon_irq_taken;
+    uint32_t pad_mon_irq_taken;
+    // Hybrid EL1 fast paths (LAPIC deferred edge-EOI, HPET main counter, platform MSRs). Append-only.
+    uint32_t hybrid_apic_vapic;
+    uint32_t hybrid_eoi_pending;
+    uint64_t hybrid_apic_base_msr;
+    uint64_t msr_core_thread_count;
+    // VM-wide HPET counter calibration in c0 (seqlock: even = stable, odd = updating). Read-only in EL1.
+    uint32_t hpet_fast_seq;
+    uint32_t hpet_fast_enabled;
+    int64_t hpet_fast_offset_ns;
+    uint64_t hpet_fast_expire_ns;
+    uint64_t hpet_fast_floor_tick;
 } EngineCtx;
+_Static_assert(sizeof(EngineCtx) <= 32768, "EngineCtx must stay below the +32 KB per-vCPU scratch region");
 _Static_assert(sizeof(EngineCtx) <= CTX_SLOT, "EngineCtx must fit its existing per-vCPU slot");
 // Monitor/vectors.s reads these two from x18 with fixed offsets.
 #define CTX_CODE_GEN_OFFSET 30680
 #define CTX_CODE_SYNCED_OFFSET 30688
+#define CTX_YMM_HI_OFFSET 30784
 _Static_assert(__builtin_offsetof(EngineCtx, code_gen) == CTX_CODE_GEN_OFFSET, "update CTX_CODE_GEN in Monitor/vectors.s");
 _Static_assert(__builtin_offsetof(EngineCtx, code_synced) == CTX_CODE_SYNCED_OFFSET, "update CTX_CODE_SYNCED in Monitor/vectors.s");
+_Static_assert(__builtin_offsetof(EngineCtx, ymm_hi) == CTX_YMM_HI_OFFSET, "update CTX_YMM_HI in Monitor/vectors.s");
 
 // Block table, one entry per translated block, ordered by arm_off because the code cache only grows.
 typedef struct {

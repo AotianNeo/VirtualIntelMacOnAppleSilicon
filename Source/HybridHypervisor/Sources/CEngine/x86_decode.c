@@ -15,6 +15,23 @@ static void set_bad(Insn *in, const char *why) {
     in->writes = 0;
 }
 
+// True when the extended decoder consumed the instruction, including a
+// cross-page fetch that has to be raised and translated again. A VEX opcode
+// that starts in the last bytes of a not-yet-present next page used to become
+// a cached one-byte #UD, and every later hit left the engine for TCG.
+static bool take_ext(u64 rip, Insn *in, const u8 *b, int avail) {
+    int ext = x86_decode_ext(rip, in, b, avail);
+    if (ext > 0)
+        return true;
+    if (ext < 0) {
+        set_bad(in, "FETCH_FAULT");
+        in->target = rip + (u64)avail;
+        in->next = rip + (u64)avail;
+        return true;
+    }
+    return false;
+}
+
 // 16-bit addressing, which is 67h in compatibility mode: bx, si, di, bp only. The emitter wraps the sum at 16 bits.
 static const u8 *modrm16(Insn *in, int mod, int rm, const u8 *p) {
     static const u8 base[8] = {3, 3, 5, 5, 6, 7, 5, 3}, index[8] = {6, 7, 6, 7};
@@ -624,7 +641,12 @@ static void decode_inner(u64 rip, Insn *in, const u8 *b, int avail) {
                    opc == 0x1F || opc == 0x27 || opc == 0x2F || opc == 0x37 || opc == 0x3F || opc == 0x60 ||
                    opc == 0x61 || opc == 0x62 || opc == 0x82 || opc == 0x9A || opc == 0xC4 || opc == 0xC5 ||
                    opc == 0xCE || opc == 0xD4 || opc == 0xD5 || opc == 0xD6 || opc == 0xEA) {
-            BADUD("invalid in 64-bit mode (or VEX)");
+            if (opc == 0xC4 || opc == 0xC5) {
+                if (take_ext(rip, in, b, avail))
+                    return;
+                BADUD("invalid in 64-bit mode (or VEX)");
+            } else
+                BADUD("invalid in 64-bit mode (or VEX)");
         } else {
             set_bad(in, "untranslated one-byte opcode");
         }
@@ -728,7 +750,9 @@ static void decode_inner(u64 rip, Insn *in, const u8 *b, int avail) {
             } else if (m == 0xF9) {
                 p++;
                 in->op = OP_RDTSCP;
-            } else if (m == 0xD0) {
+            } else if (m == 0xD0 || m == 0xD1) {
+                if (take_ext(rip, in, b, avail))
+                    return;
                 set_bad(in, "xgetbv");
                 p++;
             } else {
@@ -808,7 +832,7 @@ static void decode_inner(u64 rip, Insn *in, const u8 *b, int avail) {
                     in->writes = F_ARITH; // ptest
             } else if (mand == 0x66 && opc == 0x3A &&
                        ((p[0] >= 0x08 && p[0] <= 0x0E) || (p[0] >= 0x14 && p[0] <= 0x17) || (p[0] >= 0x20 && p[0] <= 0x22) ||
-                        p[0] == 0x44 || p[0] == 0xDF)) {
+                        p[0] == 0x40 || p[0] == 0x41 || p[0] == 0x44 || p[0] == 0xDF)) {
                 opc = *p++;
                 SSE_FORM();
                 in->sub = 4;
@@ -821,8 +845,11 @@ static void decode_inner(u64 rip, Insn *in, const u8 *b, int avail) {
                 in->has_imm = true;
                 in->imm = *p++;
                 in->writes = F_ARITH;
-            } else
+            } else {
+                if (take_ext(rip, in, b, avail))
+                    return;
                 BADUD("SSE4 opcode map: TCG has it");
+            }
         } else if (opc >= 0x40 && opc <= 0x4F) {
             MODRM();
             in->op = OP_CMOV;
@@ -887,10 +914,12 @@ static void decode_inner(u64 rip, Insn *in, const u8 *b, int avail) {
             } else if ((m >> 6) != 3 && !mand) {
                 MODRM();
                 in->reg = s;
-                if (s == 0) {
+                if (s == 0 || s == 4 || s == 6) {
                     in->op = OP_FXSAVE;
-                } else if (s == 1) {
+                    in->sub = s != 0;
+                } else if (s == 1 || s == 5) {
                     in->op = OP_FXRSTOR;
+                    in->sub = s != 1;
                 } else if (s == 2) {
                     in->op = OP_LDMXCSR;
                 } else if (s == 3) {
@@ -959,6 +988,8 @@ static void decode_inner(u64 rip, Insn *in, const u8 *b, int avail) {
         } else if (opc == 0xFF) {
             BADUD("0F FF");
         } else {
+            if (take_ext(rip, in, b, avail))
+                return;
             set_bad(in, "untranslated two-byte opcode");
         }
     }

@@ -126,6 +126,7 @@ enum {
     OP_FXSAVE,
     OP_FXRSTOR,
     OP_X87, // sub: low three bits of the escape byte, 8 for fwait. opc: the modrm byte
+    OP_EXT, // Zydis-decoded extended ISA (BMI1/BMI2/ADX/SHA-NI/AVX/AVX2/FMA/XGETBV) -> emit_ext.c
     OP_RDFSGS_UNUSED,
     OP_PUSHA, // sub 0 pushad, 1 popad
     OP_SYSENTER,
@@ -141,9 +142,11 @@ typedef struct {
     u8 pfx; // SSE mandatory prefix: 0 none, 0x66, 0xF2, 0xF3
     u8 opc; // SSE: second opcode byte; 0F38/0F3A are not advertised and stop
     u8 imm_len;
-    bool rm_reg, to_reg, has_imm, by_cl, lock, addr32, addr16, pop_seg, riprel, no_base, no_index, high_reg, high_rm, memop;
+    bool rm_reg, to_reg, has_imm, by_cl, lock, addr32, addr16, pop_seg, riprel, no_base, no_index, high_reg, high_rm, memop, vsib;
     i64 disp, imm;
     u64 rip, next, target;
+    u8 ext_bytes[16];
+    u8 ext_len;
     const char *why;
 } Insn;
 
@@ -160,9 +163,16 @@ extern u32 *tr_cc; // write cursor
 extern bool tr_precise_flags, tr_has_tzcnt, tr_hybrid, tr_no_bulk_rep;
 extern bool tr_fpcr_merges_scalar;
 extern u64 tr_ad_page;
+extern u16 tr_zext8, tr_zext16;
+extern bool tr_opt_peep, tr_opt_ymm_cache;
 extern u16 tr_aes_mask;
 extern u8 tr_aes_key[16];
 void sse_aes_flush_all(void);
+void ext_ymm_cache_reset(void);
+void ext_ymm_cache_flush_dirty(void);
+void ext_ymm_cache_flush_and_drop(void);
+bool ext_ymm_cache_has_dirty(void);
+int ext_ymm_cache_dirty_run(void);
 extern bool tr_profile_shift_helpers;
 extern bool tr_inline_shr8;
 extern bool tr_page_rep;
@@ -176,6 +186,9 @@ u64 tr_cc_va(const u32 *p);
 // ---- AArch64 encoders, integer ----
 static inline void add_imm(int sf, int sub, int s, int rd, int rn, u32 imm) {
     E((u32)sf << 31 | sub << 30 | s << 29 | 0x11u << 24 | imm << 10 | rn << 5 | rd);
+}
+static inline void add_imm_lsl12(int sf, int sub, int s, int rd, int rn, u32 imm12) {
+    E((u32)sf << 31 | sub << 30 | s << 29 | 0x11400000u | (imm12 & 0xfffu) << 10 | rn << 5 | rd);
 }
 // shift: 0 lsl, 1 lsr, 2 asr
 static inline void add_reg_sh(int sf, int sub, int s, int rd, int rn, int rm, int shift, int amt) {
@@ -204,6 +217,10 @@ static inline void lsl_imm(int sf, int rd, int rn, int n) {
 static inline void lsr_imm(int sf, int rd, int rn, int n) { bitfield(sf, 2, rd, rn, n, sf ? 63 : 31); }
 static inline void asr_imm(int sf, int rd, int rn, int n) { bitfield(sf, 0, rd, rn, n, sf ? 63 : 31); }
 static inline void ubfx(int sf, int rd, int rn, int lsb, int width) { bitfield(sf, 2, rd, rn, lsb, lsb + width - 1); }
+static inline void ubfiz(int sf, int rd, int rn, int lsb, int width) {
+    int sz = sf ? 64 : 32;
+    bitfield(sf, 2, rd, rn, (sz - lsb) % sz, width - 1);
+}
 static inline void sbfx(int sf, int rd, int rn, int lsb, int width) { bitfield(sf, 0, rd, rn, lsb, lsb + width - 1); }
 // rd[lsb+width-1:lsb] = rn[width-1:0], rest of rd kept
 static inline void bfi(int sf, int rd, int rn, int lsb, int width) {
@@ -281,7 +298,7 @@ Addr addr_prepare(const Insn *in, int access);
 int addr_reg(const Insn *in);
 // opc: 0 store, 1 load, 2 signed load to 64, 3 signed load to 32. sz 1,2,4,8.
 void ldst(int opc, int sz, int rt, Addr a);
-static inline int log2sz(int sz) { return sz == 8 ? 3 : sz == 4 ? 2 : sz == 2 ? 1 : 0; }
+static inline int log2sz(int sz) { return sz == 16 ? 4 : sz == 8 ? 3 : sz == 4 ? 2 : sz == 2 ? 1 : 0; }
 
 // Exact load/store of guest GPRs (handles ah..bh).
 int gpr_read(int reg, int sz, bool high, int scratch);
@@ -293,9 +310,27 @@ void emit_stop(u64 rip, const char *why);
 
 void emit_int(const Insn *in, int live); // every non-control x86 op
 void emit_sse(const Insn *in, int live); // OP_SSE, ldmxcsr, stmxcsr
+// S0 holds the guest MXCSR. Masked values (the Geekbench case) write FPCR/FPSR
+// here; a reserved bit or an unmasked exception still takes the monitor SVC.
+void emit_ldmxcsr_s0(void);
+// Leaves STMXCSR's result in S0. Same split as emit_ldmxcsr_s0.
+void emit_stmxcsr_s0(void);
 void emit_x87(const Insn *in); // OP_X87
+// 1: translated into *in. 0: not this translator's instruction. -1: the fetched
+// bytes run off a page, so the caller must raise a fetch fault and try again.
+int x86_decode_ext(u64 rip, Insn *in, const u8 *b, int avail);
+void emit_ext(const Insn *in, int live);
+
+// Inline EL0 PCMPISTRI/VPCMPISTRI lowering (shared by emit_sse.c and emit_ext.c).
+void emit_pcmpistri_el0(int d, int s, u8 imm, int live);
 
 // Stub entry points, relative to the stubs region. Filled in by the Swift loader from the monitor image's symbols.
 extern u64 tr_stub_lookup, tr_stub_ret_miss, tr_stub_pushf, tr_stub_sahf;
 extern int cur_part;
-#define STUB(address) ((address) + (cur_part ? OFF_STUBS2 - OFF_STUBS : 0)) // the copy in reach of the part being written
+#ifdef OFF_STUBS_HI
+#define STUB(address) ((address) + ((tr_cc_va(tr_cc) >= PRIV_VA + (cur_part ? OFF_CC2 : OFF_CC) + (124ULL << 20)) \
+    ? (cur_part ? (OFF_STUBS2_HI - OFF_STUBS) : (OFF_STUBS_HI - OFF_STUBS)) \
+    : (cur_part ? (OFF_STUBS2 - OFF_STUBS) : 0)))
+#else
+#define STUB(address) ((address) + (cur_part ? (OFF_STUBS2 - OFF_STUBS) : 0)) // the copy in reach of the part being written
+#endif
