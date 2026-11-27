@@ -65,6 +65,13 @@ static struct {
     bool logged_kernel;
     bool logged_user;
     FILE *bootprof;
+    /* Shared pointers into VM-wide EngineCtx c0 for EL1 HPET main counter fast read. */
+    uint32_t *hpet_seq, *hpet_enabled;
+    int64_t *hpet_offset_ns;
+    uint64_t *hpet_expire_ns, *hpet_floor_tick;
+    int hpet_cal_lock;
+    bool hpet_was_enabled;
+    int64_t hpet_last_off;
 } hv;
 
 /* As the engine's MAX_VCPUS. */
@@ -83,12 +90,119 @@ typedef struct {
     bool protect_all;
     char refused[64]; /* why the vCPU is on TCG, while it is */
     bool dump_done;
+    /* Per-vCPU shared pointers into EngineCtx for EL1 deferred edge-EOI sync. */
+    uint32_t *eoi_isr, *eoi_tmr, *eoi_vapic, *eoi_pending;
 } HvCpu;
 
 static HvCpu hv_cpus[HVDBT_MAX_CPUS];
 #define HV(cs) (&hv_cpus[(cs)->cpu_index])
 
 static void hvdbt_dump_kernel(CPUState *cs, const char *path);
+
+/* Flush any EL1-deferred edge-triggered LAPIC EOIs into QEMU's APICCommonState->isr before QEMU reads/mutates APIC. */
+static inline void hvdbt_sync_eoi_to_apic(CPUState *cs)
+{
+    HvCpu *cpu = HV(cs);
+    if (likely(!cpu->eoi_pending || !qatomic_read(cpu->eoi_pending))) {
+        return;
+    }
+    APICCommonState *apic = X86_CPU(cs)->apic_state;
+    if (apic) {
+        for (int i = 0; i < 8; i++) {
+            apic->isr[i] &= cpu->eoi_isr[i];
+        }
+    }
+    qatomic_set(cpu->eoi_pending, 0);
+}
+
+static inline void hvdbt_mirror_apic_to_ctx(CPUState *cs)
+{
+    HvCpu *cpu = HV(cs);
+    APICCommonState *apic = X86_CPU(cs)->apic_state;
+    if (!apic || !cpu->eoi_isr) {
+        return;
+    }
+    for (int i = 0; i < 8; i++) {
+        cpu->eoi_isr[i] = apic->isr[i];
+        cpu->eoi_tmr[i] = apic->tmr[i];
+    }
+    qatomic_set(cpu->eoi_vapic, apic->vapic_paddr != 0 ? 1u : 0u);
+    qatomic_set(cpu->eoi_pending, 0);
+}
+
+static void hvdbt_hpet_invalidate(void)
+{
+    if (!__atomic_load_n(&hv.hpet_seq, __ATOMIC_ACQUIRE)) {
+        return;
+    }
+    while (__atomic_test_and_set(&hv.hpet_cal_lock, __ATOMIC_ACQUIRE)) {
+    }
+    uint32_t seq = *hv.hpet_seq;
+    __atomic_store_n(hv.hpet_seq, seq + 1, __ATOMIC_RELEASE);
+    smp_wmb();
+    __atomic_store_n(hv.hpet_enabled, 0, __ATOMIC_RELAXED);
+    *hv.hpet_floor_tick = 0;
+    hv.hpet_was_enabled = false;
+    smp_wmb();
+    __atomic_store_n(hv.hpet_seq, seq + 2, __ATOMIC_RELEASE);
+    __atomic_clear(&hv.hpet_cal_lock, __ATOMIC_RELEASE);
+}
+
+static void hvdbt_hpet_maybe_calibrate(void)
+{
+#ifdef __APPLE__
+    if (!__atomic_load_n(&hv.hpet_seq, __ATOMIC_ACQUIRE) || !runstate_is_running()) {
+        return;
+    }
+    if (__atomic_test_and_set(&hv.hpet_cal_lock, __ATOMIC_ACQUIRE)) {
+        return;
+    }
+    uint64_t now_check = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    if (__atomic_load_n(hv.hpet_enabled, __ATOMIC_RELAXED) && now_check < *hv.hpet_expire_ns) {
+        __atomic_clear(&hv.hpet_cal_lock, __ATOMIC_RELEASE);
+        return;
+    }
+    uint64_t cap = 0, cfg = 0, tick = 0;
+    address_space_read(&address_space_memory, 0xfed00000ULL, MEMTXATTRS_UNSPECIFIED, &cap, 8);
+    address_space_read(&address_space_memory, 0xfed00010ULL, MEMTXATTRS_UNSPECIFIED, &cfg, 8);
+    if ((cap >> 32) == 10000000ULL && (cfg & 1ULL) && runstate_is_running()) {
+        uint64_t t1 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+        address_space_read(&address_space_memory, 0xfed000f0ULL, MEMTXATTRS_UNSPECIFIED, &tick, 8);
+        uint64_t t2 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+        uint64_t t_mid = t1 + ((t2 - t1) >> 1);
+        int64_t new_off = (int64_t)(tick * 10ULL) - (int64_t)t_mid;
+        uint64_t floor_tick = tick;
+        if (hv.hpet_was_enabled) {
+            int64_t prev_ns = (int64_t)t2 + hv.hpet_last_off;
+            uint64_t prev_tick = prev_ns > 0 ? (uint64_t)prev_ns / 10ULL : 0ULL;
+            if (prev_tick > floor_tick) {
+                floor_tick = prev_tick;
+            }
+        }
+        uint32_t seq = *hv.hpet_seq;
+        __atomic_store_n(hv.hpet_seq, seq + 1, __ATOMIC_RELEASE);
+        smp_wmb();
+        *hv.hpet_offset_ns = new_off;
+        *hv.hpet_expire_ns = t2 + 1000000000ULL;
+        *hv.hpet_floor_tick = floor_tick;
+        __atomic_store_n(hv.hpet_enabled, 1, __ATOMIC_RELAXED);
+        hv.hpet_was_enabled = true;
+        hv.hpet_last_off = new_off;
+        smp_wmb();
+        __atomic_store_n(hv.hpet_seq, seq + 2, __ATOMIC_RELEASE);
+    }
+    __atomic_clear(&hv.hpet_cal_lock, __ATOMIC_RELEASE);
+#endif
+}
+
+static void hvdbt_vm_state_change(void *opaque, bool running, RunState state)
+{
+    (void)opaque;
+    (void)state;
+    if (!running) {
+        hvdbt_hpet_invalidate();
+    }
+}
 
 /* ---- Devices: the vCPU thread, BQL taken here, as TCG's slow path would. ---- */
 
@@ -240,7 +354,14 @@ static void hvdbt_name_device(uint64_t gpa)
 static uint64_t hvdbt_mmio_read(void *opaque, uint64_t gpa, unsigned size)
 {
     uint64_t v = 0;
+    /* HPET main counter is lockless_io (seqlock in hw/timer/hpet.c): skip BQL and calibrate EL1 fast read. */
+    if (((gpa == 0xfed000f0ULL && (size == 4 || size == 8)) || (gpa == 0xfed000f4ULL && size == 4))) {
+        address_space_read(&address_space_memory, gpa, MEMTXATTRS_UNSPECIFIED, &v, size);
+        hvdbt_hpet_maybe_calibrate();
+        return v;
+    }
     bql_lock();
+    hvdbt_sync_eoi_to_apic(opaque);
     hvdbt_name_device(gpa);
     address_space_read(&address_space_memory, gpa, MEMTXATTRS_UNSPECIFIED, &v, size);
     hvdbt_after_device(opaque);
@@ -250,17 +371,31 @@ static uint64_t hvdbt_mmio_read(void *opaque, uint64_t gpa, unsigned size)
 
 static void hvdbt_mmio_write(void *opaque, uint64_t gpa, unsigned size, uint64_t value)
 {
+    CPUState *cs = opaque;
+    bool hpet_global = gpa >= 0xfed00000ULL && gpa < 0xfed00100ULL;
+    if (hpet_global) {
+        hvdbt_hpet_invalidate();
+    }
     bql_lock();
+    hvdbt_sync_eoi_to_apic(cs);
     hvdbt_name_device(gpa);
     address_space_write(&address_space_memory, gpa, MEMTXATTRS_UNSPECIFIED, &value, size);
-    hvdbt_after_device(opaque);
+    APICCommonState *apic = X86_CPU(cs)->apic_state;
+    if (apic && (gpa & ~0xfffULL) == (apic->apicbase & MSR_IA32_APICBASE_BASE)) {
+        hvdbt_mirror_apic_to_ctx(cs);
+    }
+    hvdbt_after_device(cs);
     bql_unlock();
+    if (hpet_global) {
+        hvdbt_hpet_invalidate();
+    }
 }
 
 static uint32_t hvdbt_port_read(void *opaque, uint16_t port, unsigned size)
 {
     uint32_t v = 0;
     bql_lock();
+    hvdbt_sync_eoi_to_apic(opaque);
     address_space_read(&address_space_io, port, MEMTXATTRS_UNSPECIFIED, &v, size);
     hvdbt_after_device(opaque);
     bql_unlock();
@@ -324,10 +459,16 @@ static void hvdbt_watch_power_ports(CPUState *cs, uint16_t port, unsigned size, 
 
 static void hvdbt_port_write(void *opaque, uint16_t port, unsigned size, uint32_t value)
 {
-    hvdbt_watch_power_ports(opaque, port, size, value);
+    CPUState *cs = opaque;
+    hvdbt_watch_power_ports(cs, port, size, value);
     bql_lock();
+    hvdbt_sync_eoi_to_apic(cs);
     address_space_write(&address_space_io, port, MEMTXATTRS_UNSPECIFIED, &value, size);
-    hvdbt_after_device(opaque);
+    APICCommonState *apic = X86_CPU(cs)->apic_state;
+    if (apic && HV(cs)->eoi_vapic) {
+        qatomic_set(HV(cs)->eoi_vapic, apic->vapic_paddr != 0 ? 1u : 0u);
+    }
+    hvdbt_after_device(cs);
     bql_unlock();
 }
 
@@ -346,10 +487,40 @@ static bool hvdbt_write_msr(void *opaque, uint32_t msr, uint64_t value)
     return false;
 }
 
+/* Alder Lake-S, family 6 model 0x97 stepping 2: CPUID.1 EAX = 0x00090672. */
+#define HVDBT_ALDER_VERSION 0x00090672u
+
+static void hvdbt_set_qos(CPUState *cs)
+{
+#ifdef __APPLE__
+    (void)cs;
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+#else
+    (void)cs;
+#endif
+}
+
 static void hvdbt_cpuid(void *opaque, uint32_t leaf, uint32_t subleaf, uint32_t out[4])
 {
     CPUState *cs = opaque;
     cpu_x86_cpuid(cpu_env(cs), leaf, subleaf, &out[0], &out[1], &out[2], &out[3]);
+    if (leaf == 0) {
+        if (out[0] < 0x15) {
+            out[0] = 0x15;
+        }
+    } else if (leaf == 1) {
+        out[0] = HVDBT_ALDER_VERSION;
+    } else if (leaf == 7 && subleaf == 0) {
+        out[3] &= ~(1u << 15); /* Symmetric multi-core: never advertise Hybrid */
+    } else if (leaf == 0x15 && (out[0] == 0 || out[1] == 0)) {
+        /* TSC Hz = crystal * EBX / EAX. QEMU's guest TSC here is 1 GHz. */
+        out[0] = 1;
+        out[1] = 1;
+        out[2] = 1000000000;
+    } else if (leaf >= 0x80000002 && leaf <= 0x80000004) {
+        static const char brand[48] = "12th Gen Intel(R) Core(TM) i9-12900K";
+        memcpy(out, brand + (leaf - 0x80000002) * 16, 16);
+    }
     if (leaf == 0x80000007) {
         out[3] |= (1u << 8); /* Invariant TSC: Apple Silicon cntvct_el0 is constant-rate */
     }
@@ -365,6 +536,7 @@ static bool hvdbt_has_interrupt(void *opaque)
         return cpu_test_interrupt(cs, CPU_INTERRUPT_HARD);
     }
     bql_lock();
+    hvdbt_sync_eoi_to_apic(cs);
     if (cpu_test_interrupt(cs, CPU_INTERRUPT_POLL)) { /* what the IO-APIC raises from another thread, as x86_cpu_exec_interrupt handles it */
         cpu_reset_interrupt(cs, CPU_INTERRUPT_POLL);
         apic_poll_irq(X86_CPU(cs)->apic_state);
@@ -383,8 +555,12 @@ static int hvdbt_acknowledge_interrupt(void *opaque)
     int vector;
 
     bql_lock();
+    hvdbt_sync_eoi_to_apic(cs);
     cpu_reset_interrupt(cs, CPU_INTERRUPT_HARD);
     vector = cpu_get_pic_interrupt(cpu_env(cs));
+    if (vector >= 0) {
+        hvdbt_mirror_apic_to_ctx(cs);
+    }
     bql_unlock();
     return vector;
 }
@@ -397,6 +573,21 @@ static bool hvdbt_wait(void *opaque, uint64_t deadline_ns)
 
 static void hvdbt_apic_eoi(void *opaque, uint8_t vector)
 {
+    CPUState *cs = opaque;
+    APICCommonState *apic = X86_CPU(cs)->apic_state;
+    (void)vector;
+    if (!apic) {
+        return;
+    }
+    bql_lock();
+    hvdbt_sync_eoi_to_apic(cs);
+    uint32_t zero = 0;
+    address_space_write(&address_space_memory,
+                        (apic->apicbase & MSR_IA32_APICBASE_BASE) + 0xb0,
+                        MEMTXATTRS_UNSPECIFIED, &zero, 4);
+    hvdbt_mirror_apic_to_ctx(cs);
+    hvdbt_after_device(cs);
+    bql_unlock();
 }
 
 /* The write to the low word, with the high word from the monitor's copy: see hybrid_icr_hi. */
@@ -406,6 +597,7 @@ static void hvdbt_apic_icr(void *opaque, uint64_t icr)
     APICCommonState *apic = X86_CPU(cs)->apic_state;
 
     bql_lock();
+    hvdbt_sync_eoi_to_apic(cs);
     apic->icr[1] = icr >> 32;
     hvdbt_name_device(apic->apicbase & MSR_IA32_APICBASE_BASE);
     uint32_t low = icr;
@@ -425,6 +617,7 @@ static void hvdbt_apic_tpr(void *opaque, uint8_t tpr)
     uint8_t new_tpr = tpr & 0xf0;
     /* Only called by monitor.c when lowering TPR unmasks a pending IRR. */
     bql_lock();
+    hvdbt_sync_eoi_to_apic(cs);
     cpu_set_apic_tpr(apic, new_tpr >> 4);
     hvdbt_after_device(opaque);
     bql_unlock();
@@ -542,9 +735,12 @@ static void hvdbt_put_state(CPUState *cs)
     s.cpl = env->hflags & HF_CPL_MASK;
     update_mxcsr_from_sse_status(env);
     s.mxcsr = env->mxcsr;
+    s.xcr0 = env->xcr0;
     for (int i = 0; i < 16; i++) {
         s.xmm[i][0] = env->xmm_regs[i].ZMM_Q(0);
         s.xmm[i][1] = env->xmm_regs[i].ZMM_Q(1);
+        s.ymm_hi[i][0] = env->xmm_regs[i].ZMM_Q(2);
+        s.ymm_hi[i][1] = env->xmm_regs[i].ZMM_Q(3);
     }
     s.fp_tags = 0;
     for (int i = 0; i < 8; i++) {
@@ -561,6 +757,13 @@ static void hvdbt_put_state(CPUState *cs)
     s.fip = env->fpip;
     s.fdp = env->fpdp;
     engine_set_state(HV(cs)->engine, &s);
+    hvdbt_mirror_apic_to_ctx(cs);
+    {
+        APICCommonState *apic = X86_CPU(cs)->apic_state;
+        engine_set_platform_msrs(HV(cs)->engine,
+                                 apic ? cpu_get_apic_base(apic) : 0,
+                                 cpu_x86_get_msr_core_thread_count(X86_CPU(cs)));
+    }
 
     /* The TSC is the same clock on both sides, cpu_get_tsc's steps with cpu_get_tsc's offsets. */
     uint32_t khz = env->user_tsc_khz;
@@ -582,6 +785,7 @@ static void hvdbt_get_state(CPUState *cs)
     CPUX86State *env = cpu_env(cs);
     EngineX86State s;
 
+    hvdbt_sync_eoi_to_apic(cs);
     engine_get_state(HV(cs)->engine, &s);
     memcpy(env->regs, s.gpr, sizeof s.gpr);
     if (X86_CPU(cs)->apic_state) { /* TCG may be the one to read them next, or to finish an IPI begun here */
@@ -594,7 +798,7 @@ static void hvdbt_get_state(CPUState *cs)
     env->cr[0] = s.cr0;
     env->cr[2] = s.cr2;
     env->cr[3] = s.cr3;
-    env->cr[4] = s.cr4;
+    cpu_x86_update_cr4(env, s.cr4);
     env->efer = s.efer | MSR_EFER_LMA;
     env->star = s.star;
     env->lstar = s.lstar;
@@ -640,9 +844,12 @@ static void hvdbt_get_state(CPUState *cs)
         (s.irq_shadow ? HF_INHIBIT_IRQ_MASK : 0);
 
     cpu_set_mxcsr(env, s.mxcsr);
+    env->xcr0 = s.xcr0;
     for (int i = 0; i < 16; i++) {
         env->xmm_regs[i].ZMM_Q(0) = s.xmm[i][0];
         env->xmm_regs[i].ZMM_Q(1) = s.xmm[i][1];
+        env->xmm_regs[i].ZMM_Q(2) = s.ymm_hi[i][0];
+        env->xmm_regs[i].ZMM_Q(3) = s.ymm_hi[i][1];
     }
     for (int i = 0; i < 8; i++) {
         env->fpregs[i].mmx.MMX_Q(0) = s.mm[i];
@@ -784,6 +991,7 @@ static bool hvdbt_vga_bar_ready(void)
 /* A reset, which a snapshot load also starts with: RAM is about to change with nothing telling the engine. vCPUs are paused. */
 static void hvdbt_reset(void *opaque)
 {
+    hvdbt_hpet_invalidate();
     engine_forget_all(hv.engine);
     hv.vga_bar_ready = false;
     for (int i = 0; i < HVDBT_MAX_CPUS; i++) {
@@ -797,9 +1005,7 @@ static void hvdbt_reset(void *opaque)
 
 static bool hvdbt_create(CPUState *cs)
 {
-#ifdef __APPLE__
-    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
-#endif
+    hvdbt_set_qos(cs);
     MachineState *ms = current_machine;
     X86MachineState *x86ms = X86_MACHINE(ms);
     CPUX86State *env = cpu_env(cs);
@@ -839,6 +1045,13 @@ static bool hvdbt_create(CPUState *cs)
         flatview_for_each_range(address_space_to_flatview(&address_space_memory), hvdbt_mark_device, ms);
     }
     qemu_register_reset(hvdbt_reset, NULL);
+    qemu_add_vm_change_state_handler(hvdbt_vm_state_change, NULL);
+    {
+        uint32_t *seq = NULL;
+        engine_hpet_fast_ptrs(engine, &seq, &hv.hpet_enabled, &hv.hpet_offset_ns,
+                              &hv.hpet_expire_ns, &hv.hpet_floor_tick);
+        __atomic_store_n(&hv.hpet_seq, seq, __ATOMIC_RELEASE);
+    }
     __atomic_store_n(&hv.engine, engine, __ATOMIC_RELEASE);
     if (!getenv("LC_HVDBT_NO_DIRECT")) {
         BQL_LOCK_GUARD();
@@ -872,9 +1085,7 @@ static bool hvdbt_create(CPUState *cs)
 /* Another vCPU joins the VM on its own thread, as HVF requires. The first made it and said how many there would be. */
 static bool hvdbt_create_secondary(CPUState *cs)
 {
-#ifdef __APPLE__
-    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
-#endif
+    hvdbt_set_qos(cs);
     const char *tally = getenv("LC_HVDBT_TALLY");
     EngineMachineOps ops;
 
@@ -1100,6 +1311,10 @@ static void hvdbt_run(CPUState *cs)
         int irrv = apic_get_highest_priority_irr(apic);
         qatomic_set(apic->hvdbt_irr_prio, irrv >= 0 ? (uint32_t)(irrv & 0xf0) : 0);
         qatomic_set(apic->hvdbt_tpr, apic->tpr & 0xf0);
+    }
+    if (!cpu->eoi_isr) {
+        engine_apic_eoi_ptrs(cpu->engine, &cpu->eoi_isr, &cpu->eoi_tmr,
+                             &cpu->eoi_vapic, &cpu->eoi_pending);
     }
     if (cpu->tcg_ran) { /* the flush runs from the work queue, then the TB miss brings control back. It is exclusive: with several vCPUs, it stops the others at a boundary */
         cpu->tcg_ran = false;

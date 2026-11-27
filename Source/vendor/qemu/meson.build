@@ -846,7 +846,8 @@ if get_option('hvdbt_engine') != ''
   hvdbt_swift_libs = fs.parent(hvdbt_swiftc) / '../lib/swift/macosx'
   hvdbt = declare_dependency(
     compile_args: ['-I' + get_option('hvdbt_engine') / 'Sources/CEngine/include'],
-    link_args: [hvdbt_library, '-L' + hvdbt_swift_libs, '-L/usr/lib/swift',
+    link_args: [hvdbt_library, '-lc++',
+                '-L' + hvdbt_swift_libs, '-L/usr/lib/swift',
                 '-lswiftCompatibility56', '-lswiftCompatibilityConcurrency',
                 '-Wl,-rpath,/usr/lib/swift',
                 '-framework', 'Foundation', '-framework', 'Hypervisor'])
