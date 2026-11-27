@@ -36,6 +36,11 @@
 #define CTX_SLOT (64ULL << 10)
 #define OFF_MON_CPU (OFF_MON_DATA + (1ULL << 20)) // EL1 rw: per vCPU, CTX_SLOT apart too, the monitor's own state and stack
 #define OFF_CTX_END (126ULL << 20)
+#define OFF_FEX_L1 (128ULL << 20) // EL0 rw, per vCPU: 4096-entry (64 KB) direct-mapped FEX L1 lookup table
+#define FEX_L1_ENTRIES 4096ULL
+#define FEX_L1_BYTES (FEX_L1_ENTRIES * 16ULL)
+#define FEX_L1_MASK ((FEX_L1_ENTRIES - 1ULL) << 4)
+#define OFF_FEX_L1_END (OFF_FEX_L1 + (2ULL << 20))
 #define OFF_HASH (1024ULL << 20) // EL0 ro, per view: indirect-branch table
 #define HASH_ENTRIES (1ULL << 16)
 #define HASH_BYTES (HASH_ENTRIES * 16)
@@ -56,8 +61,9 @@ static inline uint64_t engine_shared_compat_domain(uint64_t rip, uint64_t table)
 }
 #define MAX_VIEWS 256 // two or three per x86 address space, and one that goes takes its blocks with it: a desktop has a hundred processes
 #define OFF_RSTACKS (OFF_HASH + MAX_VIEWS * HASH_BYTES) // EL0 rw, per vCPU and view: 16 KB guard (unmapped), then a 16 KB shadow return stack
-#define OFF_BLOCKS (196ULL << 20) // EL1 ro: block table, pc maps
-#define BLOCKS_MAX (1ULL << 19) // the table has 16 MB
+#define OFF_BLOCKS (188ULL << 20) // EL1 ro: block table (24 MB for shared part 0), then pc maps at 212 MB
+#define BLOCKS_MAX (3ULL << 18) // 786,432 shared blocks = 24 MB (matches 118 MB p0 @ ~140 B/block)
+#define BLOCKS_MAX_PRIV (1ULL << 18) // 262,144 private blocks = 8 MB (total 32 MB unchanged)
 #define OFF_PCMAP (212ULL << 20)
 #define PCMAP_BYTES (44ULL << 20)
 #define OFF_PT (256ULL << 20) // EL1 rw: static hole tables, then the shadow pool
@@ -87,6 +93,10 @@ static inline uint64_t engine_shared_compat_domain(uint64_t rip, uint64_t table)
 #define STUB_OFF_REP_PAGE_STOS 0x380ULL
 #define STUB_OFF_REP_PAGE_STOS_HEAD 0x3C0ULL
 #define STUB_OFF_REP_PAGE_END 0x400ULL
+#define STUB_OFF_FEX_ENTER 0x400ULL
+#define STUB_OFF_FEX_EXIT_LINKER 0x5F8ULL
+#define STUB_OFF_FEX_EXIT 0x600ULL
+#define STUB_OFF_FEX_EXIT_NATIVE 0x690ULL
 
 #define RSTACK_BYTES (16ULL << 10)
 #define RSTACK_SLOT (32ULL << 10)
@@ -97,6 +107,7 @@ static inline uint64_t engine_off_rstacks(uint32_t cpu) { return OFF_RSTACKS + (
 #define PI_PT 2 // a shadow page tracks this frame as a guest page table
 #define PI_RAM 4 // RAM, as opposed to a device hole
 #define PI_DIRECT 8 // device memory mapped straight into the VM: shadows may point at it, and nothing else about RAM holds
+#define PI_NOTE 16 // pending DMA/TCG write notification in note_ring / overflow scan
 
 // svc immediates from translated code and stubs. Translator requests come first, then x86 events and helpers.
 enum {
@@ -107,6 +118,7 @@ enum {
     SVC_DEAD, // this block was invalidated; ELR-4 finds it
     SVC_STOP, // literal: u32 stop reason index
     SVC_SINGLE_DONE, // end of a one-off single-instruction block, literal target follows
+    SVC_FEX_LINK, // FEX direct branch lazy linker: ELR points to 4 movz/movk words
     // x86 events
     SVC_SYSCALL = 16, // x16 next rip
     SVC_SYSRET,
@@ -378,13 +390,23 @@ typedef struct {
     // Lazy-flushed back to mm[p]/fp_exp[p] on SVC_X87, FXSAVE, HC_FALLBACK, and HC_BOUNDARY.
     uint64_t fp_d_valid;
     uint64_t fp_d[8];
+    uint64_t xcr0;
+    uint64_t pad_ymm;
+    uint64_t ymm_hi[16][2] __attribute__((aligned(16)));
+    uint64_t cpuid0_cached;
+    uint64_t cpuid0_eax_ebx;
+    uint64_t cpuid0_ecx_edx;
+    uint32_t mon_irq_taken;
+    uint32_t pad_mon_irq_taken;
 } EngineCtx;
 _Static_assert(sizeof(EngineCtx) <= CTX_SLOT, "EngineCtx must fit its existing per-vCPU slot");
 // Monitor/vectors.s reads these two from x18 with fixed offsets.
 #define CTX_CODE_GEN_OFFSET 30680
 #define CTX_CODE_SYNCED_OFFSET 30688
+#define CTX_YMM_HI_OFFSET 30784
 _Static_assert(__builtin_offsetof(EngineCtx, code_gen) == CTX_CODE_GEN_OFFSET, "update CTX_CODE_GEN in Monitor/vectors.s");
 _Static_assert(__builtin_offsetof(EngineCtx, code_synced) == CTX_CODE_SYNCED_OFFSET, "update CTX_CODE_SYNCED in Monitor/vectors.s");
+_Static_assert(__builtin_offsetof(EngineCtx, ymm_hi) == CTX_YMM_HI_OFFSET, "update CTX_YMM_HI in Monitor/vectors.s");
 
 // Block table, one entry per translated block, ordered by arm_off because the code cache only grows.
 typedef struct {

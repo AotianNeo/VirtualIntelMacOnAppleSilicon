@@ -346,10 +346,40 @@ static bool hvdbt_write_msr(void *opaque, uint32_t msr, uint64_t value)
     return false;
 }
 
+/* Alder Lake-S, family 6 model 0x97 stepping 2: CPUID.1 EAX = 0x00090672. */
+#define HVDBT_ALDER_VERSION 0x00090672u
+
+static void hvdbt_set_qos(CPUState *cs)
+{
+#ifdef __APPLE__
+    (void)cs;
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+#else
+    (void)cs;
+#endif
+}
+
 static void hvdbt_cpuid(void *opaque, uint32_t leaf, uint32_t subleaf, uint32_t out[4])
 {
     CPUState *cs = opaque;
     cpu_x86_cpuid(cpu_env(cs), leaf, subleaf, &out[0], &out[1], &out[2], &out[3]);
+    if (leaf == 0) {
+        if (out[0] < 0x15) {
+            out[0] = 0x15;
+        }
+    } else if (leaf == 1) {
+        out[0] = HVDBT_ALDER_VERSION;
+    } else if (leaf == 7 && subleaf == 0) {
+        out[3] &= ~(1u << 15); /* Symmetric multi-core: never advertise Hybrid */
+    } else if (leaf == 0x15 && (out[0] == 0 || out[1] == 0)) {
+        /* TSC Hz = crystal * EBX / EAX. QEMU's guest TSC here is 1 GHz. */
+        out[0] = 1;
+        out[1] = 1;
+        out[2] = 1000000000;
+    } else if (leaf >= 0x80000002 && leaf <= 0x80000004) {
+        static const char brand[48] = "12th Gen Intel(R) Core(TM) i9-12900K";
+        memcpy(out, brand + (leaf - 0x80000002) * 16, 16);
+    }
     if (leaf == 0x80000007) {
         out[3] |= (1u << 8); /* Invariant TSC: Apple Silicon cntvct_el0 is constant-rate */
     }
@@ -542,9 +572,12 @@ static void hvdbt_put_state(CPUState *cs)
     s.cpl = env->hflags & HF_CPL_MASK;
     update_mxcsr_from_sse_status(env);
     s.mxcsr = env->mxcsr;
+    s.xcr0 = env->xcr0;
     for (int i = 0; i < 16; i++) {
         s.xmm[i][0] = env->xmm_regs[i].ZMM_Q(0);
         s.xmm[i][1] = env->xmm_regs[i].ZMM_Q(1);
+        s.ymm_hi[i][0] = env->xmm_regs[i].ZMM_Q(2);
+        s.ymm_hi[i][1] = env->xmm_regs[i].ZMM_Q(3);
     }
     s.fp_tags = 0;
     for (int i = 0; i < 8; i++) {
@@ -594,7 +627,7 @@ static void hvdbt_get_state(CPUState *cs)
     env->cr[0] = s.cr0;
     env->cr[2] = s.cr2;
     env->cr[3] = s.cr3;
-    env->cr[4] = s.cr4;
+    cpu_x86_update_cr4(env, s.cr4);
     env->efer = s.efer | MSR_EFER_LMA;
     env->star = s.star;
     env->lstar = s.lstar;
@@ -640,9 +673,12 @@ static void hvdbt_get_state(CPUState *cs)
         (s.irq_shadow ? HF_INHIBIT_IRQ_MASK : 0);
 
     cpu_set_mxcsr(env, s.mxcsr);
+    env->xcr0 = s.xcr0;
     for (int i = 0; i < 16; i++) {
         env->xmm_regs[i].ZMM_Q(0) = s.xmm[i][0];
         env->xmm_regs[i].ZMM_Q(1) = s.xmm[i][1];
+        env->xmm_regs[i].ZMM_Q(2) = s.ymm_hi[i][0];
+        env->xmm_regs[i].ZMM_Q(3) = s.ymm_hi[i][1];
     }
     for (int i = 0; i < 8; i++) {
         env->fpregs[i].mmx.MMX_Q(0) = s.mm[i];
@@ -797,9 +833,7 @@ static void hvdbt_reset(void *opaque)
 
 static bool hvdbt_create(CPUState *cs)
 {
-#ifdef __APPLE__
-    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
-#endif
+    hvdbt_set_qos(cs);
     MachineState *ms = current_machine;
     X86MachineState *x86ms = X86_MACHINE(ms);
     CPUX86State *env = cpu_env(cs);
@@ -872,9 +906,7 @@ static bool hvdbt_create(CPUState *cs)
 /* Another vCPU joins the VM on its own thread, as HVF requires. The first made it and said how many there would be. */
 static bool hvdbt_create_secondary(CPUState *cs)
 {
-#ifdef __APPLE__
-    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
-#endif
+    hvdbt_set_qos(cs);
     const char *tally = getenv("LC_HVDBT_TALLY");
     EngineMachineOps ops;
 

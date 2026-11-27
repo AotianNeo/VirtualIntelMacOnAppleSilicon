@@ -295,6 +295,8 @@ extension Engine {
         s.cpl = c.pointee.cpl
         s.mxcsr = mxcsr()
         readXMM(into: &s)
+        s.xcr0 = c.pointee.xcr0
+        s.ymm_hi = c.pointee.ymm_hi
         s.mm = c.pointee.mm
         s.fp_exp = c.pointee.fp_exp
         s.fp_top = c.pointee.fp_top
@@ -373,6 +375,8 @@ extension Engine {
         c.pointee.apic_tpr = s.hybrid_tpr
         c.pointee.resume_mxcsr = s.mxcsr
         writeXMM(from: s)
+        c.pointee.xcr0 = s.xcr0
+        c.pointee.ymm_hi = s.ymm_hi
         c.pointee.mm = s.mm
         c.pointee.compat = s.compat
         c.pointee.seg_bad = s.seg_bad

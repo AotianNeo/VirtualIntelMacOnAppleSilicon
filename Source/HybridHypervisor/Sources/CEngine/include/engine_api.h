@@ -87,6 +87,8 @@ typedef struct {
     uint32_t hybrid_icr_lo, hybrid_icr_hi;
     uint32_t hybrid_tpr;
     uint32_t irq_shadow; // the returned RIP is still protected by STI or MOV SS
+    uint64_t xcr0;
+    uint64_t ymm_hi[16][2];
 } EngineX86State;
 
 EngineHandle *engine_create(const EngineConfig *config, const EngineMachineOps *ops);
@@ -156,7 +158,7 @@ void engine_ctx_post_vector(void *ctx, uint8_t vector, bool level);
 void engine_ctx_set_stop(void *ctx);
 void engine_ctx_set_irq_line(void *ctx, bool level);
 void engine_spin_hint(void);
-bool engine_ctx_note_write(void *ctx, const unsigned char *page_info, uint64_t gpa, uint64_t bytes);
+bool engine_ctx_note_write(void *ctx, unsigned char *page_info, uint64_t gpa, uint64_t bytes);
 void *engine_test_shared_ram(uint64_t bytes);
 
 #ifdef __cplusplus

@@ -1,0 +1,206 @@
+diff --git a/Source/HybridHypervisor/Sources/CEngine/include/engine_abi.h b/Source/HybridHypervisor/Sources/CEngine/include/engine_abi.h
+index 85bd05e5..9f6c122f 100644
+--- a/Source/HybridHypervisor/Sources/CEngine/include/engine_abi.h
++++ b/Source/HybridHypervisor/Sources/CEngine/include/engine_abi.h
+@@ -32,9 +32,9 @@
+ #define OFF_CC (6ULL << 20) // EL0 execute-only, EL1 rw: translated code
+ #define CC_SIZE (118ULL << 20)
+ #define OFF_CTX (124ULL << 20) // EL0 rw: one EngineCtx per vCPU, CTX_SLOT apart. x18 holds this vCPU's
+-#define MAX_VCPUS 8
++#define MAX_VCPUS 16
+ #define CTX_SLOT (64ULL << 10)
+-#define OFF_MON_CPU (OFF_MON_DATA + (3ULL << 19)) // EL1 rw: per vCPU, CTX_SLOT apart too, the monitor's own state and stack
++#define OFF_MON_CPU (OFF_MON_DATA + (1ULL << 20)) // EL1 rw: per vCPU, CTX_SLOT apart too, the monitor's own state and stack
+ #define OFF_CTX_END (126ULL << 20)
+ #define OFF_HASH (1024ULL << 20) // EL0 ro, per view: indirect-branch table
+ #define HASH_ENTRIES (1ULL << 16)
+@@ -139,6 +139,8 @@ enum {
+     SVC_STR, // result x16
+     SVC_LLDT,
+     SVC_SLDT,
++    SVC_VERR, // x16 selector, updates ZF in SPSR
++    SVC_VERW, // x16 selector, updates ZF in SPSR
+     SVC_MOV_SEG_WRITE, // x16 segment index, x17 selector
+     SVC_MOV_SEG_READ, // x16 segment index, result x16
+     SVC_IN, // x16 port, x17 size, result x16
+@@ -163,6 +165,7 @@ enum {
+     SVC_H_PCMPISTRI, // x16, x17 the first operand, x22, x23 the second, x24 imm8. x16 the index, x22 to x24 flags as data
+     SVC_H_RMWFLAGS_UNUSED,
+     SVC_REP_PAGE = 71, // internal only: exact page-REP stub head; x17=32/element bytes
++    SVC_LSL = 72, // x16 selector, returns 32-bit limit in x16 and updates ZF in SPSR
+ };
+ 
+ // Opt-in metadata for SVC_H_SHIFT only. The semantic kind is bits 0..2 and
+@@ -200,6 +203,7 @@ enum {
+     HC_VIEW_FORGET, // a[0] view: empty its lookup table, as a slot above a shared directory changed
+     HC_CALL_TAIL, // a[0] a cross-key call/jump site, a[1] its x86 target: use a view lookup without repeatedly entering the monitor
+     HC_CODE_FETCH_RETRY, // a[0] ARM pc, a[1] x86 block entry or 0, a[2] this vCPU's retry count (only the first few are reported)
++    HC_APIC_TPR, // a[0] new TPR (bits 7:4): hybrid mode fast-path for CR8/TPR writes without TCG fallback
+ };
+ 
+ // Stop reasons for HC_STOP.
+@@ -319,7 +323,7 @@ typedef struct {
+     uint32_t clts_on_host;
+     uint64_t tsc_ns_offset, tsc_num, tsc_den; // TSC = ns + ns * num / den + tsc_offset; see tsc_counter_offset below.
+     // Frames written behind the monitor's back (DMA, TCG), holding code or page tables. Many producers, consumed in the monitor.
+-    uint32_t note_head, note_tail, note_overflow, pad4;
++    uint32_t note_head, note_tail, note_overflow, apic_irr_prio;
+     uint32_t note_ring[256]; // frame + 1
+     uint64_t stat_note_code, stat_note_pt, stat_nm, stat_pt_stale, stat_links_here, stat_stack_deepest;
+     uint64_t stat_vector[256], vector_last_rip[256], vector_last_err[256], vector_last_cr3[256]; // every delivery, software int and #GP included
+@@ -370,6 +374,10 @@ typedef struct {
+     // cores only this vCPU's own ISB discards instructions fetched before that write.
+     uint64_t code_gen __attribute__((aligned(8)));
+     uint64_t code_synced;
++    // Extreme Fast x87 shadow IEEE-754 double cache: bit p of fp_d_valid means fp_d[p] is authoritative.
++    // Lazy-flushed back to mm[p]/fp_exp[p] on SVC_X87, FXSAVE, HC_FALLBACK, and HC_BOUNDARY.
++    uint64_t fp_d_valid;
++    uint64_t fp_d[8];
+ } EngineCtx;
+ _Static_assert(sizeof(EngineCtx) <= CTX_SLOT, "EngineCtx must fit its existing per-vCPU slot");
+ // Monitor/vectors.s reads these two from x18 with fixed offsets.
+diff --git a/Source/HybridHypervisor/Sources/CEngine/include/engine_api.h b/Source/HybridHypervisor/Sources/CEngine/include/engine_api.h
+index c0174bdd..4a729f7d 100644
+--- a/Source/HybridHypervisor/Sources/CEngine/include/engine_api.h
++++ b/Source/HybridHypervisor/Sources/CEngine/include/engine_api.h
+@@ -32,6 +32,8 @@ typedef struct {
+     void (*apic_eoi)(void *opaque, uint8_t vector);
+     // An IPI the local APIC cannot finish alone: other CPUs, INIT, SIPI. Raw ICR value, high word in bits 63:32.
+     void (*apic_icr)(void *opaque, uint64_t icr);
++    // Hybrid: CR8/TPR update forwarded directly to QEMU's APIC without a TCG fallback.
++    void (*apic_tpr)(void *opaque, uint8_t tpr);
+ } EngineMachineOps;
+ 
+ typedef struct {
+@@ -83,6 +85,7 @@ typedef struct {
+     // Hybrid: the APIC is QEMU's, but the monitor answers for ICR, so that an IPI takes one exit. hybrid_apic_page: 0 if the APIC is off.
+     uint64_t hybrid_apic_page;
+     uint32_t hybrid_icr_lo, hybrid_icr_hi;
++    uint32_t hybrid_tpr;
+     uint32_t irq_shadow; // the returned RIP is still protected by STI or MOV SS
+ } EngineX86State;
+ 
+@@ -117,6 +120,7 @@ void engine_request_exit(EngineHandle *engine);
+ 
+ // Any thread.
+ void engine_request_boundary(EngineHandle *engine); // kick: engine_run returns ENGINE_RUN_BOUNDARY at the next x86 boundary
++void engine_request_boundary_local(EngineHandle *engine); // same-thread hostcall: set stop_requested without self-canceling hv_vcpu_run
+ void engine_kick(EngineHandle *engine); // look at has_interrupt_waiting and pending vectors
+ void engine_post_vector(EngineHandle *engine, uint8_t vector, bool level);
+ // Guest RAM was written other than by this engine (DMA, TCG): drop what depends on it. Translations and shadow tables are gone before the next
+@@ -124,6 +128,8 @@ void engine_post_vector(EngineHandle *engine, uint8_t vector, bool level);
+ void engine_note_write(EngineHandle *engine, uint64_t gpa, uint64_t bytes);
+ // Hybrid: an interrupt may be waiting. The monitor asks acknowledge_interrupt once IF allows.
+ void engine_set_irq_line(EngineHandle *engine, bool level);
++// Hybrid: shared pointers to ctx->apic_tpr and ctx->apic_irr_prio for zero-exit CR8/TPR sync.
++void engine_apic_shared_ptrs(EngineHandle *engine, uint32_t **tpr_out, uint32_t **irr_prio_out);
+ 
+ // While stopped. The guest's TSC in QEMU's terms: ns is the host's uptime clock plus ns_offset, TSC = ns + ns * num / den + tsc_offset.
+ void engine_set_tsc(EngineHandle *engine, uint64_t ns_offset, uint64_t tsc_offset, uint64_t num, uint64_t den);
+diff --git a/Source/HybridHypervisor/Sources/Engine/Engine.swift b/Source/HybridHypervisor/Sources/Engine/Engine.swift
+index 621a65a5..d1868907 100644
+--- a/Source/HybridHypervisor/Sources/Engine/Engine.swift
++++ b/Source/HybridHypervisor/Sources/Engine/Engine.swift
+@@ -20,6 +20,8 @@ public protocol EngineMachine: AnyObject {
+     func apicEOI(vector: UInt8)
+     /// An IPI the local APIC model cannot finish alone. High word in bits 63:32.
+     func apicICR(_ icr: UInt64)
++    /// Hybrid: CR8/TPR update forwarded directly to QEMU's APIC.
++    func apicTPR(_ tpr: UInt8)
+     /// True when an interrupt wants delivering; the engine then raises the guest's IRQ line on the vCPU thread.
+     func hasInterruptWaiting() -> Bool
+     /// End this run at a host-visible boundary, including a completed HLT.
+@@ -31,6 +33,7 @@ public protocol EngineMachine: AnyObject {
+ 
+ extension EngineMachine {
+     public var shouldStopRun: Bool { false }
++    public func apicTPR(_ tpr: UInt8) {}
+ }
+ 
+ public struct EngineOptions {
+@@ -340,7 +343,7 @@ public final class Engine {
+             gb += 1 << 30
+         }
+         // Handed to the monitor: the root-level descriptors of its private slots.
+-        let handoff = (priv + Int(kOffMonData) + (1 << 20)).assumingMemoryBound(to: UInt64.self)
++        let handoff = (priv + Int(kOffMonData) + (1 << 19)).assumingMemoryBound(to: UInt64.self)
+         handoff[0] = ipa(privL1) | valid
+         handoff[1] = ipa(ramL1) | valid
+         slot(bootRoot, Int((kRamAliasVA >> 39) & 0x1FF)).pointee = ipa(ramL1) | valid
+@@ -708,6 +711,8 @@ public final class Engine {
+             machine?.apicEOI(vector: UInt8(truncatingIfNeeded: c.pointee.req_a.0))
+         case Int(HC_APIC_ICR):
+             machine?.apicICR(c.pointee.req_a.0)
++        case Int(HC_APIC_TPR):
++            machine?.apicTPR(UInt8(truncatingIfNeeded: c.pointee.req_a.0))
+         case Int(HC_BOUNDARY):
+             if !options.hybrid && severalVCPUs && machine?.shouldStopRun != true { // a cache reset keeps this vCPU in the monitor; an explicit machine stop does not
+                 gate.leave()
+@@ -959,6 +964,11 @@ public final class Engine {
+         interruptRequested()
+     }
+ 
++    /// Current vCPU thread inside a host call: mark stop_requested without latching a self-cancel via hv_vcpus_exit.
++    public func requestBoundaryLocal() {
++        engine_ctx_set_stop(ctx)
++    }
++
+     /// Any thread: a vector for the virtual APIC's IRR, as an IO-APIC or MSI would deliver.
+     public func postVector(_ vector: UInt8, level: Bool) {
+         engine_ctx_post_vector(ctx, vector, level)
+diff --git a/Source/HybridHypervisor/Sources/Engine/EngineAPI.swift b/Source/HybridHypervisor/Sources/Engine/EngineAPI.swift
+index c2390e4d..16ddefd3 100644
+--- a/Source/HybridHypervisor/Sources/Engine/EngineAPI.swift
++++ b/Source/HybridHypervisor/Sources/Engine/EngineAPI.swift
+@@ -28,6 +28,7 @@ final class CMachine: EngineMachine {
+     func waitForInterrupt(deadlineNanos: UInt64) -> Bool { ops.wait_for_interrupt(ops.opaque, deadlineNanos) }
+     func apicEOI(vector: UInt8) { ops.apic_eoi(ops.opaque, vector) }
+     func apicICR(_ icr: UInt64) { ops.apic_icr(ops.opaque, icr) }
++    func apicTPR(_ tpr: UInt8) { ops.apic_tpr?(ops.opaque, tpr) }
+     func syscall(_ state: UnsafeMutablePointer<EngineCtx>, engine: Engine) throws {
+         throw EngineError.stop("syscall with no shim: the C API is the kernel model")
+     }
+@@ -177,6 +178,17 @@ public func engine_note_write(_ h: OpaquePointer, _ gpa: UInt64, _ bytes: UInt64
+ @_cdecl("engine_set_irq_line")
+ public func engine_set_irq_line(_ h: OpaquePointer, _ level: Bool) { engine_ctx_set_irq_line(handle(h).engine.ctx, level) }
+ 
++@_cdecl("engine_apic_shared_ptrs")
++public func engine_apic_shared_ptrs(
++    _ h: OpaquePointer,
++    _ tprOut: UnsafeMutablePointer<UnsafeMutablePointer<UInt32>?>,
++    _ irrPrioOut: UnsafeMutablePointer<UnsafeMutablePointer<UInt32>?>
++) {
++    let raw = UnsafeMutableRawPointer(handle(h).engine.ctx)
++    tprOut.pointee = (raw + MemoryLayout<EngineCtx>.offset(of: \.apic_tpr)!).assumingMemoryBound(to: UInt32.self)
++    irrPrioOut.pointee = (raw + MemoryLayout<EngineCtx>.offset(of: \.apic_irr_prio)!).assumingMemoryBound(to: UInt32.self)
++}
++
+ @_cdecl("engine_set_tsc")
+ public func engine_set_tsc(_ h: OpaquePointer, _ nsOffset: UInt64, _ tscOffset: UInt64, _ num: UInt64, _ den: UInt64) {
+     handle(h).engine.setTSC(nsOffset: nsOffset, tscOffset: tscOffset, num: num, den: den)
+@@ -237,6 +249,9 @@ public func engine_request_exit(_ h: OpaquePointer) { handle(h).engine.requestSt
+ @_cdecl("engine_request_boundary")
+ public func engine_request_boundary(_ h: OpaquePointer) { handle(h).engine.requestBoundary() }
+ 
++@_cdecl("engine_request_boundary_local")
++public func engine_request_boundary_local(_ h: OpaquePointer) { handle(h).engine.requestBoundaryLocal() }
++
+ @_cdecl("engine_kick")
+ public func engine_kick(_ h: OpaquePointer) { handle(h).engine.interruptRequested() }
+ 
+@@ -307,6 +322,7 @@ extension Engine {
+         s.hybrid_apic_page = c.pointee.hybrid_apic_page
+         s.hybrid_icr_lo = c.pointee.apic_icr_lo
+         s.hybrid_icr_hi = c.pointee.apic_icr_hi
++        s.hybrid_tpr = c.pointee.apic_tpr
+         s.irq_shadow = s.rip == c.pointee.irq_shadow_rip ? 1 : 0
+         s.compat = c.pointee.compat
+         s.seg_bad = c.pointee.seg_bad
+@@ -354,6 +370,7 @@ extension Engine {
+         c.pointee.hybrid_apic_page = s.hybrid_apic_page
+         c.pointee.apic_icr_lo = s.hybrid_icr_lo
+         c.pointee.apic_icr_hi = s.hybrid_icr_hi
++        c.pointee.apic_tpr = s.hybrid_tpr
+         c.pointee.resume_mxcsr = s.mxcsr
+         writeXMM(from: s)
+         c.pointee.mm = s.mm

@@ -21,13 +21,19 @@ else
   cd "$MESON_INSTALL_DESTDIR_PREFIX"
 fi
 
-if test -n "$ENTITLEMENT"; then
+# Rez's resource fork is detritus to codesign, and this binary needs the
+# hypervisor entitlement (HVF or hvdbt). Sign after dropping the fork.
+if test -n "$ICON" && test -f "$ICON"; then
+  Rez -append "$ICON" -o "$SRC" || true
+  SetFile -a C "$SRC" || true
+fi
+xattr -cr "$SRC" || true
+if test -z "$ENTITLEMENT"; then
+  ENTITLEMENT=$(CDPATH= cd -- "$(dirname "$0")/../accel/hvf" && pwd)/entitlements.plist
+fi
+if test -n "$ENTITLEMENT" && test -f "$ENTITLEMENT"; then
   codesign --entitlements "$ENTITLEMENT" --force -s - "$SRC"
 fi
-
-# Add the QEMU icon to the binary on Mac OS
-Rez -append "$ICON" -o "$SRC"
-SetFile -a C "$SRC"
 
 mv -f "$SRC" "$DST"
 trap '' exit

@@ -3067,7 +3067,7 @@ static inline uint64_t cr4_reserved_bits(CPUX86State *env)
     if (!(env->features[FEAT_1_ECX] & CPUID_EXT_PCID)) {
         reserved_bits |= CR4_PCIDE_MASK;
     }
-    if (!env->features[FEAT_XSAVE]) {
+    if (!(env->features[FEAT_1_ECX] & CPUID_EXT_XSAVE)) {
         reserved_bits |= CR4_OSXSAVE_MASK;
     }
     if (!(env->features[FEAT_7_0_EBX] & CPUID_7_0_EBX_SMEP)) {

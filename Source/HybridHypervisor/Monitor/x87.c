@@ -1414,73 +1414,152 @@ static void do_fx(bool save) {
         c->fp_d_valid = 0;
     u8 *area = me->fx_area;
     u64 va = c->x[R_S0], here = rip_here(c->elr - 4);
-    bool wide = c->x[R_S2];
+    bool wide = (c->x[R_S2] & 1) != 0;
+    bool is_xsave = (c->x[R_S2] & 2) != 0;
     if (c->cr0 & 0xC) {
         c->stat_nm++;
         deliver(7, 0, false, here, false);
         return;
     }
-    if (c->hybrid && (!(c->cr4 & 0x200) || (c->efer & (1ULL << 14))))
-        stop(STOP_FALLBACK, here, FB_FX, 0, 0); // what these leave out then is QEMU's to decide
-    if (save) {
-        memset(area, 0, 416);
-        put16(area, c->fcw);
-        put16(area + 2, c->fsw | (u32)(c->fp_top & 7) << 11);
-        area[4] = c->fp_tags;
-        put16(area + 6, c->fop);
-        put32(area + 8, (u32)c->fip);
-        put32(area + 16, (u32)c->fdp);
-        if (wide) {
-            put32(area + 12, (u32)(c->fip >> 32));
-            put32(area + 20, (u32)(c->fdp >> 32));
-        } else {
-            put16(area + 12, c->fcs);
-            put16(area + 20, c->fds);
-        }
-        put32(area + 24, mxcsr_read());
-        put32(area + 28, 0xFFFF);
-        for (u32 i = 0; i < 8; i++) {
-            u32 p = (c->fp_top + i) & 7;
-            u8 *r = area + 32 + i * 16;
-            put32(r, (u32)c->mm[p]);
-            put32(r + 4, (u32)(c->mm[p] >> 32));
-            put16(r + 8, c->fp_exp[p]);
-        }
-        mon_fp_save(area + 160);
-        if (!fp_area_write(va, area, 416))
-            stop(c->hybrid ? STOP_FALLBACK : STOP_UNSUPPORTED, here, c->hybrid ? FB_FX : 12, va, 0);
-        return;
-    }
-    if (!guest_read(va, area, 416, c->cpl == 3 ? 4 : 0))
+    if (is_xsave && !(c->cr4 & (1ULL << 18)))
         stop(c->hybrid ? STOP_FALLBACK : STOP_UNSUPPORTED, here, c->hybrid ? FB_FX : 12, va, 0);
-    u32 mx = get32(area + 24);
-    if (mx & 0xFFFF0000u) {
-        x86_gp0();
+    if ((c->hybrid && !is_xsave && !(c->cr4 & 0x200)) || (c->efer & (1ULL << 14)))
+        stop(STOP_FALLBACK, here, FB_FX, 0, 0); // what these leave out then is QEMU's to decide
+    u64 rfbm = is_xsave ? (((c->x[2] << 32) | (u32)c->x[0]) & c->xcr0) : 3ULL;
+    if (save) {
+        u8 hdr[64];
+        u64 xstate_bv = 0;
+        if (is_xsave) {
+            if (!guest_read(va + 512, hdr, 8, c->cpl == 3 ? 4 : 0))
+                stop(c->hybrid ? STOP_FALLBACK : STOP_UNSUPPORTED, here, c->hybrid ? FB_FX : 12, va, 0);
+            xstate_bv = (get32(hdr) | ((u64)get32(hdr + 4) << 32)) & c->xcr0;
+        }
+        if (rfbm & 3) {
+            memset(area, 0, 416);
+            put16(area, c->fcw);
+            put16(area + 2, c->fsw | (u32)(c->fp_top & 7) << 11);
+            area[4] = c->fp_tags;
+            put16(area + 6, c->fop);
+            put32(area + 8, (u32)c->fip);
+            put32(area + 16, (u32)c->fdp);
+            if (wide) {
+                put32(area + 12, (u32)(c->fip >> 32));
+                put32(area + 20, (u32)(c->fdp >> 32));
+            } else {
+                put16(area + 12, c->fcs);
+                put16(area + 20, c->fds);
+            }
+            put32(area + 24, mxcsr_read());
+            put32(area + 28, 0xFFFF);
+            for (u32 i = 0; i < 8; i++) {
+                u32 p = (c->fp_top + i) & 7;
+                u8 *r = area + 32 + i * 16;
+                put32(r, (u32)c->mm[p]);
+                put32(r + 4, (u32)(c->mm[p] >> 32));
+                put16(r + 8, c->fp_exp[p]);
+            }
+            mon_fp_save(area + 160);
+            if ((rfbm & 3) == 3) {
+                if (!fp_area_write(va, area, 416))
+                    stop(c->hybrid ? STOP_FALLBACK : STOP_UNSUPPORTED, here, c->hybrid ? FB_FX : 12, va, 0);
+            } else {
+                if (rfbm & 1) {
+                    if (!fp_area_write(va, area, 24) || !fp_area_write(va + 32, area + 32, 128))
+                        stop(c->hybrid ? STOP_FALLBACK : STOP_UNSUPPORTED, here, c->hybrid ? FB_FX : 12, va, 0);
+                }
+                if (rfbm & 2) {
+                    if (!fp_area_write(va + 24, area + 24, 8) || !fp_area_write(va + 160, area + 160, 256))
+                        stop(c->hybrid ? STOP_FALLBACK : STOP_UNSUPPORTED, here, c->hybrid ? FB_FX : 12, va, 0);
+                }
+            }
+        }
+        if (is_xsave) {
+            if ((rfbm & 4) && !fp_area_write(va + 576, (const u8 *)c->ymm_hi, 256))
+                stop(c->hybrid ? STOP_FALLBACK : STOP_UNSUPPORTED, here, c->hybrid ? FB_FX : 12, va, 0);
+            xstate_bv = (xstate_bv & ~rfbm) | (rfbm & 7);
+            put32(hdr, (u32)xstate_bv);
+            put32(hdr + 4, (u32)(xstate_bv >> 32));
+            if (!fp_area_write(va + 512, hdr, 8))
+                stop(c->hybrid ? STOP_FALLBACK : STOP_UNSUPPORTED, here, c->hybrid ? FB_FX : 12, va, 0);
+        }
         return;
     }
-    if ((mx & 0x1F80) != 0x1F80) // unmasked SSE exceptions cannot trap here
-        stop(c->hybrid ? STOP_FALLBACK : STOP_UNSUPPORTED, here, c->hybrid ? FB_FX : 14, mx, 0);
-    u32 sw = get16(area + 2);
-    c->fcw = (u16)get16(area);
-    c->fsw = (u16)(sw & ~0x3800u);
-    c->fp_top = sw >> 11 & 7;
-    c->fp_tags = area[4];
-    c->fop = get16(area + 6) & 0x7FF;
-    c->fip = get32(area + 8);
-    c->fdp = get32(area + 16);
-    if (wide) {
-        c->fip |= (u64)get32(area + 12) << 32;
-        c->fdp |= (u64)get32(area + 20) << 32;
-    } else {
-        c->fcs = (u16)get16(area + 12);
-        c->fds = (u16)get16(area + 20);
+    u64 xstate_bv = 3ULL;
+    if (is_xsave) {
+        u8 hdr[64];
+        if (!guest_read(va + 512, hdr, 24, c->cpl == 3 ? 4 : 0))
+            stop(c->hybrid ? STOP_FALLBACK : STOP_UNSUPPORTED, here, c->hybrid ? FB_FX : 12, va, 0);
+        u64 raw_bv = get32(hdr) | ((u64)get32(hdr + 4) << 32);
+        u64 xcomp_bv = get32(hdr + 8) | ((u64)get32(hdr + 12) << 32);
+        u64 res0 = get32(hdr + 16) | ((u64)get32(hdr + 20) << 32);
+        if (xcomp_bv || res0 || (raw_bv & ~c->xcr0)) {
+            x86_gp0();
+            return;
+        }
+        xstate_bv = raw_bv & c->xcr0;
     }
-    for (u32 i = 0; i < 8; i++) {
-        u32 p = (c->fp_top + i) & 7;
-        const u8 *r = area + 32 + i * 16;
-        c->mm[p] = get32(r) | (u64)get32(r + 4) << 32;
-        c->fp_exp[p] = (u16)get16(r + 8);
+    if ((rfbm & 3) && !guest_read(va, area, 416, c->cpl == 3 ? 4 : 0))
+        stop(c->hybrid ? STOP_FALLBACK : STOP_UNSUPPORTED, here, c->hybrid ? FB_FX : 12, va, 0);
+    u32 mx = mxcsr_read();
+    if (rfbm & 2) {
+        mx = get32(area + 24);
+        if (mx & 0xFFFF0000u) {
+            x86_gp0();
+            return;
+        }
+        if ((mx & 0x1F80) != 0x1F80) // unmasked SSE exceptions cannot trap here
+            stop(c->hybrid ? STOP_FALLBACK : STOP_UNSUPPORTED, here, c->hybrid ? FB_FX : 14, mx, 0);
     }
-    mon_fp_restore(area + 160);
-    mxcsr_apply(mx);
+    if (rfbm & 1) {
+        if (xstate_bv & 1) {
+            u32 sw = get16(area + 2);
+            c->fcw = (u16)get16(area);
+            c->fsw = (u16)(sw & ~0x3800u);
+            c->fp_top = sw >> 11 & 7;
+            c->fp_tags = area[4];
+            c->fop = get16(area + 6) & 0x7FF;
+            c->fip = get32(area + 8);
+            c->fdp = get32(area + 16);
+            if (wide) {
+                c->fip |= (u64)get32(area + 12) << 32;
+                c->fdp |= (u64)get32(area + 20) << 32;
+            } else {
+                c->fcs = (u16)get16(area + 12);
+                c->fds = (u16)get16(area + 20);
+            }
+            for (u32 i = 0; i < 8; i++) {
+                u32 p = (c->fp_top + i) & 7;
+                const u8 *r = area + 32 + i * 16;
+                c->mm[p] = get32(r) | (u64)get32(r + 4) << 32;
+                c->fp_exp[p] = (u16)get16(r + 8);
+            }
+        } else {
+            c->fcw = 0x37F;
+            c->fsw = 0;
+            c->fp_top = 0;
+            c->fp_tags = 0;
+            c->fop = 0;
+            c->fip = 0;
+            c->fdp = 0;
+            c->fcs = 0;
+            c->fds = 0;
+            memset(c->mm, 0, sizeof(c->mm));
+            memset(c->fp_exp, 0, sizeof(c->fp_exp));
+        }
+    }
+    if (rfbm & 2) {
+        if (!(xstate_bv & 2))
+            memset(area + 160, 0, 256);
+        mon_fp_restore(area + 160);
+    }
+    if (is_xsave && (rfbm & 4)) {
+        if (xstate_bv & 4) {
+            if (!guest_read(va + 576, (u8 *)c->ymm_hi, 256, c->cpl == 3 ? 4 : 0))
+                stop(c->hybrid ? STOP_FALLBACK : STOP_UNSUPPORTED, here, c->hybrid ? FB_FX : 12, va, 0);
+        } else {
+            memset(c->ymm_hi, 0, 256);
+        }
+    }
+    if (rfbm & 2)
+        mxcsr_apply(mx);
 }

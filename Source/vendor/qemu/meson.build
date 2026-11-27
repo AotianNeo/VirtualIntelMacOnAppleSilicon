@@ -844,13 +844,17 @@ if get_option('hvdbt_engine') != ''
   # back-deployment archives that swiftc would normally add for macOS 11.
   hvdbt_swiftc = run_command('xcrun', '--find', 'swiftc', check: true).stdout().strip()
   hvdbt_swift_libs = fs.parent(hvdbt_swiftc) / '../lib/swift/macosx'
+  hvdbt_fex_bridge = '/Users/admin/.gemini/antigravity/scratch/fexcore-macos-build/libhvdbt_fex_bridge.a'
+  hvdbt_fmt = '/opt/homebrew/opt/fmt/lib/libfmt.a'
+  hvdbt_xxhash = '/opt/homebrew/opt/xxhash/lib/libxxhash.a'
   hvdbt = declare_dependency(
     compile_args: ['-I' + get_option('hvdbt_engine') / 'Sources/CEngine/include'],
-    link_args: [hvdbt_library, '-L' + hvdbt_swift_libs, '-L/usr/lib/swift',
+    link_args: [hvdbt_library, hvdbt_fex_bridge, hvdbt_fmt, hvdbt_xxhash, '-lc++',
+                '-L' + hvdbt_swift_libs, '-L/usr/lib/swift',
                 '-lswiftCompatibility56', '-lswiftCompatibilityConcurrency',
                 '-Wl,-rpath,/usr/lib/swift',
                 '-framework', 'Foundation', '-framework', 'Hypervisor'])
-  hvdbt_link_depends = files(hvdbt_library)
+  hvdbt_link_depends = files(hvdbt_library, hvdbt_fex_bridge)
 endif
 midl = not_found
 widl = not_found

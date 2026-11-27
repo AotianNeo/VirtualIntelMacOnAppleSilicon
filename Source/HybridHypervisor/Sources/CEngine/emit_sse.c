@@ -1,10 +1,8 @@
 // SSE and SSE2 to NEON. Where supported, FPCR.AH selects alternate FP behavior for min/max and NaNs.
 // MXCSR status lives in FPSR. Unmasked FP exceptions cannot be trapped on this hardware, so the monitor stops on them.
+#include <stddef.h>
 #include "engine_api.h"
 #include "tr_internal.h"
-
-u16 tr_aes_mask;
-u8 tr_aes_key[16];
 
 static inline void sse_aes_flush_one(int r) {
     if (tr_aes_mask & (1u << r)) {
@@ -19,6 +17,99 @@ void sse_aes_flush_all(void) {
     for (int r = 0; m; r++, m >>= 1)
         if (m & 1)
             E(0x6E201C00u | (u32)tr_aes_key[r] << 16 | (u32)r << 5 | (u32)r);
+}
+
+static void logic_imm(int sf, int opc, int rd, int rn, u64 imm) {
+    u32 enc = 0;
+    logimm(imm, sf, &enc);
+    u32 base = opc == 0 ? 0x12000000u : opc == 1 ? 0x32000000u : 0x52000000u;
+    if (sf)
+        base |= 0x80000000u;
+    E(base | enc | (u32)rn << 5 | (u32)rd);
+}
+
+static void patch_tb(u32 *at, const u32 *target) {
+    *at |= ((u32)(target - at) & 0x3fffu) << 5;
+}
+
+static void patch_cb(u32 *at, const u32 *target) {
+    *at |= ((u32)(target - at) & 0x7ffffu) << 5;
+}
+
+static void patch_b(u32 *at, const u32 *target) {
+    *at |= (u32)(target - at) & 0x3ffffffu;
+}
+
+// Monitor mxcsr_apply, for the value Geekbench actually writes: exceptions masked,
+// no reserved bits, CR0.TS clear. Anything else is still the SVC.
+void emit_ldmxcsr_s0(void) {
+    ldst(1, 8, S1, (Addr){.base = CTX, .imm = offsetof(EngineCtx, cr0)});
+    u32 *to_slow_ts = tr_cc;
+    tbz(1, S1, 3, 0);
+    lsr_imm(0, S1, S0, 16);
+    u32 *to_slow_hi = tr_cc;
+    cbz(1, 0, S1, 0);
+    logic_imm(1, 0, S1, S0, 0x1F80);
+    logic_imm(1, 2, S1, S1, 0x1F80);
+    u32 *to_slow_mask = tr_cc;
+    cbz(1, 1, S1, 0);
+
+    movimm(S1, 6);
+    u32 *skip_daz = tr_cc;
+    tbz(0, S0, 6, 0);
+    logic_imm(1, 1, S1, S1, 1);
+    patch_tb(skip_daz, tr_cc);
+    u32 *skip_ftz = tr_cc;
+    tbz(0, S0, 15, 0);
+    logic_imm(1, 1, S1, S1, 1ULL << 24);
+    patch_tb(skip_ftz, tr_cc);
+    ubfx(0, S2, S0, 13, 2);
+    lsr_imm(0, S3, S2, 1);
+    logic_imm(1, 0, S2, S2, 1);
+    logic_sh(0, 1, 0, S2, S3, S2, 0, 1);
+    logic_sh(1, 1, 0, S1, S1, S2, 0, 22);
+    E(0xD51B4400u | S1); // msr fpcr, x
+
+    logic_imm(1, 0, S1, S0, 1);
+    ubfx(0, S2, S0, 2, 4);
+    logic_sh(0, 1, 0, S1, S1, S2, 0, 1);
+    u32 *skip_de = tr_cc;
+    tbz(0, S0, 1, 0);
+    logic_imm(1, 1, S1, S1, 128);
+    patch_tb(skip_de, tr_cc);
+    E(0xD51B4420u | S1); // msr fpsr, x
+
+    logic_imm(1, 0, S1, S0, 0xFFC0);
+    ldst(0, 4, S1, (Addr){.base = CTX, .imm = offsetof(EngineCtx, mxcsr)});
+    u32 *skip_svc = tr_cc;
+    b_rel(0);
+
+    u32 *slow = tr_cc;
+    svc(SVC_LDMXCSR);
+    patch_tb(to_slow_ts, slow);
+    patch_cb(to_slow_hi, slow);
+    patch_cb(to_slow_mask, slow);
+    patch_b(skip_svc, tr_cc);
+}
+
+void emit_stmxcsr_s0(void) {
+    ldst(1, 8, S1, (Addr){.base = CTX, .imm = offsetof(EngineCtx, cr0)});
+    u32 *to_slow = tr_cc;
+    tbz(1, S1, 3, 0);
+    E(0xD53B4420u | S0); // mrs x, fpsr
+    ldst(1, 4, S1, (Addr){.base = CTX, .imm = offsetof(EngineCtx, mxcsr)});
+    logic_imm(1, 0, S2, S0, 1);
+    ubfx(0, S3, S0, 7, 1);
+    logic_sh(0, 1, 0, S2, S2, S3, 0, 1);
+    ubfx(0, S3, S0, 1, 4);
+    logic_sh(0, 1, 0, S2, S2, S3, 0, 2);
+    logic_reg(0, 1, 0, S0, S1, S2);
+    u32 *skip_svc = tr_cc;
+    b_rel(0);
+    u32 *slow = tr_cc;
+    svc(SVC_STMXCSR);
+    patch_tb(to_slow, slow);
+    patch_b(skip_svc, tr_cc);
 }
 
 // kind: 2 s, 3 d, 4 q
@@ -463,6 +554,52 @@ static void emit_sse41(const Insn *in, int live) {
                 E(0x4E001C00u | (u32)(lane << (log2sz(bytes) + 1) | bytes) << 16 | (u32)s << 5 | d);
                 return;
             }
+            case 0x40: // dpps
+            case 0x41: { // dppd. Same product-mask / pairwise-add / broadcast as FEX VDPPSOpImpl.
+                bool dbl = opc == 0x41;
+                int s = src_op(in, 4, true);
+                unsigned srcm = dbl ? ((unsigned)imm >> 4) & 3u : ((unsigned)imm >> 4) & 0xfu;
+                unsigned dstm = dbl ? (unsigned)imm & 3u : (unsigned)imm & 0xfu;
+                unsigned full = dbl ? 3u : 0xfu;
+                if (srcm == 0 || dstm == 0) {
+                    E(0x6E201C00u | d << 16 | d << 5 | d);
+                    return;
+                }
+                RRR(dbl ? 0x6E60DC00u : 0x6E20DC00u, V_S0, d, s);
+                if (srcm != full) {
+                    u64 lo, hi;
+                    if (dbl) {
+                        lo = (srcm & 1) ? ~0ULL : 0;
+                        hi = (srcm & 2) ? ~0ULL : 0;
+                    } else {
+                        lo = ((srcm & 1) ? 0xffffffffULL : 0) | ((srcm & 2) ? 0xffffffffULL << 32 : 0);
+                        hi = ((srcm & 4) ? 0xffffffffULL : 0) | ((srcm & 8) ? 0xffffffffULL << 32 : 0);
+                    }
+                    movimm(S0, lo);
+                    RR(0x9E670000u, V_S1, S0);
+                    movimm(S0, hi);
+                    E(0x4E081C00u | 1u << 20 | (u32)S0 << 5 | V_S1);
+                    RRR(0x4E201C00u, V_S0, V_S0, V_S1); // and
+                }
+                E(0x6E201C00u | V_S1 << 16 | V_S1 << 5 | V_S1);
+                RRR(dbl ? 0x6E60D400u : 0x6E20D400u, V_S0, V_S0, V_S1);
+                if (!dbl)
+                    RRR(0x6E20D400u, V_S0, V_S0, V_S1);
+                if (dstm == full) {
+                    if (dbl)
+                        E(0x4E080400u | (u32)V_S0 << 5 | d); // dup.2d
+                    else
+                        E(0x4E040400u | (u32)V_S0 << 5 | d); // dup.4s
+                    return;
+                }
+                E(0x6E201C00u | V_S1 << 16 | V_S1 << 5 | V_S1);
+                int lanes = dbl ? 2 : 4, es = dbl ? 8 : 4;
+                for (int i = 0; i < lanes; i++)
+                    if (dstm & (1u << i))
+                        ins_elem(V_S1, i, V_S0, 0, es);
+                vmov(d, V_S1);
+                return;
+            }
             case 0x21: { // insertps: count_s, count_d, zero mask
                 int s = src_op(in, 2, false);
                 ins_elem(V_S0, 0, s, in->rm_reg ? (imm >> 6) & 3 : 0, 4);
@@ -800,13 +937,13 @@ void emit_sse(const Insn *in, int live) {
     }
     if (in->op == OP_LDMXCSR) {
         ldst(1, 4, S0, addr_prepare(in, 4));
-        svc(SVC_LDMXCSR);
+        emit_ldmxcsr_s0();
         return;
     }
     if (in->op == OP_STMXCSR) {
         Addr a = addr_prepare(in, 4);
-        // The monitor returns the value in x16: compute the address first, so a fault here is precise.
-        svc(SVC_STMXCSR);
+        // The value comes back in x16. The address is ready first, so a fault on the store is precise.
+        emit_stmxcsr_s0();
         ldst(0, 4, S0, a);
         return;
     }
