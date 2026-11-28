@@ -625,6 +625,7 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
         screen.height = h;
         [self resizeWindow];
         [self updateBounds];
+        [self setMouseX:mouseX y:mouseY on:mouseOn];
     }
 
     // update screenBuffer
@@ -1008,6 +1009,39 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
     }
 }
 
+- (void) queueMousePositionLocked:(NSEvent *)event
+{
+    if (isAbsoluteEnabled) {
+        NSRect bounds = [self bounds];
+        if (bounds.size.width > 0 && bounds.size.height > 0 &&
+            screen.width > 0 && screen.height > 0) {
+            /*
+             * Convert from window coordinates directly into view bounds so
+             * non-zero view origins (e.g. fullscreen letterboxing) and
+             * independent X/Y window-to-guest aspect ratios (resizable or
+             * OS-clamped windows) map pixel-accurately onto the guest screen.
+             * Origin for Cocoa view coordinates is bottom-left, not top-left.
+             */
+            NSPoint p = [self convertPoint:[event locationInWindow] fromView:nil];
+            CGFloat gx = (p.x - bounds.origin.x) *
+                         ((CGFloat)screen.width / bounds.size.width);
+            CGFloat gy = (CGFloat)screen.height -
+                         (p.y - bounds.origin.y) *
+                         ((CGFloat)screen.height / bounds.size.height);
+            int max_x = MAX(screen.width - 1, 1);
+            int max_y = MAX(screen.height - 1, 1);
+            int ix = (int)llround(fmax(0.0, fmin(gx, (CGFloat)max_x)));
+            int iy = (int)llround(fmax(0.0, fmin(gy, (CGFloat)max_y)));
+
+            qemu_input_queue_abs(dcl.con, INPUT_AXIS_X, ix, 0, max_x);
+            qemu_input_queue_abs(dcl.con, INPUT_AXIS_Y, iy, 0, max_y);
+        }
+    } else {
+        qemu_input_queue_rel(dcl.con, INPUT_AXIS_X, [event deltaX]);
+        qemu_input_queue_rel(dcl.con, INPUT_AXIS_Y, [event deltaY]);
+    }
+}
+
 - (void) handleMouseEvent:(NSEvent *)event button:(InputButton)button down:(bool)down
 {
     if (!isMouseGrabbed) {
@@ -1015,10 +1049,10 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
     }
 
     with_bql(^{
+        [self queueMousePositionLocked:event];
         qemu_input_queue_btn(dcl.con, button, down);
+        qemu_input_event_sync();
     });
-
-    [self handleMouseEvent:event];
 }
 
 - (void) handleMouseEvent:(NSEvent *)event
@@ -1028,18 +1062,7 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
     }
 
     with_bql(^{
-        if (isAbsoluteEnabled) {
-            CGFloat d = (CGFloat)screen.height / [self frame].size.height;
-            NSPoint p = [event locationInWindow];
-
-            /* Note that the origin for Cocoa mouse coords is bottom left, not top left. */
-            qemu_input_queue_abs(dcl.con, INPUT_AXIS_X, p.x * d, 0, screen.width);
-            qemu_input_queue_abs(dcl.con, INPUT_AXIS_Y, screen.height - p.y * d, 0, screen.height);
-        } else {
-            qemu_input_queue_rel(dcl.con, INPUT_AXIS_X, [event deltaX]);
-            qemu_input_queue_rel(dcl.con, INPUT_AXIS_Y, [event deltaY]);
-        }
-
+        [self queueMousePositionLocked:event];
         qemu_input_event_sync();
     });
 }
@@ -2085,7 +2108,8 @@ static void cocoa_display_init(DisplayState *ds, DisplayOptions *opts)
         left_command_key_enabled = 0;
     }
 
-    if (opts->u.cocoa.has_zoom_to_fit && opts->u.cocoa.zoom_to_fit) {
+    if ((opts->u.cocoa.has_zoom_to_fit && opts->u.cocoa.zoom_to_fit) ||
+        g_strcmp0(getenv("VMVGA_DYNAMIC_RES"), "1") == 0) {
         [cocoaView window].styleMask |= NSWindowStyleMaskResizable;
     }
 

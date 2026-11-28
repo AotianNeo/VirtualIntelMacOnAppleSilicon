@@ -28,6 +28,52 @@
 #include "ui/input.h"
 #include "ui/sdl2.h"
 
+/* Crisp text: at an integer scale (e.g. exactly 2x on a Retina panel) use
+ * nearest so every guest pixel becomes a sharp block; at any other scale use
+ * linear so no pixel rows/columns are dropped.  VMVGA_SCALE_FILTER=nearest|
+ * linear forces one. */
+static void sdl2_2d_pick_scale_mode(struct sdl2_console *scon)
+{
+    static int forced = -1;             /* -1 unread, 0 auto, 1 nearest, 2 linear */
+    int ow = 0, oh = 0, sw, sh;
+    SDL_ScaleMode mode = SDL_ScaleModeLinear;
+
+    if (forced < 0) {
+        const char *f = getenv("VMVGA_SCALE_FILTER");
+        forced = f && !strcmp(f, "nearest") ? 1 :
+                 f && !strcmp(f, "linear") ? 2 : 0;
+    }
+    sw = surface_width(scon->surface);
+    sh = surface_height(scon->surface);
+    if (forced == 1) {
+        mode = SDL_ScaleModeNearest;
+    } else if (forced == 0 && sw > 0 && sh > 0 &&
+               SDL_GetRendererOutputSize(scon->real_renderer, &ow, &oh) == 0) {
+        double k = MIN((double)ow / sw, (double)oh / sh);
+        double r = k >= 1.0 ? k - (int)(k + 0.5) : 1.0;
+        if (r > -0.01 && r < 0.01) {
+            mode = SDL_ScaleModeNearest;
+        }
+    }
+    if (scon->texture_scale_mode != (int)mode + 1) {
+        SDL_SetTextureScaleMode(scon->texture, mode);
+        scon->texture_scale_mode = (int)mode + 1;
+    }
+}
+
+static void sdl2_2d_present(struct sdl2_console *scon)
+{
+    scon->updates = 0;
+    if (!scon->texture || !scon->real_renderer || !scon->surface) {
+        return;
+    }
+
+    sdl2_2d_pick_scale_mode(scon);
+    SDL_RenderClear(scon->real_renderer);
+    SDL_RenderCopy(scon->real_renderer, scon->texture, NULL, NULL);
+    SDL_RenderPresent(scon->real_renderer);
+}
+
 void sdl2_2d_update(DisplayChangeListener *dcl,
                     int x, int y, int w, int h)
 {
@@ -37,7 +83,7 @@ void sdl2_2d_update(DisplayChangeListener *dcl,
     size_t surface_data_offset;
     assert(!scon->opengl);
 
-    if (!scon->texture) {
+    if (!scon->texture || !surf || w <= 0 || h <= 0) {
         return;
     }
 
@@ -51,9 +97,7 @@ void sdl2_2d_update(DisplayChangeListener *dcl,
     SDL_UpdateTexture(scon->texture, &rect,
                       surface_data(surf) + surface_data_offset,
                       surface_stride(surf));
-    SDL_RenderClear(scon->real_renderer);
-    SDL_RenderCopy(scon->real_renderer, scon->texture, NULL, NULL);
-    SDL_RenderPresent(scon->real_renderer);
+    scon->updates++;
 }
 
 void sdl2_2d_switch(DisplayChangeListener *dcl,
@@ -66,6 +110,7 @@ void sdl2_2d_switch(DisplayChangeListener *dcl,
     assert(!scon->opengl);
 
     scon->surface = new_surface;
+    scon->updates = 0;
 
     if (scon->texture) {
         SDL_DestroyTexture(scon->texture);
@@ -117,6 +162,7 @@ void sdl2_2d_switch(DisplayChangeListener *dcl,
     default:
         g_assert_not_reached();
     }
+    scon->texture_scale_mode = 0;
     scon->texture = SDL_CreateTexture(scon->real_renderer, format,
                                       SDL_TEXTUREACCESS_STREAMING,
                                       surface_width(new_surface),
@@ -129,7 +175,12 @@ void sdl2_2d_refresh(DisplayChangeListener *dcl)
     struct sdl2_console *scon = container_of(dcl, struct sdl2_console, dcl);
 
     assert(!scon->opengl);
+    scon->in_refresh = true;
     qemu_console_hw_update(dcl->con);
+    scon->in_refresh = false;
+    if (scon->updates) {
+        sdl2_2d_present(scon);
+    }
     sdl2_poll_events(scon);
 }
 
@@ -143,6 +194,9 @@ void sdl2_2d_redraw(struct sdl2_console *scon)
     sdl2_2d_update(&scon->dcl, 0, 0,
                    surface_width(scon->surface),
                    surface_height(scon->surface));
+    if (!scon->in_refresh && scon->updates) {
+        sdl2_2d_present(scon);
+    }
 }
 
 bool sdl2_2d_check_format(DisplayChangeListener *dcl,

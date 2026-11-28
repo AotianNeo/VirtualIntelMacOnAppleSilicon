@@ -32,6 +32,7 @@ struct sdl2_console {
     DisplaySurface *surface;
     DisplayOptions *opts;
     SDL_Texture *texture;
+    int texture_scale_mode;     /* 0 unset, else SDL_ScaleMode + 1 */
     SDL_Window *real_window;
     SDL_Renderer *real_renderer;
     int idx;
@@ -40,6 +41,7 @@ struct sdl2_console {
     int hidden;
     int opengl;
     int updates;
+    bool in_refresh;
     int idle_counter;
     int ignore_hotkeys;
     bool gui_keysym;
@@ -103,5 +105,10 @@ void sdl2_gl_release_dmabuf(DisplayChangeListener *dcl,
                             QemuDmaBuf *dmabuf);
 bool sdl2_gl_has_dmabuf(DisplayChangeListener *dcl);
 void sdl2_gl_console_init(struct sdl2_console *scon);
+
+/* sdl2-clipboard.c */
+void sdl2_clipboard_init(void);
+void sdl2_clipboard_handle_update(void);
+void sdl2_clipboard_poll(bool force);
 
 #endif /* SDL2_H */
