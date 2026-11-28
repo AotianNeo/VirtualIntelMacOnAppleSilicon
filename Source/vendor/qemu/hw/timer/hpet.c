@@ -173,11 +173,19 @@ static uint64_t hpet_get_ns(HPETState *s, uint64_t tick)
 static uint64_t hpet_calculate_cmp64(HPETTimer *t, uint64_t cur_tick, uint64_t target)
 {
     if (t->config & HPET_TN_32BIT) {
-        uint64_t result = deposit64(cur_tick, 0, 32, target);
-        if (result < cur_tick) {
-            result += 0x100000000ULL;
+        int32_t delta = (int32_t)((uint32_t)target - (uint32_t)cur_tick);
+        if (delta <= 0) {
+            /*
+             * Target is already in the recent past (within half the 32-bit
+             * counter range, ~21.47s at 100 MHz) — e.g. when a guest sets a
+             * sub-millisecond periodic timer (Windows timeBeginPeriod(1)) and
+             * host/BQL latency lets cur_tick pass target before hpet_set_timer()
+             * runs. Clamp to cur_tick to fire immediately instead of wrapping
+             * forward by 2^32 ticks (+42.95s) and stalling the guest OS clock.
+             */
+            return cur_tick;
         }
-        return result;
+        return cur_tick + (uint64_t)(uint32_t)delta;
     } else {
         return target;
     }
@@ -373,8 +381,9 @@ static void hpet_timer(void *opaque)
     uint64_t cur_tick = hpet_get_ticks(t->state);
 
     if (timer_is_periodic(t) && period != 0) {
-        while (hpet_time_after(cur_tick, t->cmp64)) {
-            t->cmp64 += period;
+        if (!hpet_time_after(t->cmp64, cur_tick)) {
+            uint64_t skip = (uint64_t)(cur_tick - t->cmp64) / period + 1;
+            t->cmp64 += skip * period;
         }
         if (t->config & HPET_TN_32BIT) {
             t->cmp = (uint32_t)t->cmp64;
@@ -596,7 +605,7 @@ static void hpet_ram_write(void *opaque, hwaddr addr,
                 timer->cmp = (uint32_t)timer->cmp;
                 timer->period = (uint32_t)timer->period;
             }
-            if (hpet_enabled(s)) {
+            if (hpet_enabled(s) && !(timer->config & HPET_TN_SETVAL)) {
                 hpet_set_timer(timer);
             }
             break;
@@ -615,7 +624,16 @@ static void hpet_ram_write(void *opaque, hwaddr addr,
                 || (timer->config & HPET_TN_SETVAL)) {
                 timer->cmp = deposit64(timer->cmp, shift, len, value);
             }
-            if (timer_is_periodic(timer)) {
+            /*
+             * When reprogramming a live periodic timer with SETVAL=1, the first
+             * write carries the absolute comparator target (cur_tick + period),
+             * followed by a second write (SETVAL=0) carrying the actual period.
+             * Avoid overwriting timer->period with the absolute target while
+             * running, so an intervening hpet_timer() callback cannot jump
+             * cmp64 forward by tens of seconds before the second write lands.
+             */
+            if (timer_is_periodic(timer)
+                && (!(timer->config & HPET_TN_SETVAL) || !hpet_enabled(s))) {
                 timer->period = deposit64(timer->period, shift, len, value);
             }
             timer->config &= ~HPET_TN_SETVAL;
