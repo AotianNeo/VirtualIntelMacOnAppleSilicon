@@ -41,6 +41,12 @@ void *memcpy(void *d, const void *s, unsigned long n) {
     return d;
 }
 
+#define POOL_SLAB_CAP 32u
+#define POOL_SLAB_BATCH 16u
+#define RMAP_SLAB_CAP 128u
+#define RMAP_SLAB_BATCH 64u
+#define MAX_CONC_MIRRORS MAX_VIEWS
+
 // ---- One vCPU's own state ----
 // x18 picks the vCPU. EngineCtx is reachable from EL0, so what the monitor keeps for itself sits at a fixed distance from it, in EL1 memory, with the stack at the
 // slot's top. The defines keep the old names: this state was statics, and a static in this file is now shared by every vCPU, so it must either move here or be locked.
@@ -72,6 +78,23 @@ typedef struct {
     u64 hv_hc_va_cached;
     u64 hv_hc_gpa_cached;
     u64 hvc_ticks_local;
+    // Fine-grained concurrent shadow PT state (per-vCPU; read_active isolated on its own cache line).
+    u32 read_active __attribute__((aligned(64)));
+    u32 read_depth;
+    u32 held_mirror_cnt;
+    u32 held_mirror_locks[2];
+    u32 held_pt_cnt;
+    u16 held_pt_locks[MAX_CONC_MIRRORS];
+    u32 held_rmap_lock; // bucket + 1, or 0
+    u32 held_rmap2m_lock; // bucket + 1, or 0
+    u8 held_pool_alloc_lock;
+    u8 held_rmap_alloc_lock;
+    u8 held_rmap2m_alloc_lock;
+    u8 in_zap_table_local;
+    u32 pool_slab_cnt;
+    u32 pool_slab[POOL_SLAB_CAP];
+    u32 rmap_slab_cnt;
+    u32 rmap_slab[RMAP_SLAB_CAP];
     u8 fx_area[512] __attribute__((aligned(16))); // the x87 save formats, one at a time
 } MonCpu;
 _Static_assert(sizeof(MonCpu) <= CTX_SLOT / 2, "the rest of the slot is the stack");
@@ -97,16 +120,56 @@ _Static_assert(OFF_RSTACKS + MAX_VCPUS * MAX_VIEWS * RSTACK_SLOT <= PRIV_SIZE, "
 #define xfl (me->xfl)
 
 // ---- Shared state ----
-// One lock over views, the shadow pool, rmap, mirrors and page_info, with no cost beyond a load at one vCPU.
-// Nested takers just count, and `stop` lets go, since it abandons the stack that took it.
-// FIFO admission bounds reacquisition starvation: a busy vCPU must not keep
-// overtaking the compositor's vCPU during cold translation/page-table bursts.
-// At most MAX_VCPUS tickets are outstanding, so equality remains valid across
-// u32 wrap. Reentrance and abandoned-stack release consume only the outer ticket.
+// Two-tier shadow PT locking:
+//   Level 0: Distributed per-vCPU RW-lock (`mon_lock` = exclusive writer, `mon_read_lock` = zero-contention reader).
+//   Level 1: Striped guest-PT-frame mirror seqlocks (`mirror_locks[1024]`).
+//   Level 2: Striped per-(view, 2 MiB VA) shadow-slot locks (`pt_locks[1024]`), acquired in ascending bucket order.
+//   Level 3: Striped reverse-map frame locks (`rmap_locks[1024]`, `rmap2m_locks[256]`).
+//   Level 4: Leaf-only global slab-refill locks (`pool_alloc_lock`, `rmap_alloc_lock`, `rmap2m_alloc_lock`).
+// Setting LC_HVDBT_GLOBAL_MON_LOCK=1 (c->global_mon_lock) forces every path back to the single global `mon_lock`.
 static u32 mon_lock_word __attribute__((aligned(64)));
 static u32 mon_lock_owner __attribute__((aligned(64)));
+static u32 pool_alloc_lock_word __attribute__((aligned(64)));
+static u32 rmap_alloc_lock_word __attribute__((aligned(64)));
+static u32 rmap2m_alloc_lock_word __attribute__((aligned(64)));
 static inline void hostcall(u64 code);
+_Noreturn static void stop(u64 reason, u64 rip, u64 a, u64 b, u64 d);
 #define smp (c0->vcpu_count > 1)
+
+typedef struct {
+    u32 word;
+    u32 pad[15];
+} __attribute__((aligned(64))) PadLock;
+_Static_assert(sizeof(PadLock) == 64, "PadLock must be one 64-byte cache line");
+
+#define PT_LOCK_BUCKETS 1024u
+#define MIRROR_LOCK_BUCKETS 1024u
+#define RMAP_LOCK_BUCKETS 1024u
+#define RMAP2M_LOCK_BUCKETS 256u
+#define PT_LOCKS_OFF (OFF_SHADOW_META + (150ULL << 20))
+#define MIRROR_LOCKS_OFF (PT_LOCKS_OFF + (u64)PT_LOCK_BUCKETS * 64ULL)
+#define RMAP_LOCKS_OFF (MIRROR_LOCKS_OFF + (u64)MIRROR_LOCK_BUCKETS * 64ULL)
+#define RMAP2M_LOCKS_OFF (RMAP_LOCKS_OFF + (u64)RMAP_LOCK_BUCKETS * 64ULL)
+_Static_assert(RMAP2M_LOCKS_OFF + (u64)RMAP2M_LOCK_BUCKETS * 64ULL <= OFF_PAGEINFO, "striped locks overflow OFF_SHADOW_META");
+
+static PadLock *const pt_locks = (PadLock *)(PRIV_VA + PT_LOCKS_OFF);
+static PadLock *const mirror_locks = (PadLock *)(PRIV_VA + MIRROR_LOCKS_OFF);
+static PadLock *const rmap_locks = (PadLock *)(PRIV_VA + RMAP_LOCKS_OFF);
+static PadLock *const rmap2m_locks = (PadLock *)(PRIV_VA + RMAP2M_LOCKS_OFF);
+
+static inline u32 pt_lock_bucket(u32 view, u64 va_2m) {
+    return ((u32)(va_2m ^ (va_2m >> 10) ^ (va_2m >> 20)) ^ (view * 131u)) & (PT_LOCK_BUCKETS - 1u);
+}
+static inline u32 mirror_lock_bucket(u32 fr) {
+    return (fr ^ (fr >> 10)) & (MIRROR_LOCK_BUCKETS - 1u);
+}
+static inline u32 rmap_lock_bucket(u32 fr) {
+    return (fr ^ (fr >> 10)) & (RMAP_LOCK_BUCKETS - 1u);
+}
+static inline u32 rmap2m_lock_bucket(u32 fr2m) {
+    return fr2m & (RMAP2M_LOCK_BUCKETS - 1u);
+}
+
 static inline void mon_flush_stats(void) {
     if (me->mon_wait_accum) {
         __atomic_fetch_add(&c0->stat_mon_wait, me->mon_wait_accum, __ATOMIC_RELAXED);
@@ -119,29 +182,178 @@ static inline void mon_flush_stats(void) {
         }
     }
 }
-static inline void mon_lock(void) {
-    if (!smp || me->lock_depth++)
+
+static inline void spin_seq_lock(u32 *word, u32 site_tag) {
+    u32 s = __atomic_load_n(word, __ATOMIC_RELAXED) & ~1u;
+    if (__builtin_expect(__atomic_compare_exchange_n(word, &s, s + 1u, false, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED), 1))
         return;
-    // mon_lock_word is a TTAS seqlock: even = unlocked, odd = locked.
-    u32 s = __atomic_load_n(&mon_lock_word, __ATOMIC_RELAXED) & ~1u;
-    if (__builtin_expect(__atomic_compare_exchange_n(&mon_lock_word, &s, s + 1, false, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED), 1)) {
-        __atomic_store_n(&mon_lock_owner, cpu_index(), __ATOMIC_RELAXED);
-        me->lock_from = RSR(cntvct_el0);
-        me->lock_site = 0;
+    u64 waiting_from = RSR(cntvct_el0);
+    for (u32 spins = 1;; spins++) {
+        s = __atomic_load_n(word, __ATOMIC_RELAXED);
+        if (!(s & 1u) &&
+            __atomic_compare_exchange_n(word, &s, s + 1u, false, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
+            me->mon_wait_accum += RSR(cntvct_el0) - waiting_from;
+            if (!(++me->mon_stat_ticks & 63))
+                mon_flush_stats();
+            return;
+        }
+        __asm__ volatile("yield");
+        if (!(spins & 0xFFFF)) {
+            c->req_a[0] = cpu_index();
+            c->req_a[1] = RSR(cntvct_el0) - waiting_from;
+            c->req_a[2] = site_tag;
+            hostcall(HC_YIELD);
+        }
+    }
+}
+static inline void spin_seq_unlock(u32 *word) {
+    u32 next_seq = __atomic_load_n(word, __ATOMIC_RELAXED) + 1u;
+    __atomic_store_n(word, next_seq, __ATOMIC_RELEASE);
+}
+
+static inline void mirror_lock_acquire(u32 b) {
+    if (!smp || me->lock_depth)
         return;
+    spin_seq_lock(&mirror_locks[b].word, 201u);
+    me->held_mirror_locks[0] = b;
+    me->held_mirror_cnt = 1u;
+}
+static inline void mirror_lock_acquire_many(const u32 *buckets, u32 cnt) {
+    if (!smp || me->lock_depth)
+        return;
+    for (u32 i = 0; i < cnt; i++) {
+        spin_seq_lock(&mirror_locks[buckets[i]].word, 201u);
+        me->held_mirror_locks[me->held_mirror_cnt++] = buckets[i];
+    }
+}
+static inline void mirror_locks_release_all(void) {
+    while (me->held_mirror_cnt) {
+        u32 b = me->held_mirror_locks[--me->held_mirror_cnt];
+        spin_seq_unlock(&mirror_locks[b].word);
+    }
+}
+static inline void mirror_lock_release(void) { mirror_locks_release_all(); }
+static inline void pt_lock_acquire_one(u32 b) {
+    if (!smp || me->lock_depth)
+        return;
+    spin_seq_lock(&pt_locks[b].word, 202u);
+    me->held_pt_locks[0] = (u16)b;
+    me->held_pt_cnt = 1u;
+}
+static inline void pt_lock_acquire_many(const u32 *buckets, u32 cnt) {
+    if (!smp || me->lock_depth)
+        return;
+    for (u32 i = 0; i < cnt; i++) {
+        spin_seq_lock(&pt_locks[buckets[i]].word, 202u);
+        me->held_pt_locks[me->held_pt_cnt++] = (u16)buckets[i];
+    }
+}
+static inline void pt_lock_acquire_bitset(const u64 *bmask) {
+    if (!smp || me->lock_depth)
+        return;
+    for (u32 w = 0; w < PT_LOCK_BUCKETS / 64u; w++) {
+        u64 m = bmask[w];
+        while (m) {
+            u32 bit = (u32)__builtin_ctzll(m);
+            m &= m - 1ULL;
+            u32 b = (w << 6) | bit;
+            spin_seq_lock(&pt_locks[b].word, 202u);
+            me->held_pt_locks[me->held_pt_cnt++] = (u16)b;
+        }
+    }
+}
+static inline void pt_locks_release_all(void) {
+    while (me->held_pt_cnt) {
+        u32 b = me->held_pt_locks[--me->held_pt_cnt];
+        spin_seq_unlock(&pt_locks[b].word);
+    }
+}
+static inline void rmap_lock_acquire(u32 b) {
+    if (!smp || me->lock_depth)
+        return;
+    spin_seq_lock(&rmap_locks[b].word, 203u);
+    me->held_rmap_lock = b + 1u;
+}
+static inline void rmap_lock_release(void) {
+    if (me->held_rmap_lock) {
+        u32 b = me->held_rmap_lock - 1u;
+        me->held_rmap_lock = 0;
+        spin_seq_unlock(&rmap_locks[b].word);
+    }
+}
+static inline void rmap2m_lock_acquire(u32 b) {
+    if (!smp || me->lock_depth)
+        return;
+    spin_seq_lock(&rmap2m_locks[b].word, 204u);
+    me->held_rmap2m_lock = b + 1u;
+}
+static inline void rmap2m_lock_release(void) {
+    if (me->held_rmap2m_lock) {
+        u32 b = me->held_rmap2m_lock - 1u;
+        me->held_rmap2m_lock = 0;
+        spin_seq_unlock(&rmap2m_locks[b].word);
+    }
+}
+static inline void pool_alloc_lock_acquire(void) {
+    if (!smp || me->lock_depth)
+        return;
+    spin_seq_lock(&pool_alloc_lock_word, 205u);
+    me->held_pool_alloc_lock = 1u;
+}
+static inline void pool_alloc_lock_release(void) {
+    if (me->held_pool_alloc_lock) {
+        me->held_pool_alloc_lock = 0;
+        spin_seq_unlock(&pool_alloc_lock_word);
+    }
+}
+static inline void rmap_alloc_lock_acquire(void) {
+    if (!smp || me->lock_depth)
+        return;
+    spin_seq_lock(&rmap_alloc_lock_word, 206u);
+    me->held_rmap_alloc_lock = 1u;
+}
+static inline void rmap_alloc_lock_release(void) {
+    if (me->held_rmap_alloc_lock) {
+        me->held_rmap_alloc_lock = 0;
+        spin_seq_unlock(&rmap_alloc_lock_word);
+    }
+}
+static inline void rmap2m_alloc_lock_acquire(void) {
+    if (!smp || me->lock_depth)
+        return;
+    spin_seq_lock(&rmap2m_alloc_lock_word, 207u);
+    me->held_rmap2m_alloc_lock = 1u;
+}
+static inline void rmap2m_alloc_lock_release(void) {
+    if (me->held_rmap2m_alloc_lock) {
+        me->held_rmap2m_alloc_lock = 0;
+        spin_seq_unlock(&rmap2m_alloc_lock_word);
+    }
+}
+
+static inline void mon_read_lock(void) {
+    if (!smp || me->lock_depth)
+        return;
+    if (me->read_depth++)
+        return;
+    if (__builtin_expect(!(__atomic_load_n(&mon_lock_word, __ATOMIC_RELAXED) & 1u), 1)) {
+        // Dekker pair with mon_lock(): SEQ_CST store (STLR) + SEQ_CST load (LDAR) — strictly ordered on ARMv8 without extra DMB ISH.
+        __atomic_store_n(&me->read_active, 1u, __ATOMIC_SEQ_CST);
+        if (__builtin_expect(!(__atomic_load_n(&mon_lock_word, __ATOMIC_SEQ_CST) & 1u), 1))
+            return;
+        __atomic_store_n(&me->read_active, 0u, __ATOMIC_RELEASE);
     }
     u64 waiting_from = RSR(cntvct_el0);
     for (u32 spins = 1;; spins++) {
-        // Test-and-Test-and-Set avoids ticket-lock preemption convoys on 16 vCPUs when a waiter yields to macOS.
-        s = __atomic_load_n(&mon_lock_word, __ATOMIC_RELAXED);
-        if (!(s & 1u) &&
-            __atomic_compare_exchange_n(&mon_lock_word, &s, s + 1, false, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
-            __atomic_store_n(&mon_lock_owner, cpu_index(), __ATOMIC_RELAXED);
-            u64 now = RSR(cntvct_el0);
-            me->mon_wait_accum += now - waiting_from;
-            me->lock_from = now;
-            me->lock_site = 0;
-            return;
+        if (!(__atomic_load_n(&mon_lock_word, __ATOMIC_RELAXED) & 1u)) {
+            __atomic_store_n(&me->read_active, 1u, __ATOMIC_SEQ_CST);
+            if (!(__atomic_load_n(&mon_lock_word, __ATOMIC_SEQ_CST) & 1u)) {
+                me->mon_wait_accum += RSR(cntvct_el0) - waiting_from;
+                if (!(++me->mon_stat_ticks & 63))
+                    mon_flush_stats();
+                return;
+            }
+            __atomic_store_n(&me->read_active, 0u, __ATOMIC_RELEASE);
         }
         __asm__ volatile("yield");
         if (!(spins & 0xFFFF)) {
@@ -154,11 +366,78 @@ static inline void mon_lock(void) {
         }
     }
 }
+static inline void mon_read_unlock(void) {
+    if (!smp || me->lock_depth)
+        return;
+    if (me->read_depth && !--me->read_depth)
+        __atomic_store_n(&me->read_active, 0u, __ATOMIC_RELEASE);
+}
+
+static inline void mon_lock(void) {
+    if (!smp || me->lock_depth++)
+        return;
+    if (me->read_depth)
+        stop(STOP_MONITOR_FAULT, 0, 0x10cd, me->read_depth, c->elr);
+    u64 waiting_from = 0;
+    // mon_lock_word is a TTAS writer seqlock: even = no exclusive writer, odd = writer active.
+    u32 s = __atomic_load_n(&mon_lock_word, __ATOMIC_RELAXED) & ~1u;
+    if (__builtin_expect(__atomic_compare_exchange_n(&mon_lock_word, &s, s + 1u, false, __ATOMIC_SEQ_CST, __ATOMIC_RELAXED), 1)) {
+        __atomic_store_n(&mon_lock_owner, cpu_index(), __ATOMIC_RELAXED);
+    } else {
+        waiting_from = RSR(cntvct_el0);
+        for (u32 spins = 1;; spins++) {
+            // Test-and-Test-and-Set avoids ticket-lock preemption convoys on 16 vCPUs when a waiter yields to macOS.
+            s = __atomic_load_n(&mon_lock_word, __ATOMIC_RELAXED);
+            if (!(s & 1u) &&
+                __atomic_compare_exchange_n(&mon_lock_word, &s, s + 1u, false, __ATOMIC_SEQ_CST, __ATOMIC_RELAXED)) {
+                __atomic_store_n(&mon_lock_owner, cpu_index(), __ATOMIC_RELAXED);
+                break;
+            }
+            __asm__ volatile("yield");
+            if (!(spins & 0xFFFF)) {
+                u32 owner = __atomic_load_n(&mon_lock_owner, __ATOMIC_RELAXED);
+                MonCpu *om = (MonCpu *)(PRIV_VA + OFF_MON_CPU + (u64)owner * CTX_SLOT);
+                c->req_a[0] = owner;
+                c->req_a[1] = RSR(cntvct_el0) - waiting_from;
+                c->req_a[2] = om->lock_site;
+                hostcall(HC_YIELD);
+            }
+        }
+    }
+    if (!c->global_mon_lock) {
+        __atomic_thread_fence(__ATOMIC_SEQ_CST);
+        u32 my_cpu = cpu_index();
+        u32 ncpus = c0->vcpu_count;
+        for (u32 cpu = 0; cpu < ncpus; cpu++) {
+            if (cpu == my_cpu)
+                continue;
+            MonCpu *om = (MonCpu *)(PRIV_VA + OFF_MON_CPU + (u64)cpu * CTX_SLOT);
+            if (__builtin_expect(__atomic_load_n(&om->read_active, __ATOMIC_SEQ_CST) != 0, 0)) {
+                if (!waiting_from)
+                    waiting_from = RSR(cntvct_el0);
+                for (u32 rspins = 1; __atomic_load_n(&om->read_active, __ATOMIC_ACQUIRE) != 0; rspins++) {
+                    __asm__ volatile("yield");
+                    if (!(rspins & 0xFFFF)) {
+                        c->req_a[0] = cpu;
+                        c->req_a[1] = RSR(cntvct_el0) - waiting_from;
+                        c->req_a[2] = 100u;
+                        hostcall(HC_YIELD);
+                    }
+                }
+            }
+        }
+    }
+    u64 now = RSR(cntvct_el0);
+    if (waiting_from)
+        me->mon_wait_accum += now - waiting_from;
+    me->lock_from = now;
+    me->lock_site = 0;
+}
 static inline void mon_unlock(void) {
     if (smp && me->lock_depth && !--me->lock_depth) {
         u32 site = me->lock_site;
         u64 held = RSR(cntvct_el0) - me->lock_from;
-        u32 next_seq = __atomic_load_n(&mon_lock_word, __ATOMIC_RELAXED) + 1;
+        u32 next_seq = __atomic_load_n(&mon_lock_word, __ATOMIC_RELAXED) + 1u;
         __atomic_store_n(&mon_lock_word, next_seq, __ATOMIC_RELEASE);
         me->mon_hold_accum[site] += held;
         if (!(++me->mon_stat_ticks & 63))
@@ -171,10 +450,29 @@ static inline void mon_unlock(void) {
         if (smp && !me->lock_depth) \
             stop(STOP_MONITOR_FAULT, 0, 0x10cc, 0, c->elr); \
     } while (0)
+#define LOCK_OR_READ_REQUIRED() \
+    do { \
+        if (smp && !me->lock_depth && !me->read_depth) \
+            stop(STOP_MONITOR_FAULT, 0, 0x10ce, 0, c->elr); \
+    } while (0)
 static inline void mon_unlock_all(void) {
-    if (smp && me->lock_depth) {
+    if (!smp)
+        return;
+    // Release any fine-grained locks strictly in reverse lock-hierarchy order (4 -> 3 -> 2 -> 1 -> 0).
+    rmap2m_alloc_lock_release();
+    rmap_alloc_lock_release();
+    pool_alloc_lock_release();
+    rmap2m_lock_release();
+    rmap_lock_release();
+    pt_locks_release_all();
+    mirror_lock_release();
+    if (me->read_depth) {
+        me->read_depth = 0;
+        __atomic_store_n(&me->read_active, 0u, __ATOMIC_RELEASE);
+    }
+    if (me->lock_depth) {
         me->lock_depth = 0;
-        u32 next_seq = __atomic_load_n(&mon_lock_word, __ATOMIC_RELAXED) + 1;
+        u32 next_seq = __atomic_load_n(&mon_lock_word, __ATOMIC_RELAXED) + 1u;
         __atomic_store_n(&mon_lock_word, next_seq, __ATOMIC_RELEASE);
         mon_flush_stats();
     }
@@ -183,7 +481,6 @@ static inline void mon_unlock_all(void) {
 static u32 rs_epoch_shared __attribute__((aligned(64)));
 
 // ---- Host calls ----
-_Noreturn static void stop(u64 reason, u64 rip, u64 a, u64 b, u64 d);
 
 static inline void hostcall(u64 code) {
     register u64 x0 __asm__("x0") = code;
@@ -307,17 +604,124 @@ static inline bool is_ram(u64 gpa) { return gpa < c->ram_size && (page_info[gpa 
 static inline bool is_direct(u64 gpa) { return gpa < PRIV_IPA && (page_info[gpa >> 12] & PI_DIRECT); }
 
 
+#define POOL_MARGIN 16u
+#define POOL_CONC_RESERVE (POOL_MARGIN + MAX_VCPUS * 4u)
+
+static inline bool pool_slab_enabled(void) {
+    u32 limit = c->pool_limit ? c->pool_limit : POOL_PAGES;
+    return smp && !c->global_mon_lock && limit >= 1024u;
+}
+
+static void pool_drain_all_slabs(void) {
+    LOCK_REQUIRED();
+    u32 ncpus = smp ? c0->vcpu_count : 1u;
+    for (u32 cpu = 0; cpu < ncpus; cpu++) {
+        MonCpu *m = (MonCpu *)(PRIV_VA + OFF_MON_CPU + (u64)cpu * CTX_SLOT);
+        while (m->pool_slab_cnt) {
+            u32 idx = m->pool_slab[--m->pool_slab_cnt];
+            *(u32 *)pool_page(idx) = pool_free_head;
+            pool_free_head = idx + 1u;
+            pool_free_count++;
+        }
+    }
+}
+
+static bool pool_pop_page_concurrent(u32 *idx_out) {
+    LOCK_OR_READ_REQUIRED();
+    if (me->pool_slab_cnt) {
+        *idx_out = me->pool_slab[--me->pool_slab_cnt];
+        return true;
+    }
+    u32 limit = c->pool_limit ? c->pool_limit : POOL_PAGES;
+    pool_alloc_lock_acquire();
+    u32 avail = pool_free_count + (limit > pool_next ? limit - pool_next : 0u);
+    if (avail <= POOL_CONC_RESERVE) {
+        pool_alloc_lock_release();
+        return false;
+    }
+    u32 want = pool_slab_enabled() ? POOL_SLAB_BATCH : 1u;
+    u32 can = avail - POOL_CONC_RESERVE;
+    if (want > can)
+        want = can;
+    u32 got = 0, first = 0;
+    while (got < want) {
+        u32 idx;
+        if (pool_free_head) {
+            idx = pool_free_head - 1u;
+            pool_free_head = *(u32 *)pool_page(idx);
+            pool_free_count--;
+        } else if (pool_next < limit) {
+            idx = pool_next++;
+        } else {
+            break;
+        }
+        if (got == 0) {
+            first = idx;
+        } else if (me->pool_slab_cnt < POOL_SLAB_CAP) {
+            me->pool_slab[me->pool_slab_cnt++] = idx;
+        } else {
+            *(u32 *)pool_page(idx) = pool_free_head;
+            pool_free_head = idx + 1u;
+            pool_free_count++;
+            break;
+        }
+        got++;
+    }
+    pool_alloc_lock_release();
+    if (!got)
+        return false;
+    *idx_out = first;
+    return true;
+}
+
+static void pool_push_page_concurrent(u32 idx) {
+    LOCK_OR_READ_REQUIRED();
+    if (pool_slab_enabled()) {
+        if (me->pool_slab_cnt < POOL_SLAB_CAP) {
+            me->pool_slab[me->pool_slab_cnt++] = idx;
+            return;
+        }
+        pool_alloc_lock_acquire();
+        *(u32 *)pool_page(idx) = pool_free_head;
+        pool_free_head = idx + 1u;
+        pool_free_count++;
+        for (u32 k = 0; k < POOL_SLAB_BATCH && me->pool_slab_cnt; k++) {
+            u32 p = me->pool_slab[--me->pool_slab_cnt];
+            *(u32 *)pool_page(p) = pool_free_head;
+            pool_free_head = p + 1u;
+            pool_free_count++;
+        }
+        pool_alloc_lock_release();
+        return;
+    }
+    pool_alloc_lock_acquire();
+    *(u32 *)pool_page(idx) = pool_free_head;
+    pool_free_head = idx + 1u;
+    pool_free_count++;
+    pool_alloc_lock_release();
+}
+
 static u32 pool_alloc(u32 view, u32 level, u64 guest_table, u64 va_base) {
     LOCK_REQUIRED();
+    u32 limit = c->pool_limit ? c->pool_limit : POOL_PAGES;
     u32 idx;
-    if (pool_free_head) {
+    if (me->pool_slab_cnt) {
+        idx = me->pool_slab[--me->pool_slab_cnt];
+    } else if (pool_free_head) {
         idx = pool_free_head - 1;
         pool_free_head = *(u32 *)pool_page(idx);
         pool_free_count--;
-    } else if (pool_next < (c->pool_limit ? c->pool_limit : POOL_PAGES)) {
+    } else if (pool_next < limit) {
         idx = pool_next++;
     } else {
-        stop(STOP_SHADOW_FULL, 0, 1, pool_next, 0); // pool_reclaim runs first on every path that allocates
+        pool_drain_all_slabs();
+        if (pool_free_head) {
+            idx = pool_free_head - 1;
+            pool_free_head = *(u32 *)pool_page(idx);
+            pool_free_count--;
+        } else {
+            stop(STOP_SHADOW_FULL, 0, 1, pool_next, 0); // pool_reclaim runs first on every path that allocates
+        }
     }
     memset(pool_page(idx), 0, 4096);
     ShadowDesc *d = &desc[idx];
@@ -469,71 +873,189 @@ static bool guest_write(u64 va, const void *in, u32 n, u32 access) {
 }
 
 // ---- rmap: who maps this frame writable ----
-static void rmap_add(u64 gpa, u64 *pte) {
+static inline bool rmap_slab_enabled(void) {
+    return smp && !c->global_mon_lock;
+}
+
+static void rmap_drain_all_slabs(void) {
     LOCK_REQUIRED();
-    u32 node;
-    if (rmap_free) {
-        node = rmap_free;
-        rmap_free = rmap_nodes[node].next;
-        rmap_free_count--;
-    } else {
-        if (rmap_next >= RMAP_NODES)
-            stop(STOP_SHADOW_FULL, 0, 2, 0, 0);
-        node = rmap_next++;
+    u32 ncpus = smp ? c0->vcpu_count : 1u;
+    for (u32 cpu = 0; cpu < ncpus; cpu++) {
+        MonCpu *m = (MonCpu *)(PRIV_VA + OFF_MON_CPU + (u64)cpu * CTX_SLOT);
+        while (m->rmap_slab_cnt) {
+            u32 node = m->rmap_slab[--m->rmap_slab_cnt];
+            rmap_nodes[node].next = rmap_free;
+            rmap_free = node;
+            rmap_free_count++;
+        }
     }
+}
+
+static u32 rmap_node_alloc_try(void) {
+    LOCK_OR_READ_REQUIRED();
+    if (me->rmap_slab_cnt)
+        return me->rmap_slab[--me->rmap_slab_cnt];
+    rmap_alloc_lock_acquire();
+    u32 want = rmap_slab_enabled() ? RMAP_SLAB_BATCH : 1u;
+    u32 first = 0, got = 0;
+    while (got < want) {
+        u32 node = 0;
+        if (rmap_free) {
+            node = rmap_free;
+            rmap_free = rmap_nodes[node].next;
+            rmap_free_count--;
+        } else if (rmap_next < RMAP_NODES) {
+            node = rmap_next++;
+        } else {
+            break;
+        }
+        if (got == 0)
+            first = node;
+        else if (me->rmap_slab_cnt < RMAP_SLAB_CAP)
+            me->rmap_slab[me->rmap_slab_cnt++] = node;
+        else {
+            rmap_nodes[node].next = rmap_free;
+            rmap_free = node;
+            rmap_free_count++;
+            break;
+        }
+        got++;
+    }
+    rmap_alloc_lock_release();
+    if (!first && (!smp || me->lock_depth)) {
+        rmap_drain_all_slabs();
+        if (rmap_free) {
+            first = rmap_free;
+            rmap_free = rmap_nodes[first].next;
+            rmap_free_count--;
+        }
+    }
+    return first;
+}
+
+static void rmap_node_free(u32 node) {
+    if (!node)
+        return;
+    if (rmap_slab_enabled()) {
+        if (me->rmap_slab_cnt < RMAP_SLAB_CAP) {
+            me->rmap_slab[me->rmap_slab_cnt++] = node;
+            return;
+        }
+        rmap_alloc_lock_acquire();
+        rmap_nodes[node].next = rmap_free;
+        rmap_free = node;
+        rmap_free_count++;
+        for (u32 k = 0; k < RMAP_SLAB_BATCH && me->rmap_slab_cnt; k++) {
+            u32 n = me->rmap_slab[--me->rmap_slab_cnt];
+            rmap_nodes[n].next = rmap_free;
+            rmap_free = n;
+            rmap_free_count++;
+        }
+        rmap_alloc_lock_release();
+        return;
+    }
+    rmap_nodes[node].next = rmap_free;
+    rmap_free = node;
+    rmap_free_count++;
+}
+
+static inline void rmap_insert_node(u64 gpa, u64 *pte, u32 node) {
     u32 fr = (u32)(gpa >> 12);
     rmap_nodes[node].pte = (u32)(((u64)pte - POOL_VA) >> 3);
+    rmap_lock_acquire(rmap_lock_bucket(fr));
     rmap_nodes[node].next = rmap_head[fr];
     rmap_head[fr] = node;
+    rmap_lock_release();
 }
+
+static void rmap_add(u64 gpa, u64 *pte) {
+    LOCK_OR_READ_REQUIRED();
+    u32 node = rmap_node_alloc_try();
+    if (!node)
+        stop(STOP_SHADOW_FULL, 0, 2, 0, 0);
+    rmap_insert_node(gpa, pte, node);
+}
+
 static void rmap_remove(u64 gpa, u64 *pte) {
+    LOCK_OR_READ_REQUIRED();
     u32 fr = (u32)(gpa >> 12), want = (u32)(((u64)pte - POOL_VA) >> 3);
+    u32 dead = 0;
+    rmap_lock_acquire(rmap_lock_bucket(fr));
     u32 *link = &rmap_head[fr];
     while (*link) {
         RmapNode *n = &rmap_nodes[*link];
         if (n->pte == want) {
-            u32 dead = *link;
+            dead = *link;
             *link = n->next;
-            n->next = rmap_free;
-            rmap_free = dead;
-            rmap_free_count++;
-            return;
+            break;
         }
         link = &n->next;
     }
+    rmap_lock_release();
+    if (dead)
+        rmap_node_free(dead);
 }
-static void rmap2m_add(u64 base_gpa, u64 *pte) {
-    LOCK_REQUIRED();
-    u32 node;
+
+static u32 rmap2m_node_alloc_try(void) {
+    LOCK_OR_READ_REQUIRED();
+    rmap2m_alloc_lock_acquire();
+    u32 node = 0;
     if (rmap2m_free) {
         node = rmap2m_free;
         rmap2m_free = rmap2m_nodes[node].next;
         rmap2m_free_count--;
-    } else {
-        if (rmap2m_next >= RMAP2M_NODES)
-            stop(STOP_SHADOW_FULL, 0, 2, 0, 0);
+    } else if (rmap2m_next < RMAP2M_NODES) {
         node = rmap2m_next++;
     }
+    rmap2m_alloc_lock_release();
+    return node;
+}
+
+static void rmap2m_node_free(u32 node) {
+    if (!node)
+        return;
+    rmap2m_alloc_lock_acquire();
+    rmap2m_nodes[node].next = rmap2m_free;
+    rmap2m_free = node;
+    rmap2m_free_count++;
+    rmap2m_alloc_lock_release();
+}
+
+static inline void rmap2m_insert_node(u64 base_gpa, u64 *pte, u32 node) {
     u32 fr2m = (u32)(base_gpa >> 21);
     rmap2m_nodes[node].pte = (u32)(((u64)pte - POOL_VA) >> 3);
+    rmap2m_lock_acquire(rmap2m_lock_bucket(fr2m));
     rmap2m_nodes[node].next = rmap2m_head[fr2m];
     rmap2m_head[fr2m] = node;
+    rmap2m_lock_release();
 }
+
+static void rmap2m_add(u64 base_gpa, u64 *pte) {
+    LOCK_OR_READ_REQUIRED();
+    u32 node = rmap2m_node_alloc_try();
+    if (!node)
+        stop(STOP_SHADOW_FULL, 0, 2, 0, 0);
+    rmap2m_insert_node(base_gpa, pte, node);
+}
+
 static void rmap2m_remove(u64 base_gpa, u64 *pte) {
+    LOCK_OR_READ_REQUIRED();
     u32 fr2m = (u32)(base_gpa >> 21), want = (u32)(((u64)pte - POOL_VA) >> 3);
+    u32 dead = 0;
+    rmap2m_lock_acquire(rmap2m_lock_bucket(fr2m));
     u32 *link = &rmap2m_head[fr2m];
     while (*link) {
         RmapNode *n = &rmap2m_nodes[*link];
         if (n->pte == want) {
-            u32 dead = *link;
+            dead = *link;
             *link = n->next;
-            n->next = rmap2m_free;
-            rmap2m_free = dead;
-            rmap2m_free_count++;
-            return;
+            break;
         }
         link = &n->next;
     }
+    rmap2m_lock_release();
+    if (dead)
+        rmap2m_node_free(dead);
 }
 
 static inline u64 *rmap_pte(u32 v) { return (u64 *)(POOL_VA + (u64)v * 8); }
@@ -561,6 +1083,7 @@ static void break_cont_group(u64 *pte, const ShadowDesc *d, bool remove_self_rma
 
 // Clears writability of every shadow mapping of this frame (4 KiB, 64 KiB PTE_CONT, and 2 MiB L2 Block).
 static void write_protect_frame(u64 gpa) {
+    LOCK_REQUIRED();
     u32 fr = (u32)(gpa >> 12);
     u32 it = rmap_head[fr];
     rmap_head[fr] = 0;
@@ -989,7 +1512,6 @@ static void zap_entry(u64 *e, const ShadowDesc *d);
 
 // Every path that allocates shadow tables comes through here first, while it holds no pointer into them. Old views go first; if the running
 // view and the keepers fill the pool alone, their shadows are dropped and refill on demand, and their translations go with their marks.
-#define POOL_MARGIN 16
 static void shadow_drop_all(void) {
     for (u32 i = 0; i < view_count; i++) {
         if (!views[i].valid)
@@ -1011,7 +1533,10 @@ static void shadow_drop_all(void) {
 }
 
 static void pool_reclaim(void) {
+    LOCK_REQUIRED();
     u32 limit = c->pool_limit ? c->pool_limit : POOL_PAGES;
+    if (pool_free_count + (limit > pool_next ? limit - pool_next : 0) < POOL_MARGIN)
+        pool_drain_all_slabs();
     while (pool_free_count + (limit > pool_next ? limit - pool_next : 0) < POOL_MARGIN) {
         c->stat_pool_reclaim++;
         zap_why = KILL_RECLAIM;
@@ -1266,7 +1791,9 @@ static u64 *shadow_slot(View *v, u64 va, const Walk *w, int leaf_level_target, u
             *e = VA_TO_IPA((u64)pool_page(idx)) | PTE_VALID;
         }
         table_va = IPA_TO_VA(*e & PTE_ADDR);
-        desc[pool_index((void *)table_va)].writes = 0;
+        ShadowDesc *td = &desc[pool_index((void *)table_va)];
+        if (td->writes)
+            td->writes = 0;
     }
     return &((u64 *)table_va)[(va >> (12 + 9 * leaf_level_target)) & 0x1ff];
 }
@@ -1325,14 +1852,23 @@ static bool try_install_cont_64k(const Walk *w, u64 va, u64 *slot, u64 gpa, bool
             return false;
         writable = all_rw;
     }
-    if (writable && (u64)rmap_free_count + (RMAP_NODES - rmap_next) < 64)
-        return false;
+    u32 nodes[16];
+    if (writable) {
+        for (u32 k = 0; k < 16; k++) {
+            nodes[k] = rmap_node_alloc_try();
+            if (!nodes[k]) {
+                for (u32 j = 0; j < k; j++)
+                    rmap_node_free(nodes[j]);
+                return false;
+            }
+        }
+    }
     u64 attr = PTE_VALID | PTE_CONT | PTE_AF | PTE_SH | PTE_NG | PTE_PXN | PTE_UXN | (writable ? AP_RW : AP_RO);
     for (u32 k = 0; k < 16; k++) {
         u64 kgpa = base64_gpa + ((u64)k << 12);
         grp[k] = kgpa | attr;
         if (writable)
-            rmap_add(kgpa, &grp[k]);
+            rmap_insert_node(kgpa, &grp[k], nodes[k]);
     }
     c->stat_hp_64k_fills++;
     return true;
@@ -1829,7 +2365,7 @@ static inline void mmu_xmark_zap(u64 old, u32 view) {
         c->stat_mmu_xmark_zaps[zap_why * 4 + (views[view].keeper != 0) * 2 + (old & 1)]++;
 }
 
-static bool in_zap_table;
+#define in_zap_table (me->in_zap_table_local)
 
 static void zap_entry(u64 *e, const ShadowDesc *d) {
     u64 v = *e;
@@ -2425,7 +2961,7 @@ static inline void mmu_observe_store(u32 kind, u64 before, u64 after) {
 
 static inline bool walk_still_valid(const Walk *w) {
     for (int l = 3; l >= w->leaf_level; l--) {
-        if ((*w->chain[l] & ~X_A) != (w->read[l] & ~X_A))
+        if ((__atomic_load_n(w->chain[l], __ATOMIC_ACQUIRE) & ~X_A) != (w->read[l] & ~X_A))
             return false;
     }
     return true;
@@ -2473,6 +3009,757 @@ static void hybrid_apic_eoi_fast(bool *did_fast) {
     }
     if (did_fast)
         *did_fast = fast_ok;
+}
+
+static void shadow_prefetch_l0(const Walk *w, u64 far, u64 *installed, u8 pi) {
+    if (is_block_desc(*installed) || (pi & PI_DIRECT) || (w->leaf_level != 0 && w->leaf_level != 1))
+        return;
+    u64 *shadow_l0 = (u64 *)((u64)installed & ~0xfffULL);
+    u32 idx = (u32)((far >> 12) & 0x1ffu);
+    u32 win_start = idx & ~31u, win_end = win_start + 32u;
+    if (!(c->hugepages_disabled & 2u)) {
+        // Also try coalescing the sibling 64 KiB half of this 128 KiB window into PTE_CONT before 4 KiB prefetch.
+        u32 other = (idx & ~15u) ^ 16u;
+        if (!shadow_l0[other]) {
+            u64 other_va = (far & ~0x1fffffULL) | ((u64)other << 12);
+            if (w->leaf_level == 0) {
+                u64 *guest_l0 = (u64 *)((u64)w->leaf & ~0xfffULL);
+                u64 ge = __atomic_load_n(&guest_l0[other], __ATOMIC_RELAXED);
+                if ((ge & (X_P | X_A)) == (X_P | X_A) && (c->cpl != 3 || (ge & X_US)))
+                    try_install_cont_64k(w, other_va, &shadow_l0[other], ge & X_ADDR, false);
+            } else {
+                u64 other_gpa = (w->gpa & ~0x1fffffULL) + ((u64)other << 12);
+                try_install_cont_64k(w, other_va, &shadow_l0[other], other_gpa, false);
+            }
+        }
+    }
+    if (w->leaf_level == 0) {
+        u64 *guest_l0 = (u64 *)((u64)w->leaf & ~0xfffULL);
+        bool upper_write = ((w->read[3] & w->read[2] & w->read[1] & X_RW) != 0) ||
+                           (c->cpl != 3 && !(c->cr0 & (1ULL << 16)));
+        for (u32 j = win_start; j < win_end; j++) {
+            if (j == idx || shadow_l0[j])
+                continue;
+            u64 ge = __atomic_load_n(&guest_l0[j], __ATOMIC_RELAXED);
+            if ((ge & (X_P | X_A)) != (X_P | X_A))
+                continue;
+            if (c->cpl == 3 && !(ge & X_US))
+                continue;
+            u64 ngpa = ge & X_ADDR;
+            if (ngpa >= c->ram_size)
+                continue;
+            u8 npi = page_info[ngpa >> 12];
+            if (!(npi & PI_RAM))
+                continue;
+            bool nwritable = upper_write && (ge & X_RW) && (ge & X_D) && !(npi & (PI_CODE | PI_PT));
+            u32 pnode = 0;
+            if (nwritable && !(npi & PI_DIRECT)) {
+                pnode = rmap_node_alloc_try();
+                if (!pnode)
+                    nwritable = false;
+            }
+            shadow_l0[j] = ngpa | PTE_VALID | PTE_AF | PTE_SH | PTE_NG | PTE_PXN | PTE_UXN | (nwritable ? AP_RW : AP_RO);
+            if (pnode)
+                rmap_insert_node(ngpa, &shadow_l0[j], pnode);
+        }
+    } else {
+        u64 base_gpa = w->gpa & ~0x1fffffULL;
+        bool lw = w->write && w->dirty;
+        for (u32 j = win_start; j < win_end; j++) {
+            if (j == idx || shadow_l0[j])
+                continue;
+            u64 ngpa = base_gpa + ((u64)j << 12);
+            if (ngpa >= c->ram_size)
+                continue;
+            u8 npi = page_info[ngpa >> 12];
+            if (!(npi & PI_RAM))
+                continue;
+            bool nwritable = lw && !(npi & (PI_CODE | PI_PT));
+            u32 pnode = 0;
+            if (nwritable && !(npi & PI_DIRECT)) {
+                pnode = rmap_node_alloc_try();
+                if (!pnode)
+                    nwritable = false;
+            }
+            shadow_l0[j] = ngpa | PTE_VALID | PTE_AF | PTE_SH | PTE_NG | PTE_PXN | PTE_UXN | (nwritable ? AP_RW : AP_RO);
+            if (pnode)
+                rmap_insert_node(ngpa, &shadow_l0[j], pnode);
+        }
+    }
+}
+
+static inline void shadow_init_l0_concurrent(u32 idx, u32 vi, u64 gt, u64 va_base, u64 *l1_slot) {
+    memset(pool_page(idx), 0, 4096);
+    ShadowDesc *d = &desc[idx];
+    d->guest_table = gt;
+    d->va_base = va_base;
+    d->view = vi;
+    d->level = 0;
+    d->next_mirror = 0;
+    d->writes = 0;
+    d->parent = l1_slot;
+    if (gt != ~0ULL && gt < c->ram_size) {
+        u32 fr = (u32)(gt >> 12);
+        d->next_mirror = mirror_head[fr];
+        mirror_head[fr] = idx + 1u;
+    }
+    __asm__ volatile("dsb ishst" : : : "memory");
+    __atomic_store_n(l1_slot, VA_TO_IPA((u64)pool_page(idx)) | PTE_VALID, __ATOMIC_RELEASE);
+}
+
+// Concurrent shadow fill under mon_read_lock + per-(view, 2 MiB) pt_lock (+ per-vCPU pool/rmap slabs).
+// Returns true if the fault was completely handled (or should retry); returns false to fall back to exclusive mon_lock().
+static bool handle_data_abort_fill_concurrent(View *v, u64 far, const Walk *w_in, u32 access, bool write, bool perm) {
+    Walk lw = *w_in;
+    Walk *wp = &lw;
+    u32 vi = (u32)(v - views);
+    mon_read_lock();
+    u64 gt_root = v->cr3 & X_ADDR;
+    if (gt_root < c->ram_size && !(__atomic_load_n(&page_info[gt_root >> 12], __ATOMIC_ACQUIRE) & PI_PT)) {
+        mon_read_unlock();
+        return false;
+    }
+    // Walk existing upper shadow levels L3 -> L2 -> L1 (immutable while mon_read_lock is held).
+    u64 table_va = (far >> 47) ? v->root1 : v->root0;
+    u64 v3 = __atomic_load_n(&((u64 *)table_va)[(far >> 39) & 0x1ff], __ATOMIC_ACQUIRE);
+    if (!is_table_desc(v3)) {
+        mon_read_unlock();
+        return false;
+    }
+    u64 l2_va = IPA_TO_VA(v3 & PTE_ADDR);
+    ShadowDesc *d2 = &desc[pool_index((void *)l2_va)];
+    if (__atomic_load_n(&d2->writes, __ATOMIC_RELAXED))
+        __atomic_store_n(&d2->writes, 0u, __ATOMIC_RELAXED);
+    u64 v2 = __atomic_load_n(&((u64 *)l2_va)[(far >> 30) & 0x1ff], __ATOMIC_ACQUIRE);
+    if (!is_table_desc(v2)) {
+        mon_read_unlock();
+        return false;
+    }
+    u64 l1_va = IPA_TO_VA(v2 & PTE_ADDR);
+    ShadowDesc *d1 = &desc[pool_index((void *)l1_va)];
+    if (__atomic_load_n(&d1->writes, __ATOMIC_RELAXED))
+        __atomic_store_n(&d1->writes, 0u, __ATOMIC_RELAXED);
+    u64 *l1_slot = &((u64 *)l1_va)[(far >> 21) & 0x1ff];
+
+    // If L1 slot needs a brand-new L0 table mirroring a guest L0 table frame, acquire mirror_lock BEFORE pt_lock (Level 1 -> Level 2).
+    u64 l1_peek = __atomic_load_n(l1_slot, __ATOMIC_ACQUIRE);
+    bool want_2m_peek = wp->leaf_level >= 1 && !(c->hugepages_disabled & 1u) && chunk_2m_clean_ram(wp->gpa & ~0x1fffffULL);
+    u64 held_gt = ~0ULL;
+    if (!want_2m_peek && !is_table_desc(l1_peek)) {
+        u64 gt = wp->leaf_level == 0 ? (wp->read[1] & X_ADDR) : ~0ULL;
+        if (gt != ~0ULL && gt < c->ram_size) {
+            if (!(__atomic_load_n(&page_info[gt >> 12], __ATOMIC_ACQUIRE) & PI_PT)) {
+                mon_read_unlock();
+                return false; // needs brand-new PI_PT write-protection + tracked_new under exclusive lock
+            }
+            mirror_lock_acquire(mirror_lock_bucket((u32)(gt >> 12)));
+            held_gt = gt;
+        }
+    }
+
+    pt_lock_acquire_one(pt_lock_bucket(vi, far >> 21));
+
+    if (!walk_still_valid(wp)) {
+        MmuWalkSample ws = mmu_walk_begin(true);
+        *wp = x86_walk(c->cr3, far, access, true);
+        mmu_walk_end(true, ws);
+        if (!wp->ok || (!is_ram(wp->gpa) && !is_direct(wp->gpa))) {
+            pt_locks_release_all();
+            mirror_lock_release();
+            mon_read_unlock();
+            return true; // retry guest access
+        }
+    }
+
+    u64 gpa = wp->gpa & ~0xfffULL;
+    u8 pi = gpa < PRIV_IPA ? __atomic_load_n(&page_info[gpa >> 12], __ATOMIC_ACQUIRE) : 0;
+    if (write && (pi & (PI_CODE | PI_PT))) {
+        pt_locks_release_all();
+        mirror_lock_release();
+        mon_read_unlock();
+        return false;
+    }
+
+    // Path A: 2 MiB L2 Block install / upgrade.
+    if (wp->leaf_level >= 1 && !(c->hugepages_disabled & 1u)) {
+        u64 base_gpa = wp->gpa & ~0x1fffffULL;
+        if (chunk_2m_clean_ram(base_gpa)) {
+            u64 old1 = *l1_slot;
+            if (!(old1 & 1) || is_block_desc(old1)) {
+                if (is_block_desc(old1) && (old1 & PTE_ADDR) == base_gpa &&
+                    (!write || (old1 & AP_RO) == AP_RW)) {
+                    if (perm) {
+                        c->stat_dirty++;
+                        tlbi_va(view_asid(vi), far & ~0x1fffffULL);
+                    } else {
+                        c->stat_fills++;
+                        __asm__ volatile("dsb ishst");
+                    }
+                    pt_locks_release_all();
+                    mirror_lock_release();
+                    mon_read_unlock();
+                    return true;
+                }
+                bool writable = wp->write && wp->dirty;
+                bool was_rw = is_block_desc(old1) && (old1 & AP_RO) == AP_RW && (old1 & PTE_ADDR) == base_gpa;
+                u32 rnode2m = (writable && !was_rw) ? rmap2m_node_alloc_try() : 0u;
+                if (!writable || was_rw || rnode2m != 0u) {
+                    if (is_block_desc(old1) && (old1 & PTE_ADDR) != base_gpa) {
+                        if ((old1 & AP_RO) == AP_RW && (old1 & PTE_ADDR) < c->ram_size)
+                            rmap2m_remove(old1 & PTE_ADDR, l1_slot);
+                        *l1_slot = 0;
+                        tlbi_va(view_asid(vi), far & ~0x1fffffULL);
+                        old1 = 0;
+                        was_rw = false;
+                    }
+                    *l1_slot = base_gpa | PTE_BLOCK | PTE_AF | PTE_SH | PTE_NG | PTE_PXN | PTE_UXN | (writable ? AP_RW : AP_RO);
+                    if (writable && !was_rw)
+                        rmap2m_insert_node(base_gpa, l1_slot, rnode2m);
+                    else if (!writable && was_rw)
+                        rmap2m_remove(base_gpa, l1_slot);
+                    if (!(old1 & 1))
+                        c->stat_hp_2m_fills++;
+                    if (perm) {
+                        c->stat_dirty++;
+                        tlbi_va(view_asid(vi), far & ~0x1fffffULL);
+                    } else {
+                        c->stat_fills++;
+                        __asm__ volatile("dsb ishst");
+                    }
+                    pt_locks_release_all();
+                    mirror_lock_release();
+                    mon_read_unlock();
+                    return true;
+                }
+            }
+        }
+    }
+
+    // Path B: L0 Shadow Table (4 KiB / 64 KiB PTE_CONT + 32-page prefetch).
+    u64 l1e = *l1_slot;
+    if (!is_table_desc(l1e)) {
+        u64 gt = wp->leaf_level == 0 ? (wp->read[1] & X_ADDR) : ~0ULL;
+        if (gt != ~0ULL && gt < c->ram_size && gt != held_gt) {
+            pt_locks_release_all();
+            mirror_lock_release();
+            mon_read_unlock();
+            return false; // need mirror_lock(gt) before pt_lock
+        }
+        u32 idx;
+        if (!pool_pop_page_concurrent(&idx)) {
+            pt_locks_release_all();
+            mirror_lock_release();
+            mon_read_unlock();
+            return false; // pool low: fall back to mon_lock() -> pool_reclaim()
+        }
+        if (is_block_desc(l1e)) {
+            // Break-Before-Make Zap-on-Split of existing 2 MiB L2 Block before publishing L0 child table.
+            if ((l1e & AP_RO) == AP_RW && (l1e & PTE_ADDR) < c->ram_size)
+                rmap2m_remove(l1e & PTE_ADDR, l1_slot);
+            *l1_slot = 0;
+            tlbi_va(view_asid(vi), far & ~0x1fffffULL);
+            c->stat_hp_2m_splits++;
+        }
+        shadow_init_l0_concurrent(idx, vi, gt, far & ~0x1fffffULL, l1_slot);
+        l1e = *l1_slot;
+    }
+    mirror_lock_release();
+
+    u64 *shadow_l0 = (u64 *)IPA_TO_VA(l1e & PTE_ADDR);
+    ShadowDesc *d0 = &desc[pool_index(shadow_l0)];
+    if (__atomic_load_n(&d0->writes, __ATOMIC_RELAXED))
+        __atomic_store_n(&d0->writes, 0u, __ATOMIC_RELAXED);
+    u64 *slot = &shadow_l0[(far >> 12) & 0x1ffu];
+    u64 old = *slot;
+    bool writable = wp->write && wp->dirty && !(pi & (PI_CODE | PI_PT));
+    bool need_rmap = writable && gpa < c->ram_size && !(pi & PI_DIRECT);
+    u32 rnode = 0;
+
+    if ((old & 1) && (old & PTE_CONT)) {
+        if ((old & PTE_ADDR) == gpa && (!write || (old & AP_RO) == AP_RW)) {
+            if (perm) {
+                c->stat_dirty++;
+                tlbi_va(view_asid(vi), far);
+            } else {
+                shadow_prefetch_l0(wp, far, slot, pi);
+                c->stat_fills++;
+                __asm__ volatile("dsb ishst");
+            }
+            pt_locks_release_all();
+            mon_read_unlock();
+            return true;
+        }
+        if (need_rmap) {
+            rnode = rmap_node_alloc_try();
+            if (!rnode) {
+                pt_locks_release_all();
+                mon_read_unlock();
+                return false;
+            }
+        }
+        break_cont_group(slot, d0, true);
+        old = *slot;
+    }
+
+    if (!old && !(c->hugepages_disabled & 2u) && !(pi & PI_DIRECT) &&
+        try_install_cont_64k(wp, far, slot, gpa, write)) {
+        if (rnode)
+            rmap_node_free(rnode);
+    } else {
+        bool was_rw = (old & 1) && (old & AP_RO) == AP_RW && (old & PTE_ADDR) == gpa;
+        if (need_rmap && !was_rw && !rnode) {
+            rnode = rmap_node_alloc_try();
+            if (!rnode) {
+                pt_locks_release_all();
+                mon_read_unlock();
+                return false;
+            }
+        }
+        u64 pte = gpa | PTE_VALID | PTE_AF | PTE_SH | PTE_NG | PTE_PXN | PTE_UXN | (old & PTE_X_MARK) | (writable ? AP_RW : AP_RO);
+        if ((old & 1) && (old & AP_RO) == AP_RW && (old & PTE_ADDR) != gpa)
+            rmap_remove(old & PTE_ADDR, slot);
+        *slot = pte;
+        if (need_rmap && !was_rw) {
+            rmap_insert_node(gpa, slot, rnode);
+            rnode = 0;
+        }
+        if (rnode)
+            rmap_node_free(rnode);
+    }
+
+    if (perm) {
+        c->stat_dirty++;
+        tlbi_va(view_asid(vi), far);
+    } else {
+        shadow_prefetch_l0(wp, far, slot, pi);
+        c->stat_fills++;
+        __asm__ volatile("dsb ishst");
+    }
+    pt_locks_release_all();
+    mon_read_unlock();
+    return true;
+}
+
+static inline void mirror_unlink_locked(u32 fr, u32 idx) {
+    u32 *link = &mirror_head[fr];
+    while (*link) {
+        if (*link == idx + 1u) {
+            *link = desc[idx].next_mirror;
+            desc[idx].next_mirror = 0;
+            return;
+        }
+        link = &desc[*link - 1u].next_mirror;
+    }
+}
+
+static inline void l0_scan_page(const u64 *t, bool *has_xmark, bool *has_rw) {
+    u64 or_all = 0, any_rw = 0;
+    for (u32 j = 0; j < 512u; j++) {
+        u64 e = t[j];
+        or_all |= e;
+        any_rw |= (u64)((e & (1ULL | AP_RO)) == (1ULL | AP_RW));
+    }
+    *has_xmark = (or_all & PTE_X_MARK) != 0;
+    *has_rw = any_rw != 0;
+}
+
+static void l0_deferred_cleanup(u32 idx, bool has_rw) {
+    if (has_rw) {
+        u64 *t = pool_page(idx);
+        for (u32 j = 0; j < 512u; j++) {
+            u64 sv = t[j];
+            if ((sv & (1ULL | AP_RO)) == (1ULL | AP_RW) && (sv & PTE_ADDR) < c->ram_size)
+                rmap_remove(sv & PTE_ADDR, &t[j]);
+        }
+    }
+    pool_push_page_concurrent(idx);
+}
+
+// Concurrent PI_PT 64-bit guest page-table write (plain aligned 8B store / 64-bit CAS / SWP / LSE).
+// Supports:
+//   - Level-0 (PT) leaf updates + concurrent pt_flood / nobody_home L0 unshadow (when zero PTE_X_MARK),
+//   - Level-1 (PD) 2 MiB L2 Block zap + concurrent child L0 table unshadow (when zero PTE_X_MARK).
+// Runs under mon_read_lock + ascending mirror_locks + ascending pt_locks, deferring 512-entry rmap_remove
+// and pool_slab return until after pt_locks & mirror_locks are released (still under mon_read_lock).
+static bool handle_data_abort_pt_write_concurrent(u64 far, const Walk *w_in, u32 access) {
+    Walk lw = *w_in;
+    Walk *wp = &lw;
+    if (!is_ram(wp->gpa) || (wp->gpa & 7ULL))
+        return false;
+    u32 word = *(u32 *)c->elr;
+    ArmAccess a;
+    u32 kind = 0; // 1=plain64, 2=cas64, 3=swp64, 4=lse64
+    if (arm_decode(word, &a) && !a.load && a.bytes == 8 && !arm_splits(arm_address(word, &a), &a)) {
+        kind = 1u;
+    } else if ((word & 0xFFE0FC00u) == 0xC8E0FC00u) {
+        kind = 2u;
+    } else if ((word & 0xFFE0FC00u) == 0xF8E08000u) {
+        kind = 3u;
+    } else if ((word & 0xFF20CC00u) == 0xF8200000u && !(far & 7ULL)) {
+        kind = 4u;
+    } else {
+        return false;
+    }
+
+    mon_read_lock();
+    if (!walk_still_valid(wp)) {
+        MmuWalkSample ws = mmu_walk_begin(true);
+        *wp = x86_walk(c->cr3, far, access, true);
+        mmu_walk_end(true, ws);
+        if (!wp->ok || (!is_ram(wp->gpa) && !is_direct(wp->gpa))) {
+            mon_read_unlock();
+            return true; // retry guest access
+        }
+        if (!is_ram(wp->gpa) || (wp->gpa & 7ULL)) {
+            mon_read_unlock();
+            return false;
+        }
+    }
+    u32 fr = (u32)(wp->gpa >> 12);
+    u8 pi = __atomic_load_n(&page_info[fr], __ATOMIC_ACQUIRE);
+    if (!(pi & PI_PT) || (pi & PI_CODE)) {
+        mon_read_unlock();
+        return false;
+    }
+    u32 slot_i = (u32)((wp->gpa & 0xfffULL) >> 3);
+    u64 *slot8 = (u64 *)RAM(wp->gpa);
+
+    // Determine Level-1 mirror_locks in strictly ascending order.
+    // For a level-1 (PD) write whose guest PDE currently points to a RAM L0 table, acquire both
+    // mirror_lock(fr) and mirror_lock(child_gt) up front before any Level-2 pt_lock.
+    u32 b_main = mirror_lock_bucket(fr);
+    u32 m_buckets[2];
+    u32 nm_locks = 1u;
+    m_buckets[0] = b_main;
+    u32 it_peek = __atomic_load_n(&mirror_head[fr], __ATOMIC_ACQUIRE);
+    if (it_peek && __atomic_load_n(&desc[it_peek - 1u].level, __ATOMIC_RELAXED) == 1u) {
+        u64 peek_ge = __atomic_load_n(slot8, __ATOMIC_ACQUIRE);
+        if ((peek_ge & X_P) && !(peek_ge & X_PS)) {
+            u64 cg = peek_ge & X_ADDR;
+            if (cg < c->ram_size) {
+                u32 b_child = mirror_lock_bucket((u32)(cg >> 12));
+                if (b_child < b_main) {
+                    m_buckets[0] = b_child;
+                    m_buckets[1] = b_main;
+                    nm_locks = 2u;
+                } else if (b_child > b_main) {
+                    m_buckets[1] = b_child;
+                    nm_locks = 2u;
+                }
+            }
+        }
+    }
+    mirror_lock_acquire_many(m_buckets, nm_locks);
+
+    u32 it = mirror_head[fr];
+    if (!it) {
+        mirror_locks_release_all();
+        mon_read_unlock();
+        return false; // stale PI_PT cleared in ~100 ns under exclusive mon_lock
+    }
+    u32 m_idx[MAX_CONC_MIRRORS];
+    u64 pt_bmask[PT_LOCK_BUCKETS / 64u];
+    memset(pt_bmask, 0, sizeof(pt_bmask));
+    u32 nm = 0;
+    u32 lvl = desc[it - 1u].level;
+    if (lvl > 1u) {
+        mirror_locks_release_all();
+        mon_read_unlock();
+        return false;
+    }
+    for (; it; it = desc[it - 1u].next_mirror) {
+        if (nm >= MAX_CONC_MIRRORS) {
+            mirror_locks_release_all();
+            mon_read_unlock();
+            return false;
+        }
+        ShadowDesc *d = &desc[it - 1u];
+        if (d->level != lvl) {
+            mirror_locks_release_all();
+            mon_read_unlock();
+            return false;
+        }
+        u32 pb;
+        if (lvl == 1u) {
+            bool nobody_home = d->view != c->view && (d->va_base >> 47) == 0 && !view_pinned(d->view);
+            if (nobody_home || d->writes >= PT_FLOOD_WRITES) {
+                mirror_locks_release_all();
+                mon_read_unlock();
+                return false; // L1 table flood/teardown stays on exclusive mon_lock
+            }
+            pb = pt_lock_bucket(d->view, (d->va_base >> 21) + (u64)slot_i);
+        } else {
+            pb = pt_lock_bucket(d->view, d->va_base >> 21);
+        }
+        pt_bmask[pb >> 6] |= 1ULL << (pb & 63u);
+        m_idx[nm] = it - 1u;
+        nm++;
+    }
+
+    // Acquire all unique pt_locks in strictly ascending order via 128-byte bitset (O(nm + 16)).
+    pt_lock_acquire_bitset(pt_bmask);
+
+    // Pre-mutation safety audit (holding Level 0 + Level 1 + Level 2 locks; guest RAM untouched on bail).
+    u8 m_flags[MAX_CONC_MIRRORS]; // bit 0: nobody_home, bit 1: has_rw
+    u32 m_child_idx[MAX_CONC_MIRRORS];
+    if (lvl == 0u) {
+        for (u32 k = 0; k < nm; k++) {
+            ShadowDesc *d = &desc[m_idx[k]];
+            u64 *t = pool_page(m_idx[k]);
+            bool nobody_home = d->view != c->view && (d->va_base >> 47) == 0 && !view_pinned(d->view);
+            m_flags[k] = nobody_home ? 1u : 0u;
+            m_child_idx[k] = ~0u;
+            bool may_flood = (d->writes >= PT_FLOOD_WRITES) ||
+                             (nobody_home && !(c->keeper_inactive_guard && views[d->view].keeper));
+            if (may_flood) {
+                if (!d->parent || !is_table_desc(*d->parent) || (*d->parent & PTE_ADDR) != VA_TO_IPA((u64)t)) {
+                    pt_locks_release_all();
+                    mirror_locks_release_all();
+                    mon_read_unlock();
+                    return false;
+                }
+                if (views[d->view].sees_shared && (views[d->view].cpl & 4) && d->va_base < (1ULL << 32)) {
+                    pt_locks_release_all();
+                    mirror_locks_release_all();
+                    mon_read_unlock();
+                    return false;
+                }
+                bool has_xmark = false, has_rw = false;
+                l0_scan_page(t, &has_xmark, &has_rw);
+                if (has_xmark) {
+                    pt_locks_release_all();
+                    mirror_locks_release_all();
+                    mon_read_unlock();
+                    return false;
+                }
+                if (has_rw)
+                    m_flags[k] |= 2u;
+            } else if (t[slot_i] & PTE_X_MARK) {
+                pt_locks_release_all();
+                mirror_locks_release_all();
+                mon_read_unlock();
+                return false;
+            }
+        }
+    } else {
+        for (u32 k = 0; k < nm; k++) {
+            ShadowDesc *d = &desc[m_idx[k]];
+            u64 *t = pool_page(m_idx[k]);
+            u64 sv = t[slot_i];
+            m_flags[k] = 0u;
+            m_child_idx[k] = ~0u;
+            if (!sv || is_block_desc(sv))
+                continue;
+            if (!is_table_desc(sv)) {
+                pt_locks_release_all();
+                mirror_locks_release_all();
+                mon_read_unlock();
+                return false;
+            }
+            if (views[d->view].sees_shared && (views[d->view].cpl & 4) && pte_va(&t[slot_i], d) < (1ULL << 32)) {
+                pt_locks_release_all();
+                mirror_locks_release_all();
+                mon_read_unlock();
+                return false;
+            }
+            u32 cidx = pool_index((void *)IPA_TO_VA(sv & PTE_ADDR));
+            ShadowDesc *cd = &desc[cidx];
+            if (cd->level != 0u) {
+                pt_locks_release_all();
+                mirror_locks_release_all();
+                mon_read_unlock();
+                return false;
+            }
+            if (cd->guest_table != ~0ULL && cd->guest_table < c->ram_size) {
+                u32 cb = mirror_lock_bucket((u32)(cd->guest_table >> 12));
+                bool held = false;
+                for (u32 bi = 0; bi < nm_locks; bi++)
+                    if (m_buckets[bi] == cb) { held = true; break; }
+                if (!held) {
+                    pt_locks_release_all();
+                    mirror_locks_release_all();
+                    mon_read_unlock();
+                    return false;
+                }
+            }
+            bool has_xmark = false, has_rw = false;
+            l0_scan_page(pool_page(cidx), &has_xmark, &has_rw);
+            if (has_xmark) {
+                pt_locks_release_all();
+                mirror_locks_release_all();
+                mon_read_unlock();
+                return false;
+            }
+            m_child_idx[k] = cidx;
+            if (has_rw)
+                m_flags[k] |= 2u;
+        }
+    }
+
+    // Execute the atomic 64-bit guest RAM update while holding mirror_locks + all mirrors' pt_locks.
+    u64 old_val = 0, next_val = 0;
+    bool run_zap = false;
+    u32 rs = (word >> 16) & 31u, rt = word & 31u;
+    if (kind == 1u) {
+        u64 val = a.rt == 31 ? 0 : c->x[a.rt];
+        old_val = __atomic_exchange_n(slot8, val, __ATOMIC_SEQ_CST);
+        next_val = val;
+        run_zap = true;
+    } else if (kind == 2u) {
+        u64 rs_v = rs == 31 ? 0 : c->x[rs], rt_v = rt == 31 ? 0 : c->x[rt];
+        u64 expected = rs_v;
+        bool changed = __atomic_compare_exchange_n(slot8, &expected, rt_v, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+        old_val = expected;
+        next_val = changed ? rt_v : old_val;
+        run_zap = next_val != old_val;
+    } else if (kind == 3u) {
+        u64 rs_v = rs == 31 ? 0 : c->x[rs];
+        old_val = __atomic_exchange_n(slot8, rs_v, __ATOMIC_SEQ_CST);
+        next_val = rs_v;
+        run_zap = next_val != old_val;
+    } else {
+        u32 op = (word >> 12) & 3u;
+        u64 v = rs == 31 ? 0 : c->x[rs];
+        old_val = op == 0 ? __atomic_fetch_add(slot8, v, __ATOMIC_SEQ_CST) :
+                  op == 1 ? __atomic_fetch_and(slot8, ~v, __ATOMIC_SEQ_CST) :
+                  op == 2 ? __atomic_fetch_xor(slot8, v, __ATOMIC_SEQ_CST) :
+                            __atomic_fetch_or(slot8, v, __ATOMIC_SEQ_CST);
+        next_val = op == 0 ? old_val + v : op == 1 ? old_val & ~v : op == 2 ? old_val ^ v : old_val | v;
+        run_zap = next_val != old_val;
+    }
+
+    u32 detached_idx[MAX_CONC_MIRRORS];
+    u8 detached_rw[MAX_CONC_MIRRORS];
+    u32 n_detached = 0;
+    u64 tlbi_asid_mask[4] = {0, 0, 0, 0}; // bitset over views 0..255 (asid = view + 1)
+    u32 clear_pi_pt_frs[8];
+    u32 n_clear_pi_pt = 0;
+
+    if (run_zap && !pte_arch_same(old_val, next_val, lvl)) {
+        bool populate_present = !(old_val & X_P) && (next_val & X_P) &&
+                                ((next_val & X_ADDR) >= 0x1000ULL) && ((next_val & X_ADDR) < c->ram_size);
+        if (lvl == 0u) {
+            bool unlinked_any = false;
+            for (u32 k = 0; k < nm; k++) {
+                ShadowDesc *d = &desc[m_idx[k]];
+                bool nobody_home = (m_flags[k] & 1u) != 0;
+                if (!(populate_present && !nobody_home) && pt_flood_decision(d, nobody_home)) {
+                    *d->parent = 0;
+                    mirror_unlink_locked(fr, m_idx[k]);
+                    unlinked_any = true;
+                    d->parent = 0;
+                    d->guest_table = ~0ULL;
+                    c->stat_pt_unshadow++;
+                    detached_idx[n_detached] = m_idx[k];
+                    detached_rw[n_detached] = (m_flags[k] >> 1) & 1u;
+                    n_detached++;
+                    tlbi_asid_mask[d->view >> 6] |= 1ULL << (d->view & 63u);
+                } else {
+                    u64 *pte = &pool_page(m_idx[k])[slot_i];
+                    u64 sv = *pte;
+                    if (!sv)
+                        continue;
+                    if ((sv & 1) && (sv & PTE_CONT)) {
+                        break_cont_group(pte, d, true);
+                    } else {
+                        *pte = 0;
+                        if (sv & 1) {
+                            if ((sv & AP_RO) == AP_RW && (sv & PTE_ADDR) < c->ram_size)
+                                rmap_remove(sv & PTE_ADDR, pte);
+                            tlbi_va(view_asid(d->view), pte_va(pte, d));
+                        }
+                    }
+                }
+            }
+            if (unlinked_any && !mirror_head[fr])
+                clear_pi_pt_frs[n_clear_pi_pt++] = fr;
+        } else {
+            for (u32 k = 0; k < nm; k++) {
+                ShadowDesc *d = &desc[m_idx[k]];
+                if (!populate_present)
+                    d->writes++;
+                u64 *pte = &pool_page(m_idx[k])[slot_i];
+                u64 sv = *pte;
+                if (!sv)
+                    continue;
+                if (is_block_desc(sv)) {
+                    *pte = 0;
+                    if ((sv & AP_RO) == AP_RW && (sv & PTE_ADDR) < c->ram_size)
+                        rmap2m_remove(sv & PTE_ADDR, pte);
+                    tlbi_va(view_asid(d->view), pte_va(pte, d));
+                    c->stat_pt_writes_zap++;
+                } else if (is_table_desc(sv)) {
+                    u32 cidx = m_child_idx[k];
+                    ShadowDesc *cd = &desc[cidx];
+                    *pte = 0;
+                    if (cd->guest_table != ~0ULL && cd->guest_table < c->ram_size) {
+                        u32 cfr = (u32)(cd->guest_table >> 12);
+                        mirror_unlink_locked(cfr, cidx);
+                        if (!mirror_head[cfr] && n_clear_pi_pt < 8u) {
+                            bool dup = false;
+                            for (u32 ci = 0; ci < n_clear_pi_pt; ci++)
+                                if (clear_pi_pt_frs[ci] == cfr) { dup = true; break; }
+                            if (!dup)
+                                clear_pi_pt_frs[n_clear_pi_pt++] = cfr;
+                        }
+                    }
+                    cd->parent = 0;
+                    cd->guest_table = ~0ULL;
+                    c->stat_pt_writes_zap++;
+                    detached_idx[n_detached] = cidx;
+                    detached_rw[n_detached] = (m_flags[k] >> 1) & 1u;
+                    n_detached++;
+                    tlbi_asid_mask[d->view >> 6] |= 1ULL << (d->view & 63u);
+                }
+            }
+        }
+        // Strict ARMv8 BBM: invalidate TLB & intermediate walk caches BEFORE releasing pt_locks.
+        for (u32 w = 0; w < 4u; w++) {
+            u64 m = tlbi_asid_mask[w];
+            while (m) {
+                u32 bit = (u32)__builtin_ctzll(m);
+                m &= m - 1ULL;
+                u32 vi = (w << 6) | bit;
+                __asm__ volatile("dsb ishst\n tlbi aside1is, %0\n dsb ish\n isb" : : "r"((u64)view_asid(vi) << 48));
+            }
+        }
+    }
+
+    pt_locks_release_all();
+    mirror_locks_release_all();
+
+    // Deferred 512-entry rmap_remove + pool_slab return runs fully in parallel under mon_read_lock().
+    for (u32 k = 0; k < n_detached; k++)
+        l0_deferred_cleanup(detached_idx[k], detached_rw[k] != 0);
+
+    mon_read_unlock();
+
+    // Immediately clear PI_PT on any unshadowed frame whose mirror list became empty so freed
+    // guest page tables reused for DMA or data never trigger stale PI_PT traps or DMA note storms.
+    if (n_clear_pi_pt) {
+        mon_lock();
+        me->lock_site = 5;
+        for (u32 ci = 0; ci < n_clear_pi_pt; ci++) {
+            u32 cfr = clear_pi_pt_frs[ci];
+            if (!mirror_head[cfr])
+                page_info[cfr] &= ~PI_PT;
+        }
+        mon_unlock();
+    }
+
+    c->stat_pt_writes++;
+    if (kind == 1u) {
+        arm_finish(&a, 0);
+    } else if (kind == 2u) {
+        if (rs != 31)
+            c->x[rs] = old_val;
+        c->elr += 4;
+    } else {
+        if (rt != 31)
+            c->x[rt] = old_val;
+        c->elr += 4;
+    }
+    return true;
 }
 
 static void handle_data_abort(bool lower) {
@@ -2604,27 +3891,30 @@ static void handle_data_abort(bool lower) {
     }
     // Lock-free fast path for aligned 64-bit guest page-table updates that do not invalidate any shadow mapping:
     // (A) Arch-bit-preserving updates on present PTEs (e.g. Windows clearing X_A or updating software bits)
-    // (B) Populating a brand-new present RAM PTE into a previously non-present slot, verified via mon_lock_word seqlock.
+    // (B) Populating a brand-new present RAM PTE into a previously non-present slot, verified via mon_lock_word + per-frame mirror seqlock.
     if (smp && write && is_ram(w.gpa) && !(w.gpa & 7ULL) && !c->profile_mmu_observations && !c->pte_same64 && !in_rep_stub(c->elr)) {
         u32 fr_fast = (u32)(w.gpa >> 12);
         u8 pi_fast = __atomic_load_n(&page_info[fr_fast], __ATOMIC_ACQUIRE);
         if ((pi_fast & PI_PT) && !(pi_fast & (PI_CODE | PI_NOTE))) {
+            u32 mb = mirror_lock_bucket(fr_fast);
             u32 word = *(u32 *)c->elr;
             ArmAccess a;
             if (arm_decode(word, &a) && !a.load && a.bytes == 8 && !arm_splits(arm_address(word, &a), &a)) {
                 u64 val = a.rt == 31 ? 0 : c->x[a.rt];
                 u64 *slot8 = (u64 *)RAM(w.gpa);
                 u32 s1 = __atomic_load_n(&mon_lock_word, __ATOMIC_ACQUIRE);
+                u32 ms1 = c->global_mon_lock ? 0u : __atomic_load_n(&mirror_locks[mb].word, __ATOMIC_ACQUIRE);
                 u64 peek = __atomic_load_n(slot8, __ATOMIC_ACQUIRE);
                 bool arch_same = (peek & X_P) && (((peek ^ val) & X_ARCH_ALL) == 0);
                 bool pop_new = !(peek & X_P) && (val & X_P) &&
                                ((val & X_ADDR) >= 0x1000ULL) && ((val & X_ADDR) < c->ram_size) &&
-                               !(s1 & 1u) && !__atomic_load_n(&c0->note_overflow, __ATOMIC_ACQUIRE);
+                               !(s1 & 1u) && !(ms1 & 1u) && !__atomic_load_n(&c0->note_overflow, __ATOMIC_ACQUIRE);
                 if (arch_same || pop_new) {
                     u64 expected = peek;
                     if (__atomic_compare_exchange_n(slot8, &expected, val, false, __ATOMIC_SEQ_CST, __ATOMIC_RELAXED)) {
                         if (pop_new &&
-                            (__atomic_load_n(&mon_lock_word, __ATOMIC_ACQUIRE) != s1 ||
+                            (__atomic_load_n(&mon_lock_word, __ATOMIC_SEQ_CST) != s1 ||
+                             (!c->global_mon_lock && __atomic_load_n(&mirror_locks[mb].word, __ATOMIC_SEQ_CST) != ms1) ||
                              __atomic_load_n(&c0->note_overflow, __ATOMIC_ACQUIRE) ||
                              (__atomic_load_n(&page_info[fr_fast], __ATOMIC_ACQUIRE) & PI_NOTE))) {
                             mon_lock();
@@ -2641,16 +3931,18 @@ static void handle_data_abort(bool lower) {
                 u32 rs = (word >> 16) & 31, rt = word & 31;
                 u64 rs_v = rs == 31 ? 0 : c->x[rs], rt_v = rt == 31 ? 0 : c->x[rt];
                 u32 s1 = __atomic_load_n(&mon_lock_word, __ATOMIC_ACQUIRE);
+                u32 ms1 = c->global_mon_lock ? 0u : __atomic_load_n(&mirror_locks[mb].word, __ATOMIC_ACQUIRE);
                 bool arch_same = (rs_v & X_P) && (((rs_v ^ rt_v) & X_ARCH_ALL) == 0);
                 bool pop_new = !(rs_v & X_P) && (rt_v & X_P) &&
                                ((rt_v & X_ADDR) >= 0x1000ULL) && ((rt_v & X_ADDR) < c->ram_size) &&
-                               !(s1 & 1u) && !__atomic_load_n(&c0->note_overflow, __ATOMIC_ACQUIRE);
+                               !(s1 & 1u) && !(ms1 & 1u) && !__atomic_load_n(&c0->note_overflow, __ATOMIC_ACQUIRE);
                 if (arch_same || pop_new) {
                     u64 expected = rs_v;
                     bool changed = __atomic_compare_exchange_n((u64 *)RAM(w.gpa), &expected, rt_v,
                         false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
                     if (changed && pop_new &&
-                        (__atomic_load_n(&mon_lock_word, __ATOMIC_ACQUIRE) != s1 ||
+                        (__atomic_load_n(&mon_lock_word, __ATOMIC_SEQ_CST) != s1 ||
+                         (!c->global_mon_lock && __atomic_load_n(&mirror_locks[mb].word, __ATOMIC_SEQ_CST) != ms1) ||
                          __atomic_load_n(&c0->note_overflow, __ATOMIC_ACQUIRE) ||
                          (__atomic_load_n(&page_info[fr_fast], __ATOMIC_ACQUIRE) & PI_NOTE))) {
                         mon_lock();
@@ -2694,6 +3986,20 @@ static void handle_data_abort(bool lower) {
                     return;
                 }
             }
+        }
+    }
+    bool perm = (dfsc & 0x3c) == 0x0c;
+    // Fine-grained concurrent shadow PT paths (disabled when LC_HVDBT_GLOBAL_MON_LOCK=1).
+    if (smp && !c->global_mon_lock) {
+        u64 gpa_peek = w.gpa & ~0xfffULL;
+        u8 pi_peek = gpa_peek < PRIV_IPA ? __atomic_load_n(&page_info[gpa_peek >> 12], __ATOMIC_ACQUIRE) : 0;
+        if (!(write && (pi_peek & (PI_CODE | PI_PT)))) {
+            if (handle_data_abort_fill_concurrent(v, far, &w, access, write, perm))
+                return;
+        } else if (write && (pi_peek & PI_PT) && !(pi_peek & PI_CODE) &&
+                   !c->profile_mmu_observations && !c->pte_same64 && !in_rep_stub(c->elr)) {
+            if (handle_data_abort_pt_write_concurrent(far, &w, access))
+                return;
         }
     }
     mon_lock();
@@ -2881,7 +4187,6 @@ static void handle_data_abort(bool lower) {
         mon_unlock();
         return;
     }
-    bool perm = (dfsc & 0x3c) == 0x0c;
     me->tracked_new = false;
     u64 *installed = shadow_install(v, far, &w, write);
     if (smp && me->tracked_new) { // Protected now: drop what was read before it and let the access fault again, which reads the table again.
@@ -2906,73 +4211,7 @@ static void handle_data_abort(bool lower) {
         c->stat_dirty++;
         tlbi_va(view_asid(c->view), is_block_desc(*installed) ? (far & ~0x1fffffULL) : far);
     } else {
-        // Batch-prefetch up to 31 already-accessed adjacent 4KB entries in the same L0 shadow page.
-        if (!is_block_desc(*installed) && !(pi & PI_DIRECT) && (w.leaf_level == 0 || w.leaf_level == 1)) {
-            u64 *shadow_l0 = (u64 *)((u64)installed & ~0xfffULL);
-            u32 idx = (u32)((far >> 12) & 0x1ffu);
-            u32 win_start = idx & ~31u, win_end = win_start + 32u;
-            if (!(c->hugepages_disabled & 2u)) {
-                // Also try coalescing the sibling 64 KiB half of this 128 KiB window into PTE_CONT before 4 KiB prefetch.
-                u32 other = (idx & ~15u) ^ 16u;
-                if (!shadow_l0[other]) {
-                    u64 other_va = (far & ~0x1fffffULL) | ((u64)other << 12);
-                    if (w.leaf_level == 0) {
-                        u64 *guest_l0 = (u64 *)((u64)w.leaf & ~0xfffULL);
-                        u64 ge = __atomic_load_n(&guest_l0[other], __ATOMIC_RELAXED);
-                        if ((ge & (X_P | X_A)) == (X_P | X_A) && (c->cpl != 3 || (ge & X_US)))
-                            try_install_cont_64k(&w, other_va, &shadow_l0[other], ge & X_ADDR, false);
-                    } else {
-                        u64 other_gpa = (w.gpa & ~0x1fffffULL) + ((u64)other << 12);
-                        try_install_cont_64k(&w, other_va, &shadow_l0[other], other_gpa, false);
-                    }
-                }
-            }
-            if (w.leaf_level == 0) {
-                u64 *guest_l0 = (u64 *)((u64)w.leaf & ~0xfffULL);
-                bool upper_write = ((w.read[3] & w.read[2] & w.read[1] & X_RW) != 0) ||
-                                   (c->cpl != 3 && !(c->cr0 & (1ULL << 16)));
-                for (u32 j = win_start; j < win_end; j++) {
-                    if (j == idx || shadow_l0[j])
-                        continue;
-                    u64 ge = __atomic_load_n(&guest_l0[j], __ATOMIC_RELAXED);
-                    if ((ge & (X_P | X_A)) != (X_P | X_A))
-                        continue;
-                    if (c->cpl == 3 && !(ge & X_US))
-                        continue;
-                    u64 ngpa = ge & X_ADDR;
-                    if (ngpa >= c->ram_size)
-                        continue;
-                    u8 npi = page_info[ngpa >> 12];
-                    if (!(npi & PI_RAM))
-                        continue;
-                    bool nwritable = upper_write && (ge & X_RW) && (ge & X_D) && !(npi & (PI_CODE | PI_PT));
-                    if (nwritable && !(npi & PI_DIRECT) && !rmap_free && rmap_next >= RMAP_NODES - 64)
-                        nwritable = false;
-                    shadow_l0[j] = ngpa | PTE_VALID | PTE_AF | PTE_SH | PTE_NG | PTE_PXN | PTE_UXN | (nwritable ? AP_RW : AP_RO);
-                    if (nwritable && !(npi & PI_DIRECT))
-                        rmap_add(ngpa, &shadow_l0[j]);
-                }
-            } else {
-                u64 base_gpa = w.gpa & ~0x1fffffULL;
-                bool lw = w.write && w.dirty;
-                for (u32 j = win_start; j < win_end; j++) {
-                    if (j == idx || shadow_l0[j])
-                        continue;
-                    u64 ngpa = base_gpa + ((u64)j << 12);
-                    if (ngpa >= c->ram_size)
-                        continue;
-                    u8 npi = page_info[ngpa >> 12];
-                    if (!(npi & PI_RAM))
-                        continue;
-                    bool nwritable = lw && !(npi & (PI_CODE | PI_PT));
-                    if (nwritable && !(npi & PI_DIRECT) && !rmap_free && rmap_next >= RMAP_NODES - 64)
-                        nwritable = false;
-                    shadow_l0[j] = ngpa | PTE_VALID | PTE_AF | PTE_SH | PTE_NG | PTE_PXN | PTE_UXN | (nwritable ? AP_RW : AP_RO);
-                    if (nwritable && !(npi & PI_DIRECT))
-                        rmap_add(ngpa, &shadow_l0[j]);
-                }
-            }
-        }
+        shadow_prefetch_l0(&w, far, installed, pi);
         c->stat_fills++;
         __asm__ volatile("dsb ishst");
     }

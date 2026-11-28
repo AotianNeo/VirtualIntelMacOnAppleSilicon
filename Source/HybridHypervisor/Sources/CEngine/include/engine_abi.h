@@ -518,6 +518,9 @@ typedef struct {
     uint32_t isa_features_pad;
     // Per-vCPU active view PIC epoch (always >= 2; shared view_epoch[] lives in page 0 of OFF_PIC_TABLE). Append-only.
     uint64_t pic_epoch;
+    // Fine-grained shadow PT lock ablation switch (LC_HVDBT_GLOBAL_MON_LOCK=1 forces legacy global mon_lock). Append-only.
+    uint32_t global_mon_lock;
+    uint32_t global_mon_lock_pad;
 } EngineCtx;
 // Stored in page 0 (4 KiB) of OFF_PIC_TABLE (shared EL0/EL1/Host rw).
 typedef struct {

@@ -517,6 +517,7 @@ public final class Engine {
         if environment["LC_HVDBT_NO_HP_2M"] == "1" { hpDisabled |= 1 }
         if environment["LC_HVDBT_NO_HP_64K"] == "1" { hpDisabled |= 6 }
         ctx.pointee.hugepages_disabled = hpDisabled
+        ctx.pointee.global_mon_lock = environment["LC_HVDBT_GLOBAL_MON_LOCK"] == "1" ? 1 : 0
         // ENGINE_SHARE: the keeper rule in a test with no fallbacks, as --smp is, so that it runs with vCPUs really side by side.
         ctx.pointee.share_user = (options.hybrid && environment["LC_HVDBT_NO_SHARE"] != "1") || environment["ENGINE_SHARE"] == "1" ? 1 : 0
         ctx.pointee.clts_on_host = options.hybrid && ProcessInfo.processInfo.environment["LC_HVDBT_CLTS_TCG"] == "1" ? 1 : 0
