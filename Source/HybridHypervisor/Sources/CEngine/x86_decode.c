@@ -1004,14 +1004,661 @@ static void decode_inner(u64 rip, Insn *in, const u8 *b, int avail) {
         in->target = tr_compat ? (u32)(in->next + in->imm) : in->next + in->imm;
 }
 
+static int no_fast_scalar_mode = -1;
+static int verify_fast_scalar_mode = -1;
+static bool x86_dec_inited = false;
+static bool fast_scalar_off = false;
+static bool fast_scalar_verify = false;
+
+void x86_decode_init(void) {
+    const char *e1 = getenv("LC_HVDBT_NO_FAST_SCALAR");
+    const char *e2 = getenv("LC_HVDBT_VERIFY_FAST_SCALAR");
+    fast_scalar_off = (e1 && !strcmp(e1, "1"));
+    fast_scalar_verify = (e2 && !strcmp(e2, "1"));
+    __atomic_store_n(&no_fast_scalar_mode, fast_scalar_off ? 1 : 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&verify_fast_scalar_mode, fast_scalar_verify ? 1 : 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&x86_dec_inited, true, __ATOMIC_RELEASE);
+}
+
+// 1 for x86 legacy prefixes (operand/addr size, segment overrides, LOCK, REP/REPNE).
+static const u8 scalar_legacy_pfx[256] = {
+    [0x26] = 1, [0x2E] = 1, [0x36] = 1, [0x3E] = 1,
+    [0x64] = 1, [0x65] = 1, [0x66] = 1, [0x67] = 1,
+    [0xF0] = 1, [0xF2] = 1, [0xF3] = 1,
+};
+
+static inline const u8 *fast_modrm64(Insn *in, int rex, const u8 *p) {
+    u8 m = *p++;
+    int mod = m >> 6, rm = m & 7;
+    in->reg = (u8)(((m >> 3) & 7) | ((rex & 4) << 1));
+    if (mod == 3) {
+        in->rm_reg = true;
+        in->rm = (u8)(rm | ((rex & 1) << 3));
+        return p;
+    }
+    in->memop = true;
+    if (rm == 4) {
+        u8 s = *p++;
+        int idx = ((s >> 3) & 7) | ((rex & 2) << 2);
+        int bs = s & 7;
+        if (idx != 4) {
+            in->no_index = false;
+            in->index = (u8)idx;
+            in->scale = s >> 6;
+        }
+        if (bs == 5 && mod == 0) {
+            in->no_base = true;
+            i32 d;
+            memcpy(&d, p, 4);
+            in->disp = d;
+            return p + 4;
+        }
+        in->base = (u8)(bs | ((rex & 1) << 3));
+    } else if (rm == 5 && mod == 0) {
+        in->riprel = true;
+        i32 d;
+        memcpy(&d, p, 4);
+        in->disp = d;
+        return p + 4;
+    } else {
+        in->base = (u8)(rm | ((rex & 1) << 3));
+    }
+    if (mod == 1) {
+        in->disp = (int8_t)*p++;
+    } else if (mod == 2) {
+        i32 d;
+        memcpy(&d, p, 4);
+        in->disp = d;
+        p += 4;
+    }
+    return p;
+}
+
+static inline const u8 *fast_imm(Insn *in, int n, const u8 *p) {
+    in->has_imm = true;
+    in->imm_len = (u8)n;
+    if (n == 1) {
+        in->imm = (int8_t)*p;
+        return p + 1;
+    }
+    if (n == 2) {
+        int16_t v;
+        memcpy(&v, p, 2);
+        in->imm = v;
+        return p + 2;
+    }
+    if (n == 4) {
+        i32 v;
+        memcpy(&v, p, 4);
+        in->imm = v;
+        return p + 4;
+    }
+    i64 v;
+    memcpy(&v, p, 8);
+    in->imm = v;
+    return p + 8;
+}
+
+// Direct jump-table fast-path decoder for the hottest 64-bit scalar integer instructions.
+// Returns true on fast-path hit (100% bit-exact with decode_inner()); false falls back to decode_inner().
+static bool fast_decode_scalar(u64 rip, Insn *in, const u8 *b, int avail) {
+    if (__builtin_expect(tr_compat || avail < 15, 0))
+        return false;
+
+    const u8 *p = b;
+    int sz = 4;
+    u8 p66 = 0;
+
+    if (__builtin_expect(scalar_legacy_pfx[*p], 0)) {
+        u8 c = *p;
+        if (c == 0x66) {
+            p66 = 1;
+            sz = 2;
+            p++;
+        } else if (c == 0x65) {
+            in->seg = 2;
+            p++;
+        } else if (c == 0x64) {
+            in->seg = 1;
+            p++;
+        } else {
+            return false;
+        }
+        // Only handle a single hot legacy prefix on the fast path; multi-prefix falls back cleanly.
+        if (__builtin_expect(scalar_legacy_pfx[*p], 0))
+            return false;
+    }
+
+    int rex = 0;
+    bool has_rex = false;
+    if ((*p & 0xF0) == 0x40) {
+        rex = *p++ & 15;
+        has_rex = true;
+        if (rex & 8)
+            sz = 8;
+    }
+    int w = sz;
+    const int stack_w = (sz == 2) ? 2 : 8;
+    u8 opc = *p++;
+
+#define F_IMMSZ(s) ((s) == 8 ? 4 : (s))
+#define F_MARK_HIGH()                                                          \
+    do {                                                                       \
+        if (w == 1 && !has_rex) {                                              \
+            if (in->reg >= 4 && in->reg <= 7)                                  \
+                in->high_reg = true;                                           \
+            if (in->rm_reg && in->rm >= 4 && in->rm <= 7)                      \
+                in->high_rm = true;                                            \
+        }                                                                      \
+    } while (0)
+#define F_MARK_HIGH_RM()                                                       \
+    do {                                                                       \
+        if (w == 1 && !has_rex && in->rm_reg && in->rm >= 4 && in->rm <= 7)    \
+            in->high_rm = true;                                                \
+    } while (0)
+
+    switch (opc) {
+        // ---- MOV r/m, r and r, r/m (hottest x86-64 opcode family) ----
+        case 0x88: case 0x89: case 0x8A: case 0x8B:
+            w = (opc & 1) ? sz : 1;
+            p = fast_modrm64(in, rex, p);
+            in->op = OP_MOV;
+            in->to_reg = (opc & 2) != 0;
+            F_MARK_HIGH();
+            break;
+
+        // ---- LEA ----
+        case 0x8D:
+            p = fast_modrm64(in, rex, p);
+            if (__builtin_expect(in->rm_reg, 0))
+                return false;
+            in->op = OP_LEA;
+            in->memop = false;
+            break;
+
+        // ---- MOV r8, imm8 & MOV r, imm ----
+        case 0xB0: case 0xB1: case 0xB2: case 0xB3:
+        case 0xB4: case 0xB5: case 0xB6: case 0xB7:
+            in->op = OP_MOV;
+            in->to_reg = true;
+            in->rm_reg = true;
+            w = 1;
+            in->reg = (u8)((opc & 7) | ((rex & 1) << 3));
+            if (!has_rex && (opc & 7) >= 4)
+                in->high_reg = true;
+            p = fast_imm(in, 1, p);
+            break;
+        case 0xB8: case 0xB9: case 0xBA: case 0xBB:
+        case 0xBC: case 0xBD: case 0xBE: case 0xBF:
+            in->op = OP_MOV;
+            in->to_reg = true;
+            in->rm_reg = true;
+            in->reg = (u8)((opc & 7) | ((rex & 1) << 3));
+            p = fast_imm(in, sz, p);
+            break;
+
+        // ---- MOV r/m, imm ----
+        case 0xC6: case 0xC7:
+            w = (opc == 0xC6) ? 1 : sz;
+            p = fast_modrm64(in, rex, p);
+            if (__builtin_expect((in->reg & 7) != 0, 0))
+                return false;
+            in->op = OP_MOV;
+            in->reg = 0;
+            p = fast_imm(in, F_IMMSZ(w), p);
+            F_MARK_HIGH_RM();
+            break;
+
+        // ---- ALU r/m, r / r, r/m / rAX, imm (ADD, OR, ADC, SBB, AND, SUB, XOR, CMP) ----
+        case 0x00: case 0x01: case 0x02: case 0x03: case 0x04: case 0x05:
+        case 0x08: case 0x09: case 0x0A: case 0x0B: case 0x0C: case 0x0D:
+        case 0x10: case 0x11: case 0x12: case 0x13: case 0x14: case 0x15:
+        case 0x18: case 0x19: case 0x1A: case 0x1B: case 0x1C: case 0x1D:
+        case 0x20: case 0x21: case 0x22: case 0x23: case 0x24: case 0x25:
+        case 0x28: case 0x29: case 0x2A: case 0x2B: case 0x2C: case 0x2D:
+        case 0x30: case 0x31: case 0x32: case 0x33: case 0x34: case 0x35:
+        case 0x38: case 0x39: case 0x3A: case 0x3B: case 0x3C: case 0x3D: {
+            int form = opc & 7;
+            u8 sub = opc >> 3;
+            in->op = OP_ALU;
+            in->sub = sub;
+            in->writes = F_ARITH;
+            if (sub == ALU_ADC || sub == ALU_SBB)
+                in->reads = F_C;
+            w = (form & 1) ? sz : 1;
+            if (form < 4) {
+                p = fast_modrm64(in, rex, p);
+                in->to_reg = form >= 2;
+                F_MARK_HIGH();
+            } else {
+                in->rm_reg = true;
+                in->to_reg = false;
+                p = fast_imm(in, F_IMMSZ(w), p);
+            }
+            break;
+        }
+
+        // ---- ALU r/m, imm8 / imm32 ----
+        case 0x80: case 0x81: case 0x83:
+            w = (opc == 0x80) ? 1 : sz;
+            p = fast_modrm64(in, rex, p);
+            in->op = OP_ALU;
+            in->sub = in->reg & 7;
+            in->writes = F_ARITH;
+            if (in->sub == ALU_ADC || in->sub == ALU_SBB)
+                in->reads = F_C;
+            p = fast_imm(in, opc == 0x81 ? F_IMMSZ(w) : 1, p);
+            in->reg = 0;
+            F_MARK_HIGH_RM();
+            break;
+
+        // ---- TEST ----
+        case 0x84: case 0x85:
+            w = (opc == 0x84) ? 1 : sz;
+            p = fast_modrm64(in, rex, p);
+            in->op = OP_ALU;
+            in->sub = ALU_TEST;
+            in->writes = F_ARITH;
+            in->to_reg = false;
+            F_MARK_HIGH();
+            break;
+        case 0xA8: case 0xA9:
+            w = (opc == 0xA8) ? 1 : sz;
+            in->rm_reg = true;
+            p = fast_imm(in, F_IMMSZ(w), p);
+            in->op = OP_ALU;
+            in->sub = ALU_TEST;
+            in->writes = F_ARITH;
+            break;
+
+        // ---- PUSH / POP reg & PUSH imm ----
+        case 0x50: case 0x51: case 0x52: case 0x53:
+        case 0x54: case 0x55: case 0x56: case 0x57:
+            in->op = OP_PUSH;
+            in->rm_reg = true;
+            in->rm = (u8)((opc & 7) | ((rex & 1) << 3));
+            w = stack_w;
+            break;
+        case 0x58: case 0x59: case 0x5A: case 0x5B:
+        case 0x5C: case 0x5D: case 0x5E: case 0x5F:
+            in->op = OP_POP;
+            in->rm_reg = true;
+            in->rm = (u8)((opc & 7) | ((rex & 1) << 3));
+            w = stack_w;
+            break;
+        case 0x68: case 0x6A:
+            in->op = OP_PUSH;
+            w = stack_w;
+            p = fast_imm(in, opc == 0x6A ? 1 : (sz == 2 ? 2 : 4), p);
+            break;
+
+        // ---- MOVSXD ----
+        case 0x63:
+            p = fast_modrm64(in, rex, p);
+            in->op = OP_MOVSX;
+            in->srcsz = 4;
+            break;
+
+        // ---- IMUL r, r/m, imm ----
+        case 0x69: case 0x6B:
+            p = fast_modrm64(in, rex, p);
+            in->op = OP_IMUL;
+            in->writes = F_ARITH;
+            p = fast_imm(in, opc == 0x6B ? 1 : F_IMMSZ(sz), p);
+            break;
+
+        // ---- Jcc rel8 ----
+        case 0x70: case 0x71: case 0x72: case 0x73:
+        case 0x74: case 0x75: case 0x76: case 0x77:
+        case 0x78: case 0x79: case 0x7A: case 0x7B:
+        case 0x7C: case 0x7D: case 0x7E: case 0x7F:
+            in->op = OP_JCC;
+            in->cc = opc & 15;
+            in->reads = cc_reads[in->cc];
+            p = fast_imm(in, 1, p);
+            break;
+
+        // ---- CALL / JMP / RET / LEAVE ----
+        case 0xE8:
+            in->op = OP_CALL;
+            in->memop = true;
+            p = fast_imm(in, 4, p);
+            break;
+        case 0xE9:
+            in->op = OP_JMP;
+            p = fast_imm(in, 4, p);
+            break;
+        case 0xEB:
+            in->op = OP_JMP;
+            p = fast_imm(in, 1, p);
+            break;
+        case 0xC2: {
+            in->op = OP_RET;
+            in->memop = true;
+            in->has_imm = true;
+            u16 v;
+            memcpy(&v, p, 2);
+            in->imm = v;
+            p += 2;
+            break;
+        }
+        case 0xC3:
+            in->op = OP_RET;
+            in->memop = true;
+            in->rep = 0;
+            break;
+        case 0xC9:
+            in->op = OP_LEAVE;
+            in->memop = true;
+            break;
+
+        // ---- XCHG / NOP / CBW / CWD ----
+        case 0x86: case 0x87:
+            w = (opc == 0x86) ? 1 : sz;
+            p = fast_modrm64(in, rex, p);
+            in->op = OP_XCHG;
+            F_MARK_HIGH();
+            break;
+        case 0x90: case 0x91: case 0x92: case 0x93:
+        case 0x94: case 0x95: case 0x96: case 0x97:
+            if (opc == 0x90 && !(rex & 1)) {
+                in->op = OP_NOP;
+                in->rep = 0;
+            } else {
+                in->op = OP_XCHG;
+                in->rm_reg = true;
+                in->rm = 0;
+                in->reg = (u8)((opc & 7) | ((rex & 1) << 3));
+            }
+            break;
+        case 0x98:
+            in->op = OP_CBW;
+            break;
+        case 0x99:
+            in->op = OP_CWD;
+            break;
+
+        // ---- SHIFTS / ROTATES ----
+        case 0xC0: case 0xC1: case 0xD0: case 0xD1: case 0xD2: case 0xD3: {
+            w = (opc & 1) ? sz : 1;
+            p = fast_modrm64(in, rex, p);
+            in->op = OP_SHIFT;
+            in->sub = in->reg & 7;
+            in->reg = 0;
+            F_MARK_HIGH_RM();
+            bool rot = in->sub < SH_SHL;
+            bool thru = (in->sub == SH_RCL || in->sub == SH_RCR);
+            if (opc >= 0xD2) {
+                in->by_cl = true;
+                in->reads = F_ARITH;
+                in->writes = 0;
+            } else {
+                in->has_imm = true;
+                in->imm = (opc <= 0xC1) ? (i64)(*p++) : 1;
+                in->imm &= (w == 8) ? 63 : 31;
+                if (thru)
+                    in->reads = F_C;
+                if (in->imm)
+                    in->writes = rot ? (F_C | F_V) : F_ARITH;
+            }
+            break;
+        }
+
+        // ---- Group 3: TEST imm / NOT / NEG / MUL / IMUL / DIV / IDIV ----
+        case 0xF6: case 0xF7: {
+            w = (opc == 0xF6) ? 1 : sz;
+            p = fast_modrm64(in, rex, p);
+            int s = in->reg & 7;
+            in->reg = 0;
+            F_MARK_HIGH_RM();
+            switch (s) {
+                case 0: case 1:
+                    in->op = OP_ALU;
+                    in->sub = ALU_TEST;
+                    in->writes = F_ARITH;
+                    p = fast_imm(in, F_IMMSZ(w), p);
+                    break;
+                case 2:
+                    in->op = OP_NOT;
+                    break;
+                case 3:
+                    in->op = OP_NEG;
+                    in->writes = F_ARITH;
+                    break;
+                case 4: case 5:
+                    in->op = OP_MUL;
+                    in->sub = (u8)(s - 4);
+                    in->writes = F_ARITH;
+                    break;
+                default:
+                    in->op = OP_DIV;
+                    in->sub = (u8)(s - 6);
+                    in->writes = F_ARITH;
+                    break;
+            }
+            break;
+        }
+
+        // ---- Group 4/5: INC / DEC / CALLI / JMPI / PUSH mem ----
+        case 0xFE: case 0xFF: {
+            w = (opc == 0xFE) ? 1 : sz;
+            p = fast_modrm64(in, rex, p);
+            int s = in->reg & 7;
+            in->reg = 0;
+            if (s == 0 || s == 1) {
+                in->op = OP_INCDEC;
+                in->sub = (u8)s;
+                in->writes = F_V | F_Z | F_N | F_P | F_A;
+                F_MARK_HIGH_RM();
+            } else if (opc == 0xFF && s == 2) {
+                w = 8;
+                in->op = OP_CALLI;
+                in->memop = true;
+            } else if (opc == 0xFF && s == 4) {
+                w = 8;
+                in->op = OP_JMPI;
+            } else if (opc == 0xFF && s == 6) {
+                w = stack_w;
+                in->op = OP_PUSH;
+            } else {
+                return false;
+            }
+            break;
+        }
+
+        // ---- Hot 2-byte 0x0F scalar opcodes ----
+        case 0x0F: {
+            u8 op2 = *p++;
+            switch (op2) {
+                case 0x19: case 0x1A: case 0x1B: case 0x1C:
+                case 0x1D: case 0x1E: case 0x1F:
+                    p = fast_modrm64(in, rex, p);
+                    in->op = OP_NOP;
+                    in->memop = false;
+                    break;
+                case 0x40: case 0x41: case 0x42: case 0x43:
+                case 0x44: case 0x45: case 0x46: case 0x47:
+                case 0x48: case 0x49: case 0x4A: case 0x4B:
+                case 0x4C: case 0x4D: case 0x4E: case 0x4F:
+                    p = fast_modrm64(in, rex, p);
+                    in->op = OP_CMOV;
+                    in->cc = op2 & 15;
+                    in->reads = cc_reads[in->cc];
+                    break;
+                case 0x80: case 0x81: case 0x82: case 0x83:
+                case 0x84: case 0x85: case 0x86: case 0x87:
+                case 0x88: case 0x89: case 0x8A: case 0x8B:
+                case 0x8C: case 0x8D: case 0x8E: case 0x8F:
+                    in->op = OP_JCC;
+                    in->cc = op2 & 15;
+                    in->reads = cc_reads[in->cc];
+                    p = fast_imm(in, 4, p);
+                    break;
+                case 0x90: case 0x91: case 0x92: case 0x93:
+                case 0x94: case 0x95: case 0x96: case 0x97:
+                case 0x98: case 0x99: case 0x9A: case 0x9B:
+                case 0x9C: case 0x9D: case 0x9E: case 0x9F:
+                    w = 1;
+                    p = fast_modrm64(in, rex, p);
+                    in->op = OP_SETCC;
+                    in->cc = op2 & 15;
+                    in->reads = cc_reads[in->cc];
+                    F_MARK_HIGH_RM();
+                    break;
+                case 0xA3: case 0xAB: case 0xB3: case 0xBB:
+                    p = fast_modrm64(in, rex, p);
+                    in->op = OP_BT;
+                    in->sub = (op2 == 0xA3) ? 0 : (op2 == 0xAB) ? 1 : (op2 == 0xB3) ? 2 : 3;
+                    in->writes = F_ARITH & ~F_Z;
+                    break;
+                case 0xBA: {
+                    p = fast_modrm64(in, rex, p);
+                    int s = in->reg & 7;
+                    if (__builtin_expect(s < 4, 0))
+                        return false;
+                    in->op = OP_BT;
+                    in->sub = (u8)(s - 4);
+                    in->writes = F_ARITH & ~F_Z;
+                    in->has_imm = true;
+                    in->imm = *p++;
+                    break;
+                }
+                case 0xA4: case 0xA5: case 0xAC: case 0xAD:
+                    p = fast_modrm64(in, rex, p);
+                    in->op = OP_SHD;
+                    in->sub = op2 >= 0xAC;
+                    if (op2 & 1) {
+                        in->by_cl = true;
+                        in->reads = F_ARITH;
+                    } else {
+                        in->has_imm = true;
+                        in->imm = (*p++) & (sz == 8 ? 63 : 31);
+                        if (in->imm)
+                            in->writes = F_ARITH;
+                    }
+                    break;
+                case 0xAF:
+                    p = fast_modrm64(in, rex, p);
+                    in->op = OP_IMUL;
+                    in->writes = F_ARITH;
+                    break;
+                case 0xB6: case 0xB7: case 0xBE: case 0xBF:
+                    p = fast_modrm64(in, rex, p);
+                    in->op = (op2 < 0xBE) ? OP_MOVZX : OP_MOVSX;
+                    in->srcsz = (op2 & 1) ? 2 : 1;
+                    if (in->srcsz == 1 && !has_rex && in->rm_reg && in->rm >= 4 && in->rm <= 7)
+                        in->high_rm = true;
+                    break;
+                case 0xBC: case 0xBD:
+                    // Fast path never sees 0xF3 prefix, so always BSF/BSR (TZCNT/LZCNT goes to decode_inner).
+                    p = fast_modrm64(in, rex, p);
+                    in->op = (op2 == 0xBC) ? OP_BSF : OP_BSR;
+                    in->writes = F_ARITH;
+                    break;
+                case 0xC8: case 0xC9: case 0xCA: case 0xCB:
+                case 0xCC: case 0xCD: case 0xCE: case 0xCF:
+                    in->op = OP_BSWAP;
+                    in->rm_reg = true;
+                    in->rm = (u8)((op2 & 7) | ((rex & 1) << 3));
+                    break;
+                default:
+                    return false;
+            }
+            break;
+        }
+
+        default:
+            return false;
+    }
+
+#undef F_IMMSZ
+#undef F_MARK_HIGH
+#undef F_MARK_HIGH_RM
+
+    (void)p66;
+    in->sz = (u8)w;
+    in->next = rip + (u64)(p - b);
+    if (in->op == OP_JCC || in->op == OP_JMP || in->op == OP_CALL)
+        in->target = in->next + (u64)in->imm;
+    return true;
+}
+
 void x86_decode(u64 rip, Insn *in) {
-    // Decoding is from a buffer with zero padding, then checked: the instruction must fit in what was fetched.
-    u8 b[32] = {0};
-    memset(in, 0, sizeof *in);
-    in->rip = rip;
-    in->no_index = true;
-    int got = tr_fetch(rip, b, 15);
-    decode_inner(rip, in, b, got);
+    if (__builtin_expect(!x86_dec_inited, 0))
+        x86_decode_init();
+    const bool no_fast = fast_scalar_off;
+    const bool verify = fast_scalar_verify;
+
+    u8 b_stack[32];
+    const u8 *b = NULL;
+    int got = 0;
+    if (__builtin_expect(!no_fast, 1))
+        b = tr_fetch_fast(rip, &got);
+    if (__builtin_expect(!b, 0)) {
+        memset(b_stack, 0, sizeof b_stack);
+        got = tr_fetch(rip, b_stack, 15);
+        b = b_stack;
+    }
+
+    // On scalar fast-path (when not verifying), zero only header/operand fields before ExtDecoded ext (72B vs 96B).
+    if (__builtin_expect(!no_fast && !verify, 1)) {
+        memset(in, 0, __builtin_offsetof(Insn, ext));
+        in->rip = rip;
+        in->no_index = true;
+        if (__builtin_expect(fast_decode_scalar(rip, in, b, got), 1)) {
+            int len = (int)(in->next - rip);
+            if (__builtin_expect(len <= 15 && in->next != 0 && len <= got, 1))
+                return;
+        }
+        // Fallback: full zeroing + reference decode_inner()
+        memset(in, 0, sizeof *in);
+        in->rip = rip;
+        in->no_index = true;
+        decode_inner(rip, in, b, got);
+    } else if (!no_fast) {
+        // Strict LC_HVDBT_VERIFY_FAST_SCALAR=1 mode: full zeroing + bit-exact memcmp vs decode_inner()!
+        memset(in, 0, sizeof *in);
+        in->rip = rip;
+        in->no_index = true;
+        if (!fast_decode_scalar(rip, in, b, got)) {
+            memset(in, 0, sizeof *in);
+            in->rip = rip;
+            in->no_index = true;
+            decode_inner(rip, in, b, got);
+        } else {
+            Insn ref;
+            memset(&ref, 0, sizeof ref);
+            ref.rip = rip;
+            ref.no_index = true;
+            decode_inner(rip, &ref, b, got);
+            if (memcmp(in, &ref, sizeof(Insn)) != 0) {
+                fprintf(stderr,
+                        "FAST_SCALAR_MISMATCH rip=%llx bytes=%02x %02x %02x %02x %02x %02x %02x %02x\n"
+                        "  fast: op=%u sz=%u srcsz=%u sub=%u cc=%u rm=%u reg=%u base=%u idx=%u sc=%u "
+                        "r=%u w=%u seg=%u rep=%u rm_reg=%d to_reg=%d has_imm=%d imm_len=%u by_cl=%d "
+                        "riprel=%d nb=%d ni=%d hr=%d hrm=%d memop=%d disp=%lld imm=%lld next=%llx tgt=%llx\n"
+                        "  ref : op=%u sz=%u srcsz=%u sub=%u cc=%u rm=%u reg=%u base=%u idx=%u sc=%u "
+                        "r=%u w=%u seg=%u rep=%u rm_reg=%d to_reg=%d has_imm=%d imm_len=%u by_cl=%d "
+                        "riprel=%d nb=%d ni=%d hr=%d hrm=%d memop=%d disp=%lld imm=%lld next=%llx tgt=%llx\n",
+                        (unsigned long long)rip, b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+                        in->op, in->sz, in->srcsz, in->sub, in->cc, in->rm, in->reg, in->base, in->index, in->scale,
+                        in->reads, in->writes, in->seg, in->rep, in->rm_reg, in->to_reg, in->has_imm, in->imm_len, in->by_cl,
+                        in->riprel, in->no_base, in->no_index, in->high_reg, in->high_rm, in->memop,
+                        (long long)in->disp, (long long)in->imm, (unsigned long long)in->next, (unsigned long long)in->target,
+                        ref.op, ref.sz, ref.srcsz, ref.sub, ref.cc, ref.rm, ref.reg, ref.base, ref.index, ref.scale,
+                        ref.reads, ref.writes, ref.seg, ref.rep, ref.rm_reg, ref.to_reg, ref.has_imm, ref.imm_len, ref.by_cl,
+                        ref.riprel, ref.no_base, ref.no_index, ref.high_reg, ref.high_rm, ref.memop,
+                        (long long)ref.disp, (long long)ref.imm, (unsigned long long)ref.next, (unsigned long long)ref.target);
+                abort();
+            }
+        }
+    } else {
+        memset(in, 0, sizeof *in);
+        in->rip = rip;
+        in->no_index = true;
+        decode_inner(rip, in, b, got);
+    }
+
     int len = (int)(in->next - rip);
     if (len > 15 || in->next == 0) {
         memset(in, 0, sizeof *in);
@@ -1027,9 +1674,6 @@ void x86_decode(u64 rip, Insn *in) {
         in->next = fault_va;
         in->target = fault_va;
         set_bad(in, "FETCH_FAULT");
-    }
-    if (in->op == OP_MOVSX || in->op == OP_MOVZX || in->op == OP_LEA || in->op == OP_CMOV || in->op == OP_IMUL) {
-        // Size prefix is honoured; nothing else to fix up.
     }
 }
 

@@ -428,6 +428,10 @@ public final class Tally: @unchecked Sendable {
                         hitRate, avgRelocNs, Double(t.aot_reloc_ns) / 1_000_000.0, t.aot_eager_cc_links, t.aot_reloc_failures)
             o += "aot_recorded_t1 \(t.aot_recorded_t1) aot_recorded_t2 \(t.aot_recorded_t2) aot_saves_ok \(t.aot_saves_ok) aot_saved_bytes \(t.aot_saved_bytes)\n"
         }
+        if t.par_enabled != 0 {
+            o += "\n== parallel translation pipeline (global, repeated per vCPU) ==\n"
+            o += "par_translates \(t.par_translates) par_fast_hits \(t.par_fast_hits) par_dups \(t.par_dups) par_retries \(t.par_retries) par_fallbacks \(t.par_fallbacks)\n"
+        }
         if c.profile_mmu_observations != 0 {
             o += "\n== MMU observations (this vCPU; count/timing only, no skipped operations) ==\n"
             o += "mmu_observations_enabled \(c.profile_mmu_observations)\n"

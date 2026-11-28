@@ -1601,13 +1601,15 @@ static bool fast_decode_vex(u64 rip, Insn *in, const u8 *b, int avail) {
 static int verify_fast_vex_mode = -1;
 
 int x86_decode_ext(u64 rip, Insn *in, const u8 *b, int avail) {
-    if (__builtin_expect(verify_fast_vex_mode < 0, 0)) {
+    int vmode = __atomic_load_n(&verify_fast_vex_mode, __ATOMIC_RELAXED);
+    if (__builtin_expect(vmode < 0, 0)) {
         const char *e = getenv("LC_HVDBT_VERIFY_FAST_VEX");
-        verify_fast_vex_mode = (e && e[0] == '2') ? 2 : (e && e[0] == '1') ? 1 : 0;
+        vmode = (e && e[0] == '2') ? 2 : (e && e[0] == '1') ? 1 : 0;
+        __atomic_store_n(&verify_fast_vex_mode, vmode, __ATOMIC_RELAXED);
     }
     Insn fast_in = *in;
     if (fast_decode_vex(rip, &fast_in, b, avail)) {
-        if (__builtin_expect(!verify_fast_vex_mode, 1)) {
+        if (__builtin_expect(!vmode, 1)) {
             *in = fast_in;
             return 1;
         }
@@ -1655,7 +1657,7 @@ int x86_decode_ext(u64 rip, Insn *in, const u8 *b, int avail) {
                     z_in.ext.op_type[1], z_in.ext.op_reg[1], z_in.ext.op_bytes[1],
                     z_in.ext.op_type[2], z_in.ext.op_reg[2], z_in.ext.op_bytes[2],
                     z_in.ext.op_type[3], z_in.ext.op_reg[3], z_in.ext.op_bytes[3]);
-            if (verify_fast_vex_mode == 1)
+            if (vmode == 1)
                 abort();
         }
         *in = fast_in;

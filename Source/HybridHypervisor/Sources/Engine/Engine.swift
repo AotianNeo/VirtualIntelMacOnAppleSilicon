@@ -745,47 +745,134 @@ public final class Engine {
         }
         let c = ctx
         // The translator's tables are one set for the VM. Taken here, in the slow path of a host exit that costs far more.
-        let translating = code == Int(HC_TRANSLATE) || code == Int(HC_SMC) || code == Int(HC_VIEW_INVALIDATE_VA) || code == Int(HC_VIEW_FORGET) || code == Int(HC_VIEW_DROP) || code == Int(HC_CALL_TAIL)
+        let isTranslate = code == Int(HC_TRANSLATE)
+        let translating = isTranslate || code == Int(HC_SMC) || code == Int(HC_VIEW_INVALIDATE_VA) || code == Int(HC_VIEW_FORGET) || code == Int(HC_VIEW_DROP) || code == Int(HC_CALL_TAIL)
         var cacheWasReset = false
-        if code == Int(HC_TRANSLATE) && severalVCPUs {
+        var lockHeld = false
+        let parFastTranslate = isTranslate && severalVCPUs && (c.pointee.req_a.4 == 0) && tr_par_enabled()
+        if isTranslate && severalVCPUs && !parFastTranslate {
             lockTranslator()
+            lockHeld = true
             while tr_needs_flush() {
+                lockHeld = false
                 translatorLock.unlock()
                 resetCodeCacheWithOthersOut()
                 cacheWasReset = true
                 lockTranslator()
+                lockHeld = true
             }
-        } else if translating {
+        } else if translating && !parFastTranslate {
             let start = code == Int(HC_VIEW_INVALIDATE_VA) ? mach_absolute_time() : 0
             lockTranslator()
+            lockHeld = true
             if start != 0 { invalidationWaitTicks &+= mach_absolute_time() &- start }
         }
-        defer { if translating { translatorLock.unlock() } }
+        defer { if lockHeld { translatorLock.unlock() } }
         switch code {
         case Int(HC_TRANSLATE):
             let view = Int32(c.pointee.req_a.0)
             let rip = c.pointee.req_a.1
             let site = c.pointee.req_a.2
             let kind = Int32(c.pointee.req_a.3)
+            let cr3 = c.pointee.req_a.5
+            let cpl = Int32(c.pointee.cpl)
+            let compat = c.pointee.compat != 0
+            let single = c.pointee.req_a.4 != 0
             let coldBefore = tally != nil ? tr_stats().blocks : 0
-            var result: TrResult
-            while true {
-                let flushGen = gate.flushGeneration
-                let r = tr_translate(view, c.pointee.req_a.5, Int32(c.pointee.cpl), c.pointee.compat != 0, rip, c.pointee.req_a.4 != 0)
-                if r.needs_flush && severalVCPUs {
-                    let isSharedPart = (UInt32(bitPattern: r.key) & 0x4000_0000) != 0
-                    translatorLock.unlock()
-                    resetCodeCacheWithOthersOut(afterGeneration: flushGen, forceAll: isSharedPart, forcePrivate: !isSharedPart)
-                    cacheWasReset = true
+            var result = TrResult()
+            var needPost = false
+            if parFastTranslate {
+                var parRetries = 0
+                while true {
+                    let flushGen = gate.flushGeneration
+                    var r = TrResult()
+                    // 1-lock parallel fast path: probe lock-free and prepare (AOT or decode+DAG+emit) BEFORE taking translatorLock!
+                    let prepared = tr_translate_try_prepare_unlocked(view, cr3, cpl, compat, rip)
                     lockTranslator()
-                    continue
+                    lockHeld = true
+                    if !prepared {
+                        // Fast hit, dead-block reuse, unprotected frame, or cache-full: resolve under single lock!
+                        while tr_needs_flush() {
+                            lockHeld = false
+                            translatorLock.unlock()
+                            resetCodeCacheWithOthersOut()
+                            cacheWasReset = true
+                            lockTranslator()
+                            lockHeld = true
+                        }
+                        if tr_translate_fast(view, cr3, cpl, compat, rip, false, &r) {
+                            if r.needs_flush {
+                                let isSharedPart = (UInt32(bitPattern: r.key) & 0x4000_0000) != 0
+                                lockHeld = false
+                                translatorLock.unlock()
+                                resetCodeCacheWithOthersOut(afterGeneration: flushGen, forceAll: isSharedPart, forcePrivate: !isSharedPart)
+                                cacheWasReset = true
+                                continue
+                            }
+                            result = r
+                            break
+                        }
+                        // Rare hint mismatch: unlock, prepare, and relock to commit.
+                        lockHeld = false
+                        translatorLock.unlock()
+                        tr_translate_prepare()
+                        lockTranslator()
+                        lockHeld = true
+                    }
+                    let commitStatus = tr_translate_commit(&r)
+                    if commitStatus < 0 {
+                        let isSharedPart = (UInt32(bitPattern: r.key) & 0x4000_0000) != 0
+                        lockHeld = false
+                        translatorLock.unlock()
+                        resetCodeCacheWithOthersOut(afterGeneration: flushGen, forceAll: isSharedPart, forcePrivate: !isSharedPart)
+                        cacheWasReset = true
+                        continue
+                    }
+                    if commitStatus == 0 {
+                        parRetries += 1
+                        if parRetries <= 2 {
+                            lockHeld = false
+                            translatorLock.unlock()
+                            continue
+                        }
+                        let sr = tr_translate(view, cr3, cpl, compat, rip, false)
+                        if sr.needs_flush {
+                            let isSharedPart = (UInt32(bitPattern: sr.key) & 0x4000_0000) != 0
+                            lockHeld = false
+                            translatorLock.unlock()
+                            resetCodeCacheWithOthersOut(afterGeneration: flushGen, forceAll: isSharedPart, forcePrivate: !isSharedPart)
+                            cacheWasReset = true
+                            continue
+                        }
+                        result = sr
+                        break
+                    }
+                    result = r
+                    needPost = true
+                    break
                 }
-                result = r
-                break
+            } else {
+                while true {
+                    let flushGen = gate.flushGeneration
+                    let r = tr_translate(view, cr3, cpl, compat, rip, single)
+                    if r.needs_flush && severalVCPUs {
+                        let isSharedPart = (UInt32(bitPattern: r.key) & 0x4000_0000) != 0
+                        lockHeld = false
+                        translatorLock.unlock()
+                        resetCodeCacheWithOthersOut(afterGeneration: flushGen, forceAll: isSharedPart, forcePrivate: !isSharedPart)
+                        cacheWasReset = true
+                        lockTranslator()
+                        lockHeld = true
+                        continue
+                    }
+                    result = r
+                    break
+                }
             }
-            if let tally, c.pointee.cpl == 3, tr_stats().blocks != coldBefore { tally.coldUserBlock(rip: rip, cr3: c.pointee.req_a.5) }
+            if let tally, c.pointee.cpl == 3, tr_stats().blocks != coldBefore { tally.coldUserBlock(rip: rip, cr3: cr3) }
             if result.fetch_fault_va != 0 {
                 c.pointee.req_r.1 = result.fetch_fault_va + 1
+                if needPost { lockHeld = false; translatorLock.unlock(); tr_translate_post() }
                 return nil
             }
             if result.unprotected != 0 {
@@ -793,6 +880,7 @@ public final class Engine {
                 c.pointee.req_r.1 = 0
                 c.pointee.req_r.2 = (result.unprotected - 1) | 1
                 c.pointee.req_r.3 = 0
+                if needPost { lockHeld = false; translatorLock.unlock(); tr_translate_post() }
                 return nil
             }
             c.pointee.req_r.0 = result.arm
@@ -805,6 +893,11 @@ public final class Engine {
             } else if !result.flushed && site != 0 {
                 if !cacheWasReset { tr_link(site, kind, result.arm, result.key) } // or the site is in the old cache
                 tr_hash_insert(view, rip, result.arm) // so the next site with this target links in the monitor
+            }
+            if needPost {
+                lockHeld = false
+                translatorLock.unlock()
+                tr_translate_post()
             }
         case Int(HC_SMC):
             _ = tr_invalidate_frame(c.pointee.req_a.0, UInt32(c.pointee.req_a.1))

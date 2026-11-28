@@ -54,6 +54,22 @@ TrResult tr_translate(int view, uint64_t cr3, int cpl, bool compat, uint64_t rip
 // As above, but do not start a FEX translation for a cold block.
 TrResult tr_translate_native(int view, uint64_t cr3, int cpl, bool compat, uint64_t rip, bool single);
 
+// 16-core lock-free parallel translation split (1-lock fast path):
+// 0) Unlocked (parallel across all vCPUs): tr_translate_try_prepare_unlocked(...) checks lock-free map/dead hints;
+//    if likely cold/AOT miss, immediately runs AOT lookup/reloc or decode+DAG+emit into TLS and returns true (ready for
+//    single-lock commit). Returns false on likely fast-hit, unprotected frame, or flush-needed (caller locks once).
+// 1) Under translatorLock: tr_translate_fast(...) resolves fast-hit/reuse/flush; returns false only if race missed hint.
+// 2) Unlocked: tr_translate_prepare() runs AOT/decode+emit into TLS (used on hint-miss fallback).
+// 3) Under translatorLock: tr_translate_commit(out) returns 1 (published/dup-discarded), 0 (SMC/PT race -> retry),
+//    or -1 (needs_flush -> caller runs parked flush and retries).
+// 4) Unlocked (after tr_link/tr_hash_insert + unlock): tr_translate_post() performs AOT record & Tier-2 promotion.
+bool tr_par_enabled(void);
+bool tr_translate_try_prepare_unlocked(int view, uint64_t cr3, int cpl, bool compat, uint64_t rip);
+bool tr_translate_fast(int view, uint64_t cr3, int cpl, bool compat, uint64_t rip, bool single, TrResult *out);
+void tr_translate_prepare(void);
+int tr_translate_commit(TrResult *out);
+void tr_translate_post(void);
+
 // Patches an exit stub: site is the guest VA reported in the request, kind the svc number, arm the linked target.
 void tr_link(uint64_t site, int kind, uint64_t arm, int key);
 
@@ -121,6 +137,8 @@ typedef struct {
     // Persistent AOT code cache counters (zero when LC_HVDBT_AOT_CACHE is unset).
     uint64_t aot_enabled, aot_loaded, aot_loaded_t2, aot_lookups, aot_hits_t1, aot_hits_t2, aot_misses;
     uint64_t aot_reloc_failures, aot_eager_cc_links, aot_recorded_t1, aot_recorded_t2, aot_saves_ok, aot_saved_bytes, aot_reloc_ns;
+    // Parallel lock-free translation pipeline counters (global, repeated per vCPU).
+    uint64_t par_enabled, par_translates, par_fast_hits, par_dups, par_retries, par_fallbacks;
 } TrStats;
 TrStats tr_stats(void);
 void tr_aot_flush(void);

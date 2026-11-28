@@ -302,10 +302,16 @@ typedef struct {
     AotDiskRecordHeader *rec;
 } AotStageSlot;
 
+typedef struct AotStageTable {
+    struct AotStageTable *prev_retired;
+    uint32_t buckets;
+    AotStageSlot slots[];
+} AotStageTable;
+
 typedef struct {
+    uint64_t seq; // seqlock: odd = writer active, even & nonzero = valid iff frame_gpa == aligned
     uint64_t frame_gpa;
     uint64_t page_hash;
-    uint8_t  valid;
 } AotFrameHashEntry;
 
 struct AotCache {
@@ -325,8 +331,7 @@ struct AotCache {
     AotArenaChunk  *arena_head;
     size_t          staged_bytes;
     size_t          staged_t2_bytes;
-    AotStageSlot   *stage_table;
-    uint32_t        stage_buckets;
+    AotStageTable  *stage_cur;
     uint32_t        stage_count;
     uint32_t        stage_t2_count;
     uint32_t        dirty_since_save;
@@ -338,6 +343,7 @@ struct AotCache {
     bool            async_save_joinable;
     uint64_t        last_save_mono_s;
 
+    pthread_mutex_t    frame_lock;
     AotFrameHashEntry *frame_cache;
 
 #ifdef __APPLE__
@@ -455,35 +461,54 @@ static void *aot_arena_alloc_locked(AotCache *c, size_t bytes) {
 }
 
 static bool aot_stage_grow_locked(AotCache *c) {
-    uint32_t new_cap = c->stage_buckets ? c->stage_buckets * 2U : AOT_STAGE_INIT_BUCKETS;
-    AotStageSlot *nt = (AotStageSlot *)calloc(new_cap, sizeof(AotStageSlot));
+    AotStageTable *old = c->stage_cur;
+    uint32_t old_cap = old ? old->buckets : 0U;
+    uint32_t new_cap = old_cap ? old_cap * 2U : AOT_STAGE_INIT_BUCKETS;
+    AotStageTable *nt = (AotStageTable *)calloc(1, sizeof(AotStageTable) + (size_t)new_cap * sizeof(AotStageSlot));
     if (!nt)
         return false;
+    nt->buckets = new_cap;
+    nt->prev_retired = old;
     uint32_t mask = new_cap - 1U;
-    for (uint32_t i = 0; i < c->stage_buckets; i++) {
-        if (!c->stage_table[i].rec)
+    for (uint32_t i = 0; i < old_cap; i++) {
+        if (!old->slots[i].rec)
             continue;
-        uint32_t h = (uint32_t)c->stage_table[i].key_hash & mask;
-        while (nt[h].rec)
+        uint32_t h = (uint32_t)old->slots[i].key_hash & mask;
+        while (nt->slots[h].rec)
             h = (h + 1U) & mask;
-        nt[h] = c->stage_table[i];
+        nt->slots[h] = old->slots[i];
     }
-    free(c->stage_table);
-    c->stage_table = nt;
-    c->stage_buckets = new_cap;
+    // Keep retired snapshots alive until aot_close() so concurrent lock-free readers never UAF.
+    __atomic_store_n(&c->stage_cur, nt, __ATOMIC_RELEASE);
     return true;
 }
 
 static const AotDiskRecordHeader *aot_stage_find_locked(const AotCache *c, const AotKey *key, uint64_t kh) {
-    if (!c->stage_table || c->stage_buckets == 0)
+    const AotStageTable *st = c->stage_cur;
+    if (!st || st->buckets == 0)
         return NULL;
-    uint32_t mask = c->stage_buckets - 1U;
-    for (uint32_t h = (uint32_t)kh & mask, n = 0; n < c->stage_buckets; n++, h = (h + 1U) & mask) {
-        const AotStageSlot *s = &c->stage_table[h];
+    uint32_t mask = st->buckets - 1U;
+    for (uint32_t h = (uint32_t)kh & mask, n = 0; n < st->buckets; n++, h = (h + 1U) & mask) {
+        const AotStageSlot *s = &st->slots[h];
         if (!s->rec)
             return NULL;
         if (s->key_hash == kh && aot_key_eq(&s->rec->key, key))
             return s->rec;
+    }
+    return NULL;
+}
+
+static const AotDiskRecordHeader *aot_stage_find_lockfree(const AotCache *c, const AotKey *key, uint64_t kh) {
+    const AotStageTable *st = __atomic_load_n(&c->stage_cur, __ATOMIC_ACQUIRE);
+    if (!st || st->buckets == 0)
+        return NULL;
+    uint32_t mask = st->buckets - 1U;
+    for (uint32_t h = (uint32_t)kh & mask, n = 0; n < st->buckets; n++, h = (h + 1U) & mask) {
+        const AotDiskRecordHeader *rec = __atomic_load_n(&st->slots[h].rec, __ATOMIC_ACQUIRE);
+        if (!rec)
+            return NULL;
+        if (st->slots[h].key_hash == kh && aot_key_eq(&rec->key, key))
+            return rec;
     }
     return NULL;
 }
@@ -590,6 +615,7 @@ AotCache *aot_open(const char *path, uint64_t abi_hash, uint64_t max_bytes) {
     c->max_bytes = max_bytes ? max_bytes : AOT_DEFAULT_MAX_BYTES;
     pthread_mutex_init(&c->lock, NULL);
     pthread_mutex_init(&c->save_lock, NULL);
+    pthread_mutex_init(&c->frame_lock, NULL);
     c->frame_cache = (AotFrameHashEntry *)calloc(AOT_FRAME_CACHE_SLOTS, sizeof(AotFrameHashEntry));
 #ifdef __APPLE__
     mach_timebase_info(&c->tb);
@@ -633,15 +659,21 @@ void aot_close(AotCache *c, bool save_dirty) {
         free(ch);
         ch = nx;
     }
-    free(c->stage_table);
+    AotStageTable *st = c->stage_cur;
+    while (st) {
+        AotStageTable *prev = st->prev_retired;
+        free(st);
+        st = prev;
+    }
     free(c->frame_cache);
     free(c->path);
+    pthread_mutex_destroy(&c->frame_lock);
     pthread_mutex_destroy(&c->save_lock);
     pthread_mutex_destroy(&c->lock);
     free(c);
 }
 
-// ---- Per-Frame Page Hash Cache ----
+// ---- Per-Frame Page Hash Cache (Lock-Free Seqlock Read Fast Path) ----
 
 static inline uint32_t aot_frame_slot(uint64_t frame_gpa) {
     uint64_t pfn = frame_gpa >> 12;
@@ -653,25 +685,35 @@ uint64_t aot_hash_frame_cached(AotCache *c, uint64_t frame_gpa, const uint8_t pa
         return aot_hash_page(page);
     uint64_t aligned = frame_gpa & ~0xFFFULL;
     uint32_t slot = aot_frame_slot(aligned);
-    pthread_mutex_lock(&c->lock);
     AotFrameHashEntry *e = &c->frame_cache[slot];
-    if (e->valid && e->frame_gpa == aligned) {
-        uint64_t h = e->page_hash;
-        c->stats.page_hash_cache_hits++;
-        pthread_mutex_unlock(&c->lock);
-        return h;
+    // Lock-free seqlock read: zero mutex traffic across all 16 cores on hit.
+    for (int attempt = 0; attempt < 2; attempt++) {
+        uint64_t s1 = __atomic_load_n(&e->seq, __ATOMIC_ACQUIRE);
+        if ((s1 & 1ULL) == 0 && s1 != 0) {
+            uint64_t fg = __atomic_load_n(&e->frame_gpa, __ATOMIC_RELAXED);
+            uint64_t ph = __atomic_load_n(&e->page_hash, __ATOMIC_RELAXED);
+            __atomic_thread_fence(__ATOMIC_ACQUIRE);
+            uint64_t s2 = __atomic_load_n(&e->seq, __ATOMIC_RELAXED);
+            if (s1 == s2 && fg == aligned) {
+                __atomic_fetch_add(&c->stats.page_hash_cache_hits, 1ULL, __ATOMIC_RELAXED);
+                return ph;
+            }
+        }
+        if ((s1 & 1ULL) == 0)
+            break;
     }
-    pthread_mutex_unlock(&c->lock);
 
     uint64_t h = aot_hash_page(page);
 
-    pthread_mutex_lock(&c->lock);
-    e = &c->frame_cache[slot];
-    e->frame_gpa = aligned;
-    e->page_hash = h;
-    e->valid = 1;
-    c->stats.page_hash_cache_misses++;
-    pthread_mutex_unlock(&c->lock);
+    pthread_mutex_lock(&c->frame_lock);
+    uint64_t s = e->seq;
+    __atomic_store_n(&e->seq, s + 1ULL, __ATOMIC_RELEASE);
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    __atomic_store_n(&e->frame_gpa, aligned, __ATOMIC_RELAXED);
+    __atomic_store_n(&e->page_hash, h, __ATOMIC_RELAXED);
+    __atomic_store_n(&e->seq, s + 2ULL, __ATOMIC_RELEASE);
+    pthread_mutex_unlock(&c->frame_lock);
+    __atomic_fetch_add(&c->stats.page_hash_cache_misses, 1ULL, __ATOMIC_RELAXED);
     return h;
 }
 
@@ -680,18 +722,33 @@ void aot_invalidate_frame_hash(AotCache *c, uint64_t frame_gpa) {
         return;
     uint64_t aligned = frame_gpa & ~0xFFFULL;
     uint32_t slot = aot_frame_slot(aligned);
-    pthread_mutex_lock(&c->lock);
-    if (c->frame_cache[slot].frame_gpa == aligned)
-        c->frame_cache[slot].valid = 0;
-    pthread_mutex_unlock(&c->lock);
+    pthread_mutex_lock(&c->frame_lock);
+    AotFrameHashEntry *e = &c->frame_cache[slot];
+    if (e->frame_gpa == aligned) {
+        uint64_t s = e->seq;
+        __atomic_store_n(&e->seq, s + 1ULL, __ATOMIC_RELEASE);
+        __atomic_thread_fence(__ATOMIC_RELEASE);
+        __atomic_store_n(&e->frame_gpa, ~0ULL, __ATOMIC_RELAXED);
+        __atomic_store_n(&e->seq, s + 2ULL, __ATOMIC_RELEASE);
+    }
+    pthread_mutex_unlock(&c->frame_lock);
 }
 
 void aot_clear_frame_hashes(AotCache *c) {
     if (!c || !c->frame_cache)
         return;
-    pthread_mutex_lock(&c->lock);
-    memset(c->frame_cache, 0, AOT_FRAME_CACHE_SLOTS * sizeof(AotFrameHashEntry));
-    pthread_mutex_unlock(&c->lock);
+    pthread_mutex_lock(&c->frame_lock);
+    for (uint32_t i = 0; i < AOT_FRAME_CACHE_SLOTS; i++) {
+        AotFrameHashEntry *e = &c->frame_cache[i];
+        if (e->seq != 0) {
+            uint64_t s = e->seq;
+            __atomic_store_n(&e->seq, s + 1ULL, __ATOMIC_RELEASE);
+            __atomic_thread_fence(__ATOMIC_RELEASE);
+            __atomic_store_n(&e->frame_gpa, ~0ULL, __ATOMIC_RELAXED);
+            __atomic_store_n(&e->seq, s + 2ULL, __ATOMIC_RELEASE);
+        }
+    }
+    pthread_mutex_unlock(&c->frame_lock);
 }
 
 // ---- Lookup & Recording ----
@@ -702,7 +759,7 @@ bool aot_lookup(AotCache *c, const AotKey *key, AotBlockView *out_view) {
     uint64_t kh = aot_hash_key(key);
     __atomic_fetch_add(&c->stats.lookups, 1ULL, __ATOMIC_RELAXED);
 
-    // Lock-free fast path: immutable read-only mmap'd disk index first!
+    // Lock-free fast path 1: immutable read-only mmap'd disk index.
     AotBlockView dv;
     if (aot_disk_find(c, key, kh, &dv)) {
         if (out_view)
@@ -714,20 +771,16 @@ bool aot_lookup(AotCache *c, const AotKey *key, AotBlockView *out_view) {
         return true;
     }
 
-    if (__atomic_load_n(&c->stage_count, __ATOMIC_ACQUIRE) > 0) {
-        pthread_mutex_lock(&c->lock);
-        const AotDiskRecordHeader *staged = aot_stage_find_locked(c, key, kh);
-        if (staged) {
-            if (out_view)
-                aot_view_from_hdr(staged, out_view);
-            pthread_mutex_unlock(&c->lock);
-            if (key->mode_bits & AOT_MODE_IS_T2)
-                __atomic_fetch_add(&c->stats.hits_t2, 1ULL, __ATOMIC_RELAXED);
-            else
-                __atomic_fetch_add(&c->stats.hits_t1, 1ULL, __ATOMIC_RELAXED);
-            return true;
-        }
-        pthread_mutex_unlock(&c->lock);
+    // Lock-free fast path 2: immutable-record in-memory staging table.
+    const AotDiskRecordHeader *staged = aot_stage_find_lockfree(c, key, kh);
+    if (staged) {
+        if (out_view)
+            aot_view_from_hdr(staged, out_view);
+        if (key->mode_bits & AOT_MODE_IS_T2)
+            __atomic_fetch_add(&c->stats.hits_t2, 1ULL, __ATOMIC_RELAXED);
+        else
+            __atomic_fetch_add(&c->stats.hits_t1, 1ULL, __ATOMIC_RELAXED);
+        return true;
     }
 
     __atomic_fetch_add(&c->stats.misses, 1ULL, __ATOMIC_RELAXED);
@@ -767,7 +820,7 @@ bool aot_record(AotCache *c, const AotBlockView *view) {
         return false;
     }
 
-    if (c->stage_buckets == 0 || (uint64_t)(c->stage_count + 1U) * 10ULL >= (uint64_t)c->stage_buckets * 7ULL) {
+    if (!c->stage_cur || (uint64_t)(c->stage_count + 1U) * 10ULL >= (uint64_t)c->stage_cur->buckets * 7ULL) {
         if (!aot_stage_grow_locked(c)) {
             pthread_mutex_unlock(&c->lock);
             return false;
@@ -812,12 +865,14 @@ bool aot_record(AotCache *c, const AotBlockView *view) {
     hdr->rec_xxh32 = aot_compute_record_xxh32(hdr, view->code, view->pcm, view->relocs,
                                               has_t2m ? &view->t2_meta : NULL);
 
-    uint32_t mask = c->stage_buckets - 1U;
+    AotStageTable *st = c->stage_cur;
+    uint32_t mask = st->buckets - 1U;
     uint32_t h = (uint32_t)kh & mask;
-    while (c->stage_table[h].rec)
+    while (st->slots[h].rec)
         h = (h + 1U) & mask;
-    c->stage_table[h].key_hash = kh;
-    c->stage_table[h].rec = hdr;
+    // Publish key_hash before releasing rec so lock-free readers observe fully initialized record & key_hash.
+    st->slots[h].key_hash = kh;
+    __atomic_store_n(&st->slots[h].rec, hdr, __ATOMIC_RELEASE);
 
     __atomic_store_n(&c->stage_count, c->stage_count + 1U, __ATOMIC_RELEASE);
     c->staged_bytes += rec_sz;
@@ -991,6 +1046,11 @@ bool aot_materialize(AotCache *c,
                 bool is_bl = (r->aux & 0x80U) != 0;
                 if (stub_id >= AOT_STUB_COUNT)
                     goto reloc_fail;
+                if (dst_cc_va == 0) {
+                    // Deferred stub relocation (unlocked parallel prepare): commit patches exact final VA.
+                    dst_code[w] = is_bl ? 0x94000000u : 0x14000000u;
+                    break;
+                }
                 uint64_t pc_va = dst_cc_va + (uint64_t)w * 4ULL;
                 uint64_t stub_va = aot_resolve_stub_va(stubs, (AotStubId)stub_id, dst_part, pc_va);
                 int64_t disp = (int64_t)(stub_va - pc_va) / 4;
@@ -1123,16 +1183,19 @@ bool aot_save(AotCache *c) {
     }
 
     // 1. Snapshot ONLY staged pointers under short c->lock (arena chunks & disk_map are immutable!).
-    for (uint32_t i = 0; i < c->stage_buckets; i++) {
-        const AotDiskRecordHeader *hdr = c->stage_table[i].rec;
-        if (!hdr)
-            continue;
-        size_t rsz = aot_record_disk_size(hdr->code_words, hdr->pcm_count, hdr->reloc_count, hdr->has_t2_meta);
-        AotEmitItem it = { (const uint8_t *)hdr, rsz, c->stage_table[i].key_hash, hdr->priority };
-        if (hdr->priority >= AOT_PRIO_TIER2)
-            t2_items[t2_n++] = it;
-        else
-            t1_items[t1_n++] = it;
+    if (c->stage_cur) {
+        const AotStageTable *st = c->stage_cur;
+        for (uint32_t i = 0; i < st->buckets; i++) {
+            const AotDiskRecordHeader *hdr = st->slots[i].rec;
+            if (!hdr)
+                continue;
+            size_t rsz = aot_record_disk_size(hdr->code_words, hdr->pcm_count, hdr->reloc_count, hdr->has_t2_meta);
+            AotEmitItem it = { (const uint8_t *)hdr, rsz, st->slots[i].key_hash, hdr->priority };
+            if (hdr->priority >= AOT_PRIO_TIER2)
+                t2_items[t2_n++] = it;
+            else
+                t1_items[t1_n++] = it;
+        }
     }
     pthread_mutex_unlock(&c->lock);
 
@@ -1330,6 +1393,11 @@ void aot_maybe_save_async(AotCache *c, uint32_t min_dirty) {
     pthread_mutex_unlock(&c->save_lock);
 }
 
+void aot_note_eager_links(AotCache *c, uint64_t count) {
+    if (c && count)
+        __atomic_fetch_add(&c->stats.eager_cc_links, count, __ATOMIC_RELAXED);
+}
+
 AotStats aot_get_stats(const AotCache *c) {
     AotStats s;
     memset(&s, 0, sizeof s);
@@ -1338,5 +1406,14 @@ AotStats aot_get_stats(const AotCache *c) {
     pthread_mutex_lock(&((AotCache *)c)->lock);
     s = c->stats;
     pthread_mutex_unlock(&((AotCache *)c)->lock);
+    s.lookups = __atomic_load_n(&c->stats.lookups, __ATOMIC_RELAXED);
+    s.hits_t1 = __atomic_load_n(&c->stats.hits_t1, __ATOMIC_RELAXED);
+    s.hits_t2 = __atomic_load_n(&c->stats.hits_t2, __ATOMIC_RELAXED);
+    s.misses = __atomic_load_n(&c->stats.misses, __ATOMIC_RELAXED);
+    s.reloc_failures = __atomic_load_n(&c->stats.reloc_failures, __ATOMIC_RELAXED);
+    s.eager_cc_links = __atomic_load_n(&c->stats.eager_cc_links, __ATOMIC_RELAXED);
+    s.page_hash_cache_hits = __atomic_load_n(&c->stats.page_hash_cache_hits, __ATOMIC_RELAXED);
+    s.page_hash_cache_misses = __atomic_load_n(&c->stats.page_hash_cache_misses, __ATOMIC_RELAXED);
+    s.reloc_ns_total = __atomic_load_n(&c->stats.reloc_ns_total, __ATOMIC_RELAXED);
     return s;
 }

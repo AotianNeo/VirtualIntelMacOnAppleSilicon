@@ -165,6 +165,9 @@ extern const u8 cc_reads[16];
 
 // Reads up to n guest bytes at va. Returns the count readable (may stop at an unmapped page).
 int tr_fetch(u64 va, u8 *out, int n);
+// Fast direct host-RAM pointer fetch when va stays safely within the cached guest page (>=32B headroom); NULL -> fallback to tr_fetch.
+const u8 *tr_fetch_fast(u64 va, int *avail);
+void x86_decode_init(void);
 void x86_decode(u64 rip, Insn *in);
 bool insn_is_terminator(const Insn *in);
 
@@ -375,6 +378,12 @@ void emit_pcmpistri_el0(int d, int s, u8 imm, int live);
 extern u64 tr_stub_lookup, tr_stub_ret_miss, tr_stub_pushf, tr_stub_sahf;
 extern _Thread_local int cur_part;
 
+// Parallel lock-free translation capture (active during unlocked tr_translate_prepare).
+extern _Thread_local bool tr_par_active;
+extern _Thread_local u32 *tr_par_block_start;
+void tr_par_record_stub(u32 word_off, AotStubId id, bool is_bl);
+void tr_par_record_cc_branch(u32 word_off, AotCcBranchKind kind, u32 lit_off);
+
 // Persistent AOT cache relocation capture (inert when tr_aot_active == false).
 extern bool tr_aot_active;
 extern _Thread_local AotCapture tr_aot_cap;
@@ -399,12 +408,16 @@ static inline void tr_aot_note_gva64_lit(u32 *lit_site) {
 }
 
 static inline void tr_aot_note_stub(u32 *branch_site, AotStubId id, bool is_bl) {
+    if (__builtin_expect(tr_par_active, 0))
+        tr_par_record_stub((u32)(branch_site - tr_par_block_start), id, is_bl);
     if (__builtin_expect(tr_aot_active && tr_aot_cap.active, 0))
         aot_capture_add(&tr_aot_cap, (u32)(branch_site - tr_aot_block_start),
                         AOT_RELOC_STUB_BRANCH, (u8)((u8)id | (is_bl ? 0x80u : 0u)), 0);
 }
 
 static inline void tr_aot_note_cc_branch(u32 *site, AotCcBranchKind kind, u32 *lit_site) {
+    if (__builtin_expect(tr_par_active, 0))
+        tr_par_record_cc_branch((u32)(site - tr_par_block_start), kind, (u32)(lit_site - tr_par_block_start));
     if (__builtin_expect(tr_aot_active && tr_aot_cap.active, 0)) {
         u32 lit_off = (u32)(lit_site - tr_aot_block_start);
         if (lit_off > 0xFFFFU) {

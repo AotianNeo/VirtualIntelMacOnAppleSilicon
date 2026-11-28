@@ -219,6 +219,7 @@ bool aot_materialize(AotCache *cache,
                      void *resolve_ctx);
 
 bool     aot_record(AotCache *cache, const AotBlockView *view);
+void     aot_note_eager_links(AotCache *cache, uint64_t count);
 AotStats aot_get_stats(const AotCache *cache);
 
 // ---- Emitter Capture & Fixed-Width Relocatable Helpers ----

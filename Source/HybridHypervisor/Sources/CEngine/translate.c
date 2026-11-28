@@ -14,6 +14,8 @@ _Thread_local u16 tr_zext8 = 0, tr_zext16 = 0;
 bool tr_opt_peep = true, tr_opt_ymm_cache = true;
 static bool native_dag = true, native_l1 = true;
 static bool p0_ring_enabled = false;
+static bool par_translate_enabled = true;
+static int no_uframe_share = 0;
 _Thread_local u16 tr_aes_mask = 0;
 _Thread_local u8 tr_aes_key[16];
 
@@ -102,6 +104,8 @@ bool tr_page_rep;
 _Thread_local int tr_cpl;
 _Thread_local bool tr_compat;
 _Thread_local bool tr_t2_mode;
+_Thread_local bool tr_par_active;
+_Thread_local u32 *tr_par_block_start;
 bool tr_aot_active;
 _Thread_local AotCapture tr_aot_cap;
 _Thread_local u32 *tr_aot_block_start;
@@ -211,10 +215,21 @@ static u64 invalidation_ns(u64 ticks) {
     return (u64)((__uint128_t)ticks * invalidation_timebase.numer / invalidation_timebase.denom);
 }
 
+static pthread_mutex_t stop_reason_lock = PTHREAD_MUTEX_INITIALIZER;
 static const char *stop_reasons[4096];
 static u32 stop_reason_count;
 
-u64 tr_cc_va(const u32 *p) { return PRIV_VA + OFF_CC + (u64)((const u8 *)p - (const u8 *)cc_base); }
+// Monotonic invalidation/flush sequence counters for lock-free parallel translate commit verification.
+#define PAR_GEN_BUCKETS 4096U
+static u64 tr_frame_inval_gen[PAR_GEN_BUCKETS];
+static u64 tr_pt_inval_gen;
+static u64 tr_flush_gen;
+
+u64 tr_cc_va(const u32 *p) {
+    if (__builtin_expect(tr_par_active, 0))
+        return PRIV_VA + (cur_part ? OFF_CC2 : OFF_CC) + (u64)((const u8 *)p - (const u8 *)tr_par_block_start);
+    return PRIV_VA + OFF_CC + (u64)((const u8 *)p - (const u8 *)cc_base);
+}
 static u32 *cc_host(u64 va) { return (u32 *)((u8 *)cc_base + (va - PRIV_VA - OFF_CC)); }
 
 static u32 map_hash(int view, u64 rip) { return (u32)((rip ^ ((u64)view << 40)) * 0x9E3779B97F4A7C15ULL >> (64 - MAP_BITS)); }
@@ -228,13 +243,29 @@ static u32 map_find(int view, u64 rip) {
             return e->block;
     }
 }
+// Advisory lock-free probe used ONLY to avoid taking translatorLock before parallel prepare.
+// Authoritative lookup always runs under translatorLock in tr_translate_fast / tr_translate_commit.
+static bool map_find_hint(int view, u64 rip) {
+    u32 h = map_hash(view, rip);
+    for (u32 probes = 0; probes < 32; probes++, h = (h + 1) & (MAP_SIZE - 1)) {
+        MapEntry *e = &block_map[h];
+        u32 blk = __atomic_load_n(&e->block, __ATOMIC_RELAXED);
+        if (!blk)
+            return false;
+        if (blk != ~0u &&
+            __atomic_load_n(&e->rip, __ATOMIC_RELAXED) == rip &&
+            __atomic_load_n(&e->view, __ATOMIC_RELAXED) == (u32)view)
+            return true;
+    }
+    return true; // long chain -> let locked fast path decide
+}
 static void map_insert(int view, u64 rip, u32 block) {
     for (u32 h = map_hash(view, rip);; h = (h + 1) & (MAP_SIZE - 1)) {
         MapEntry *e = &block_map[h];
         if (!e->block || e->block == ~0u) {
-            e->rip = rip;
-            e->view = (u32)view;
-            e->block = block;
+            __atomic_store_n(&e->rip, rip, __ATOMIC_RELAXED);
+            __atomic_store_n(&e->view, (u32)view, __ATOMIC_RELAXED);
+            __atomic_store_n(&e->block, block, __ATOMIC_RELEASE);
             return;
         }
     }
@@ -245,7 +276,7 @@ static void map_remove(int view, u64 rip) {
         if (!e->block)
             return;
         if (e->block != ~0u && e->rip == rip && e->view == (u32)view) {
-            e->block = ~0u;
+            __atomic_store_n(&e->block, ~0u, __ATOMIC_RELAXED);
             return;
         }
     }
@@ -290,17 +321,15 @@ static int shared_user_key(u64 cr3, int cpl, u64 rip) {
         if (cpl == 0)
             directory |= SHARED_COMPAT_KERNEL;
     }
-    for (u32 i = 0; i < ctx_ptr->shared_dir_count; i++)
+    u32 shared_cnt = __atomic_load_n(&ctx_ptr->shared_dir_count, __ATOMIC_ACQUIRE);
+    for (u32 i = 0; i < shared_cnt; i++)
         if (ctx_ptr->shared_dirs[i] == directory)
             return compat ? (int)(0xC0000000u | i) : KEY_DOMAIN | (int)((directory >> 12) & 0x3FFFFFFF);
     return 0;
 }
 
 static int shared_user_frame_key(u64 cr3, int cpl, u64 rip) {
-    static int no_uframe = -1;
-    if (no_uframe < 0)
-        no_uframe = getenv("LC_HVDBT_NO_USER_FRAME_SHARE") != NULL;
-    if (no_uframe || cpl != 3 || tr_compat || (rip >> 47) || (rip & 0xfffULL) >= 4096 - 16)
+    if (no_uframe_share || cpl != 3 || tr_compat || (rip >> 47) || (rip & 0xfffULL) >= 4096 - 16)
         return 0;
     u64 table = cr3 & 0x000FFFFFFFFFF000ULL;
     if (!is_ram(table))
@@ -361,9 +390,9 @@ static int block_key(int view, u64 cr3, int cpl, u64 rip) {
     return uframe ? uframe : view;
 }
 
-// ---- Guest memory, host's read-only view ----
-static u64 walk_cr3;
-static int walk_cpl;
+// ---- Guest memory, host's read-only view (thread-local for 16-core parallel translate) ----
+static _Thread_local u64 walk_cr3;
+static _Thread_local int walk_cpl;
 #define X_P 1ULL
 #define X_US 4ULL
 #define X_PS 0x80ULL
@@ -401,10 +430,11 @@ ok:
     return is_ram(*gpa);
 }
 
-static u64 fetch_lo, fetch_hi; // all a translation has read
-static bool fetch_cache_valid;
-static u64 fetch_cache_va_page, fetch_cache_gpa_page, fetch_cache_cr3;
-static int fetch_cache_cpl;
+static _Thread_local u64 fetch_lo, fetch_hi; // all a translation has read
+static _Thread_local bool fetch_cache_valid;
+static _Thread_local u64 fetch_cache_va_page, fetch_cache_gpa_page, fetch_cache_cr3;
+static _Thread_local const u8 *fetch_cache_host_page;
+static _Thread_local int fetch_cache_cpl;
 
 // ---- Inert analyzed-input recurrence census ----
 // One entry per direct-mapped identity, full population: this is not a sampled cache with an inflated retention budget.
@@ -617,6 +647,7 @@ int tr_fetch(u64 va, u8 *out, int n) {
             }
             fetch_cache_va_page = cur_pg;
             fetch_cache_gpa_page = gpa & ~0xfffULL;
+            fetch_cache_host_page = ram_at(fetch_cache_gpa_page);
             fetch_cache_cr3 = walk_cr3;
             fetch_cache_cpl = walk_cpl;
             fetch_cache_valid = true;
@@ -630,6 +661,33 @@ int tr_fetch(u64 va, u8 *out, int n) {
         got += chunk;
     }
     return got;
+}
+
+const u8 *tr_fetch_fast(u64 va, int *avail) {
+    if (__builtin_expect(tr_t2_mode || cfg.profile_compile_inputs, 0))
+        return NULL;
+    u64 off = va & 0xfffULL;
+    if (__builtin_expect(off > 4096ULL - 32ULL, 0))
+        return NULL;
+    u64 cur_pg = va & ~0xfffULL;
+    if (__builtin_expect(!(fetch_cache_valid && cur_pg == fetch_cache_va_page &&
+                           walk_cr3 == fetch_cache_cr3 && walk_cpl == fetch_cache_cpl), 0)) {
+        u64 gpa;
+        if (!fetch_walk(va, &gpa))
+            return NULL;
+        fetch_cache_va_page = cur_pg;
+        fetch_cache_gpa_page = gpa & ~0xfffULL;
+        fetch_cache_host_page = ram_at(fetch_cache_gpa_page);
+        fetch_cache_cr3 = walk_cr3;
+        fetch_cache_cpl = walk_cpl;
+        fetch_cache_valid = true;
+    }
+    if (va < fetch_lo)
+        fetch_lo = va;
+    if (va + 15ULL > fetch_hi)
+        fetch_hi = va + 15ULL;
+    *avail = 15;
+    return fetch_cache_host_page + off;
 }
 
 // With several vCPUs a block is found the moment it exists, by vCPUs that may already have seen a later store. So its bytes must be read
@@ -709,26 +767,32 @@ typedef struct {
     int kind; // SVC_DIRECT, SVC_JCC, SVC_CALL
     int form; // 0 b.cond/cbz (19-bit), 1 b/bl (26-bit), 2 tbz (unused)
 } Pending;
-static Pending pend[MAX_PENDING];
-static int pend_count;
+static _Thread_local Pending pend[MAX_PENDING];
+static _Thread_local int pend_count;
 
 void emit_stop(u64 rip, const char *why) {
     compile_inputs_reject(TR_CI_UNSUPPORTED);
     aot_capture_mark_ineligible(&tr_aot_cap);
     (void)rip;
+    pthread_mutex_lock(&stop_reason_lock);
     u32 idx = stop_reason_count;
     for (u32 i = 0; i < stop_reason_count; i++)
         if (stop_reasons[i] == why || !strcmp(stop_reasons[i], why)) {
             idx = i;
             break;
         }
-    if (idx == stop_reason_count && stop_reason_count < 4096)
-        stop_reasons[stop_reason_count++] = why;
+    if (idx == stop_reason_count && stop_reason_count < 4096) {
+        stop_reasons[stop_reason_count] = why;
+        __atomic_store_n(&stop_reason_count, stop_reason_count + 1U, __ATOMIC_RELEASE);
+    }
+    pthread_mutex_unlock(&stop_reason_lock);
     svc(SVC_STOP);
     E(idx);
 }
 
-const char *tr_stop_reason(uint32_t index) { return index < stop_reason_count ? stop_reasons[index] : "?"; }
+const char *tr_stop_reason(uint32_t index) {
+    return index < __atomic_load_n(&stop_reason_count, __ATOMIC_ACQUIRE) ? stop_reasons[index] : "?";
+}
 
 static void add_pending(u32 *site, u64 target, int kind, int form) {
     pend[pend_count].site = site;
@@ -755,15 +819,15 @@ typedef struct {
     u32 *blr_site; // for OP_CALLI: jump back to blr x22
     bool is_call;
 } L1Miss;
-static L1Miss l1_miss[MAX_L1_MISS];
-static int l1_miss_count;
+static _Thread_local L1Miss l1_miss[MAX_L1_MISS];
+static _Thread_local int l1_miss_count;
 
-static int cur_key;
-static u64 cur_entry_rip, cur_page;
-static bool cur_single;
+static _Thread_local int cur_key;
+static _Thread_local u64 cur_entry_rip, cur_page;
+static _Thread_local bool cur_single;
 
 static u32 *try_direct_link_target(int key, u64 entry_rip, u64 page, u64 target, bool single) {
-    if (single || target == entry_rip || (tr_aot_active && tr_aot_cap.active))
+    if (single || target == entry_rip || tr_par_active || (tr_aot_active && tr_aot_cap.active))
         return NULL;
     if ((key & KEY_USER_FRAME) == KEY_USER_FRAME && (target & ~0xfffULL) != page)
         return NULL;
@@ -802,17 +866,17 @@ static void emit_indirect_tail(void) {
     br(S2);
 }
 
-static const Insn *block_insns;
-static u32 *insn_arm[MAX_INSNS];
-static int insn_total;
+static _Thread_local const Insn *block_insns;
+static _Thread_local u32 *insn_arm[MAX_INSNS];
+static _Thread_local int insn_total;
 
 typedef struct {
     u32 *site;
     int target_idx;
     int form;
 } FwdFix;
-static FwdFix fwd_fix[MAX_FWD_FIX];
-static int fwd_count;
+static _Thread_local FwdFix fwd_fix[MAX_FWD_FIX];
+static _Thread_local int fwd_count;
 
 // If target is an instruction already emitted in this block, returns where.
 static u32 *internal_target(u64 target, int upto) {
@@ -1382,7 +1446,7 @@ static void expand_forward_dag(Insn *list, int *count_p, int key, u64 entry_rip,
         u64 t = q[qh++];
         if (t < max_end && linear_find_rip(list, count, t) >= 0)
             continue;
-        if (!cfg.profile_compile_inputs) {
+        if (!cfg.profile_compile_inputs && !tr_par_active) {
             u32 hit = map_find(key, t);
             if (hit && !hblocks[hit - 1].dead)
                 continue;
@@ -1807,6 +1871,1577 @@ static void tr_aot_atexit_flush(void) {
         aot_cache = NULL;
         tr_aot_active = false;
         aot_close(c, true);
+    }
+}
+
+// ---- 16-Core Lock-Free Parallel Translation Pipeline ----
+#define PAR_CODE_CAP 32768U
+#define PAR_PCM_CAP (MAX_INSNS + 256U)
+#define PAR_MAX_STUBS 512U
+#define PAR_MAX_LINKS (MAX_PENDING + 64U)
+
+typedef struct {
+    u32 word_off;
+    u8 stub_id;
+    u8 is_bl;
+} ParStubSite;
+
+typedef struct {
+    u32 word_off;
+    u32 lit_off;
+    u8 kind;
+} ParLinkSite;
+
+typedef enum {
+    PAR_RES_NONE = 0,
+    PAR_RES_AOT_HIT,
+    PAR_RES_COLD,
+    PAR_RES_FETCH_FAULT,
+    PAR_RES_UNPROTECTED,
+    PAR_RES_FALLBACK_LOCKED,
+} ParResKind;
+
+typedef struct {
+    u64 op_mask_lo, op_mask_hi;
+    u32 op_insns_d[128];
+    u32 op_words_d[128];
+    u32 insn_count;
+    u32 exit_words;
+} BlockStatsDelta;
+
+static inline void block_stats_reset(BlockStatsDelta *d) {
+    d->op_mask_lo = 0;
+    d->op_mask_hi = 0;
+    d->insn_count = 0;
+    d->exit_words = 0;
+}
+
+static inline void block_stats_touch_op(BlockStatsDelta *d, u8 op) {
+    u32 o = op & 127u;
+    if (o < 64u) {
+        u64 bit = 1ULL << o;
+        if (!(d->op_mask_lo & bit)) {
+            d->op_mask_lo |= bit;
+            d->op_insns_d[o] = 0;
+            d->op_words_d[o] = 0;
+        }
+    } else {
+        u64 bit = 1ULL << (o - 64u);
+        if (!(d->op_mask_hi & bit)) {
+            d->op_mask_hi |= bit;
+            d->op_insns_d[o] = 0;
+            d->op_words_d[o] = 0;
+        }
+    }
+}
+
+static inline void block_stats_add_insn(BlockStatsDelta *d, u8 op) {
+    block_stats_touch_op(d, op);
+    d->op_insns_d[op & 127u]++;
+    d->insn_count++;
+}
+
+static inline void block_stats_add_words(BlockStatsDelta *d, u8 op, u32 words) {
+    block_stats_touch_op(d, op);
+    d->op_words_d[op & 127u] += words;
+}
+
+static void block_stats_merge(const BlockStatsDelta *d) {
+    stats.insns += d->insn_count;
+    stats.exit_words += d->exit_words;
+    u64 m = d->op_mask_lo;
+    while (m) {
+        u32 o = (u32)__builtin_ctzll(m);
+        m &= m - 1ULL;
+        stats.op_insns[o] += d->op_insns_d[o];
+        stats.op_words[o] += d->op_words_d[o];
+    }
+    m = d->op_mask_hi;
+    while (m) {
+        u32 o = 64u + (u32)__builtin_ctzll(m);
+        m &= m - 1ULL;
+        stats.op_insns[o] += d->op_insns_d[o];
+        stats.op_words[o] += d->op_words_d[o];
+    }
+}
+
+typedef struct {
+    // Captured before parallel prepare
+    int view, key, cpl;
+    u64 cr3, rip, page;
+    bool compat;
+    u64 prep_ticks;
+    u64 fgen_flush;
+    u64 pt_gen;
+    u64 fgen0, fgen1;
+    bool have_gpa0;
+    u64 frame0, frame1;
+
+    // Produced unlocked in tr_translate_prepare()
+    ParResKind res_kind;
+    u64 fault_or_unprot;
+    u32 code_words;
+    u32 pcm_count;
+    u32 stub_cnt;
+    u32 link_cnt;
+    bool par_overflow;
+
+    // Guest read-bytes snapshot for remember_reads()
+    u16 snap_off, snap_len;
+    u8 snap_bytes[4096];
+
+    // AOT / Tier-2 metadata
+    bool aot_have_page_hash;
+    u64 aot_page_hash;
+    bool aot_record_eligible;
+    bool t2_has_loop;
+    u32 t2_patch_off; // word offset relative to start, or ~0U
+    u16 aot_t2_patch_off, aot_t2_head_off, aot_t2_min_off, aot_t2_span_bytes;
+    u64 t2_head_rip;
+
+    BlockStatsDelta sdelta;
+
+    // Post-commit state executed unlocked in tr_translate_post()
+    bool need_post;
+    bool post_is_aot_hit;
+    u32 pub_idx, pub_part, pub_slot;
+    u32 pub_entry_word, pub_arm_words, pub_t2_patch_word;
+    u16 pub_read_off, pub_read_bytes;
+    u64 pub_t2_epoch;
+
+    // Per-vCPU scratch buffers (heap-allocated once per thread)
+    u32 code[PAR_CODE_CAP];
+    PcMap pcm[PAR_PCM_CAP];
+    Insn list[MAX_INSNS];
+    ParStubSite stubs[PAR_MAX_STUBS];
+    ParLinkSite links[PAR_MAX_LINKS];
+    AotCapture aot_cap;
+} ParScratch;
+
+static _Thread_local ParScratch *tls_par;
+
+static ParScratch *par_scratch_get(void) {
+    if (__builtin_expect(!tls_par, 0))
+        tls_par = (ParScratch *)calloc(1, sizeof(ParScratch));
+    return tls_par;
+}
+
+void tr_par_record_stub(u32 word_off, AotStubId id, bool is_bl) {
+    ParScratch *ps = tls_par;
+    if (!ps || ps->stub_cnt >= PAR_MAX_STUBS) {
+        if (ps)
+            ps->par_overflow = true;
+        return;
+    }
+    ps->stubs[ps->stub_cnt++] = (ParStubSite){ word_off, (u8)id, is_bl ? 1u : 0u };
+}
+
+void tr_par_record_cc_branch(u32 word_off, AotCcBranchKind kind, u32 lit_off) {
+    ParScratch *ps = tls_par;
+    if (!ps || ps->link_cnt >= PAR_MAX_LINKS) {
+        if (ps)
+            ps->par_overflow = true;
+        return;
+    }
+    ps->links[ps->link_cnt++] = (ParLinkSite){ word_off, lit_off, (u8)kind };
+}
+
+bool tr_par_enabled(void) {
+    return par_translate_enabled && !cfg.profile_compile_inputs;
+}
+
+typedef struct {
+    int count;
+    int t2_head_i;
+    u32 t2_patch_off; // relative to block start, or ~0U
+    u32 pcm_written;
+    u16 aot_t2_patch_off, aot_t2_head_off, aot_t2_min_off, aot_t2_span_bytes;
+    u64 t2_head_rip;
+    bool overflow;
+} ColdEmitOut;
+
+// Shared cold emission engine: writes ARM64 into `start` (either live cc_base or thread-local ParScratch.code)
+// and PcMap into `pcm_dst[0..pcm_cap)`. Zero shared mutable global writes when `tr_par_active == true`.
+static void emit_cold_block(int key, u64 rip, u64 page, int cpl, bool single, u64 frame0, u64 frame1,
+                            Insn *list, int count, u32 *start, u32 code_cap,
+                            PcMap *pcm_dst, u32 pcm_cap, BlockStatsDelta *sdelta, ColdEmitOut *out) {
+    memset(out, 0, sizeof *out);
+    out->t2_head_i = -1;
+    out->t2_patch_off = ~0U;
+    out->aot_t2_patch_off = AOT_NO_PATCH_WORD;
+    block_stats_reset(sdelta);
+
+    tr_cc = start;
+    Insn *last = &list[count - 1];
+    bool fallthrough_end = !(last->op == OP_JMP || last->op == OP_JMPI || last->op == OP_RET || last->op == OP_BAD ||
+                             last->op == OP_UD || last->op == OP_IRET);
+    block_insns = list;
+    insn_total = count;
+    pend_count = 0;
+    fwd_count = 0;
+    tr_ad_page = ~0ULL;
+    tr_aes_mask = 0;
+    if (tr_aot_active && !single && frame1 == ~0ULL && !cfg.profile_compile_inputs) {
+        tr_aot_block_start = start;
+        aot_capture_begin(&tr_aot_cap);
+    } else {
+        tr_aot_cap.active = false;
+    }
+    if (native_dag && !single && count > 0 && count < MAX_INSNS && frame1 == ~0ULL) {
+        expand_forward_dag(list, &count, key, rip, page);
+        insn_total = count;
+        last = &list[count - 1];
+        fallthrough_end = !is_uncond_term_op(last->op);
+    }
+    out->count = count;
+    cur_key = key;
+    cur_entry_rip = rip;
+    cur_page = page;
+    cur_single = single;
+    l1_miss_count = 0;
+    tr_zext8 = tr_zext16 = 0;
+    ext_ymm_cache_reset();
+
+    int tgt_idx[MAX_INSNS], fall_idx[MAX_INSNS];
+    u8 ext_tgt_live[MAX_INSNS], ext_fall_live[MAX_INSNS];
+    bool is_target[MAX_INSNS];
+    memset(is_target, 0, (size_t)count * sizeof(bool));
+    for (int i = 0; i < count; i++) {
+        const Insn *in = &list[i];
+        tgt_idx[i] = -1;
+        fall_idx[i] = -1;
+        ext_tgt_live[i] = 0;
+        ext_fall_live[i] = 0;
+        if (in->op == OP_JCC || in->op == OP_JRCXZ || in->op == OP_JMP) {
+            int ti = idx_of_rip(list, count, in->target);
+            tgt_idx[i] = ti;
+            if (ti >= 0)
+                is_target[ti] = true;
+            else
+                ext_tgt_live[i] = (u8)flags_needed_at(in->target, page, in->op == OP_JMP ? 3 : 2, list, count);
+        } else if (in->op == OP_CALL) {
+            if (!tr_precise_flags && (in->target & ~0xfffULL) == page && ((in->target + 15) & ~0xfffULL) == page)
+                ext_tgt_live[i] = (u8)flags_needed_at(in->target, page, 2, list, count);
+            else
+                ext_tgt_live[i] = F_ARITH;
+        }
+        if (!is_uncond_term_op(in->op)) {
+            if (i + 1 < count && list[i + 1].rip == in->next) {
+                fall_idx[i] = i + 1;
+            } else {
+                int fi = idx_of_rip(list, count, in->next);
+                fall_idx[i] = fi;
+                if (fi >= 0)
+                    is_target[fi] = true;
+                else
+                    ext_fall_live[i] = (u8)flags_needed_at(in->next, page, 3, list, count);
+            }
+        }
+        if (i > 0 && (is_uncond_term_op(list[i - 1].op) || list[i - 1].next != in->rip))
+            is_target[i] = true;
+    }
+
+    u8 live_after[MAX_INSNS];
+    u8 live_before[MAX_INSNS];
+    if (cfg.all_flags_live) {
+        memset(live_after, F_ARITH, (size_t)count);
+        memset(live_before, F_ARITH, (size_t)count);
+    } else {
+        memset(live_after, 0, (size_t)count);
+        memset(live_before, 0, (size_t)count);
+        bool changed = true;
+        for (int pass = 0; pass < 8 && changed; pass++) {
+            changed = false;
+            for (int i = count - 1; i >= 0; i--) {
+                const Insn *in = &list[i];
+                u8 out_f;
+                if (in->op == OP_JMP) {
+                    out_f = tgt_idx[i] >= 0 ? live_before[tgt_idx[i]] : ext_tgt_live[i];
+                } else if (is_uncond_term_op(in->op) || in->op == OP_CALLI) {
+                    out_f = F_ARITH;
+                } else if (in->op == OP_CALL) {
+                    out_f = ext_tgt_live[i];
+                } else if (in->op == OP_JCC || in->op == OP_JRCXZ) {
+                    u8 f = fall_idx[i] >= 0 ? live_before[fall_idx[i]] : ext_fall_live[i];
+                    u8 t = tgt_idx[i] >= 0 ? live_before[tgt_idx[i]] : ext_tgt_live[i];
+                    out_f = f | t;
+                } else {
+                    out_f = fall_idx[i] >= 0 ? live_before[fall_idx[i]] : ext_fall_live[i];
+                }
+                u8 lb = (u8)((out_f & ~in->writes) | insn_reads(in));
+                if (out_f != live_after[i] || lb != live_before[i]) {
+                    live_after[i] = out_f;
+                    live_before[i] = lb;
+                    changed = true;
+                }
+            }
+        }
+        if (changed) {
+            memset(live_after, F_ARITH, (size_t)count);
+            memset(live_before, F_ARITH, (size_t)count);
+        }
+    }
+
+    int t2_head_i = (!single && (cpl == 3 || t2_eager_mode()) &&
+                     frame1 == ~0ULL && frame0 != ~0ULL && frame0 < cfg.ram_size &&
+                     !tr_precise_flags && !cfg.all_flags_live && !cfg.profile_compile_inputs)
+                        ? t2_find_clean_loop(list, count, tgt_idx)
+                        : -1;
+    out->t2_head_i = t2_head_i;
+    u32 t2_patch_off = ~0U;
+    if (ctx_ptr->vcpu_count > 1 || t2_head_i == 0) // a kill or Tier-2 OSR patches the entry NOP atomically
+        E(WORD_NOP);
+    if (t2_head_i == 0)
+        t2_patch_off = 0U;
+
+    u32 pcm_n = 0;
+    for (int i = 0; i < count; i++) {
+        if (code_cap && (u32)(tr_cc - start) + 1024U >= code_cap) {
+            out->overflow = true;
+            return;
+        }
+        const Insn *in = &list[i];
+        bool prev_fell_through = i > 0 && !is_uncond_term_op(list[i - 1].op) && list[i - 1].next == in->rip;
+        if (is_target[i]) {
+            if (prev_fell_through) {
+                if (tr_aes_mask)
+                    sse_aes_flush_all();
+                if (ext_ymm_cache_has_dirty())
+                    ext_ymm_cache_flush_dirty();
+            }
+            tr_ad_page = ~0ULL;
+            tr_zext8 = tr_zext16 = 0;
+            ext_ymm_cache_reset();
+        }
+        if (ext_ymm_cache_has_dirty() &&
+            (in->op != OP_EXT || in->memop || is_target[i] || ext_ymm_cache_dirty_run() >= 8)) {
+            ext_ymm_cache_flush_dirty();
+        }
+        if (in->op == OP_SSE || in->op == OP_LDMXCSR || in->op == OP_STMXCSR ||
+            in->op == OP_X87 || (in->op == OP_POPCNT && !tr_hybrid)) {
+            ext_ymm_cache_flush_and_drop();
+        }
+        if ((!tr_opt_peep && in->op != OP_SSE && in->op != OP_EXT) ||
+            (tr_opt_peep && !ad_page_safe_op(in->op))) {
+            tr_ad_page = ~0ULL;
+        }
+        if (in->op != OP_SSE && tr_aes_mask)
+            sse_aes_flush_all();
+        if (i == 0 && t2_head_i == 0) {
+            insn_arm[0] = start;
+        } else {
+            insn_arm[i] = tr_cc;
+        }
+        if (i)
+            block_stats_add_words(sdelta, list[i - 1].op, (u32)(tr_cc - insn_arm[i - 1]));
+        block_stats_add_insn(sdelta, in->op);
+        if (!ext_ymm_cache_has_dirty()) {
+            if (pcm_cap && pcm_n >= pcm_cap) {
+                out->overflow = true;
+                return;
+            }
+            pcm_dst[pcm_n].arm_word = (u16)(tr_cc - start);
+            pcm_dst[pcm_n].rip_off = (u16)(in->rip - rip);
+            pcm_n++;
+        }
+        if (i > 0 && i == t2_head_i) {
+            t2_patch_off = (u32)(tr_cc - start);
+            E(WORD_NOP);
+        }
+
+        // P1-A multi-instruction peephole fusions (adjacent non-target pairs).
+        bool fused = false;
+        if (tr_opt_peep && !single && i + 1 < count && !is_target[i + 1] && in->next == list[i + 1].rip) {
+            const Insn *nx = &list[i + 1];
+            // 1) TEST r, r / CMP r, 0 + JE/JNE -> CBZ/CBNZ (flags dead after Jcc).
+            if (in->op == OP_ALU && nx->op == OP_JCC && (nx->cc == 4 || nx->cc == 5) && live_after[i + 1] == 0) {
+                int cbz_reg = -1, cbz_sf = 0;
+                if (in->sub == ALU_TEST && !in->has_imm && in->rm_reg && !in->high_reg && !in->high_rm && in->reg == in->rm) {
+                    if (in->sz == 4 || in->sz == 8) {
+                        cbz_reg = in->rm;
+                        cbz_sf = in->sz == 8;
+                    } else if (in->sz == 1 && (tr_zext8 & (1u << in->rm))) {
+                        cbz_reg = in->rm;
+                        cbz_sf = 0;
+                    } else if (in->sz == 2 && (tr_zext16 & (1u << in->rm))) {
+                        cbz_reg = in->rm;
+                        cbz_sf = 0;
+                    }
+                } else if (in->sub == ALU_CMP && in->has_imm && in->imm == 0 && in->rm_reg && !in->high_rm) {
+                    if (in->sz == 4 || in->sz == 8) {
+                        cbz_reg = in->rm;
+                        cbz_sf = in->sz == 8;
+                    } else if (in->sz == 1 && (tr_zext8 & (1u << in->rm))) {
+                        cbz_reg = in->rm;
+                        cbz_sf = 0;
+                    } else if (in->sz == 2 && (tr_zext16 & (1u << in->rm))) {
+                        cbz_reg = in->rm;
+                        cbz_sf = 0;
+                    }
+                }
+                if (cbz_reg >= 0) {
+                    u32 *back = internal_target(nx->target, i);
+                    int fwd = back ? -1 : forward_target_idx(nx->target, i + 1);
+                    u32 *direct = (back || fwd >= 0) ? NULL : try_direct_link_target(cur_key, cur_entry_rip, cur_page, nx->target, cur_single);
+                    i64 dd = direct ? (direct - tr_cc) : 0;
+                    if (direct && (dd < -(1 << 18) || dd >= (1 << 18)))
+                        direct = NULL;
+                    if (back) {
+                        cbz(nx->cc == 5, cbz_sf, cbz_reg, (int)(back - tr_cc));
+                    } else if (fwd >= 0) {
+                        add_fwd(tr_cc, fwd, 0);
+                        cbz(nx->cc == 5, cbz_sf, cbz_reg, 0);
+                    } else if (direct) {
+                        cbz(nx->cc == 5, cbz_sf, cbz_reg, (int)dd);
+                    } else {
+                        add_pending(tr_cc, nx->target, SVC_JCC, 0);
+                        cbz(nx->cc == 5, cbz_sf, cbz_reg, 0);
+                    }
+                    insn_arm[i + 1] = insn_arm[i];
+                    block_stats_add_insn(sdelta, nx->op);
+                    i++;
+                    fused = true;
+                } else if (in->sub == ALU_TEST && in->has_imm && (in->rm_reg || !tr_precise_flags)) {
+                    // 2) TEST r/m, #(1<<k) + JE/JNE -> TBZ/TBNZ (STRICTLY internal targets only; 14-bit range!).
+                    u64 m = in->sz == 1 ? (u8)in->imm : in->sz == 2 ? (u16)in->imm : in->sz == 4 ? (u32)in->imm : (u64)in->imm;
+                    if (m != 0 && (m & (m - 1)) == 0) {
+                        u32 *back = internal_target(nx->target, i);
+                        int fwd = back ? -1 : forward_target_idx(nx->target, i + 1);
+                        bool back_ok = back && (back - tr_cc) >= -(1 << 13) + 16 && (back - tr_cc) < (1 << 13) - 16;
+                        bool fwd_ok = false;
+                        if (fwd >= 0 && (fwd - (i + 1)) <= 48 && fwd_count < MAX_FWD_FIX) {
+                            fwd_ok = true;
+                            for (int k = i + 2; k < fwd; k++) {
+                                u8 kop = list[k].op;
+                                if (kop == OP_EXT || kop == OP_SSE || kop == OP_X87 || kop == OP_STRING) {
+                                    fwd_ok = false;
+                                    break;
+                                }
+                            }
+                        }
+                        if (back_ok || fwd_ok) {
+                            int bit = __builtin_ctzll(m);
+                            int treg;
+                            if (in->rm_reg) {
+                                treg = gpr_phys(in->rm, in->high_rm);
+                                if (in->high_rm)
+                                    bit += 8;
+                            } else {
+                                ldst(1, in->sz, S0, addr_prepare(in, in->sz));
+                                treg = S0;
+                            }
+                            if (back_ok) {
+                                tbz(nx->cc == 5, treg, bit, (int)(back - tr_cc));
+                            } else {
+                                add_fwd(tr_cc, fwd, 2);
+                                tbz(nx->cc == 5, treg, bit, 0);
+                            }
+                            insn_arm[i + 1] = insn_arm[i];
+                            block_stats_add_insn(sdelta, nx->op);
+                            i++;
+                            fused = true;
+                        }
+                    }
+                }
+            } else if (in->op == OP_SETCC && in->rm_reg && !in->high_rm &&
+                       nx->op == OP_MOVZX && nx->rm_reg && !nx->high_rm &&
+                       nx->srcsz == 1 && nx->sz >= 4 && nx->rm == in->rm && nx->reg == in->rm) {
+                // 2b) SETcc r8; MOVZX r32/64, r8 (same reg) -> single CSET (1 insn vs 3).
+                int acc = x86_to_arm_cc[in->cc];
+                if (acc < 0) {
+                    emit_parity(nx->reg);
+                    if (in->cc == 11)
+                        E(0x52000000u | (u32)nx->reg << 5 | (u32)nx->reg); // eor wd, wd, #1
+                } else {
+                    cset(nx->reg, acc);
+                }
+                u16 bit = (u16)(1u << nx->reg);
+                tr_zext8 |= bit;
+                tr_zext16 |= bit;
+                insn_arm[i + 1] = insn_arm[i];
+                block_stats_add_insn(sdelta, nx->op);
+                i++;
+                fused = true;
+            } else if (in->op == OP_BT && in->sub == 0 && in->has_imm && in->rm_reg && in->sz >= 4 &&
+                       nx->op == OP_JCC && (nx->cc == 2 || nx->cc == 3) && live_after[i + 1] == 0) {
+                // 2c) BT r32/64, imm; JC/JNC -> TBNZ/TBZ (internal target within 14-bit range).
+                u32 *back = internal_target(nx->target, i);
+                int fwd = back ? -1 : forward_target_idx(nx->target, i + 1);
+                bool back_ok = back && (back - tr_cc) >= -(1 << 13) + 16 && (back - tr_cc) < (1 << 13) - 16;
+                bool fwd_ok = false;
+                if (fwd >= 0 && (fwd - (i + 1)) <= 48 && fwd_count < MAX_FWD_FIX) {
+                    fwd_ok = true;
+                    for (int k = i + 2; k < fwd; k++) {
+                        u8 kop = list[k].op;
+                        if (kop == OP_EXT || kop == OP_SSE || kop == OP_X87 || kop == OP_STRING) {
+                            fwd_ok = false;
+                            break;
+                        }
+                    }
+                }
+                if (back_ok || fwd_ok) {
+                    int bit = (int)((u64)in->imm & (u64)(in->sz * 8 - 1));
+                    int nz = nx->cc == 2 ? 1 : 0; // cc==2 is JB/JC (CF==1 -> bit==1 -> TBNZ)
+                    if (back_ok) {
+                        tbz(nz, in->rm, bit, (int)(back - tr_cc));
+                    } else {
+                        add_fwd(tr_cc, fwd, 2);
+                        tbz(nz, in->rm, bit, 0);
+                    }
+                    insn_arm[i + 1] = insn_arm[i];
+                    block_stats_add_insn(sdelta, nx->op);
+                    i++;
+                    fused = true;
+                }
+            } else if (!tr_compat && !tr_precise_flags) {
+                // 3) PUSH r1; PUSH r2 -> stp r2, r1, [x4, #-16]!
+                if (in->op == OP_PUSH && in->rm_reg && !in->has_imm && !in->sub && in->sz == 8 && in->rm != 4 &&
+                    nx->op == OP_PUSH && nx->rm_reg && !nx->has_imm && !nx->sub && nx->sz == 8 && nx->rm != 4) {
+                    E(0xA9800000u | ((u32)-2 & 0x7fu) << 15 | (u32)in->rm << 10 | 4u << 5 | (u32)nx->rm);
+                    tr_zext8 &= (u16)~(1u << 4);
+                    tr_zext16 &= (u16)~(1u << 4);
+                    insn_arm[i + 1] = insn_arm[i];
+                    block_stats_add_insn(sdelta, nx->op);
+                    i++;
+                    fused = true;
+                } else if (in->op == OP_POP && in->rm_reg && !in->sub && in->sz == 8 && in->rm != 4 &&
+                           nx->op == OP_POP && nx->rm_reg && !nx->sub && nx->sz == 8 && nx->rm != 4 &&
+                           in->rm != nx->rm) {
+                    // 4) POP r1; POP r2 -> ldp r1, r2, [x4], #16 (r1 != r2 required by ARM64)
+                    E(0xA8C00000u | (2u << 15) | (u32)nx->rm << 10 | 4u << 5 | (u32)in->rm);
+                    u16 clr = (u16)((1u << 4) | (1u << in->rm) | (1u << nx->rm));
+                    tr_zext8 &= (u16)~clr;
+                    tr_zext16 &= (u16)~clr;
+                    insn_arm[i + 1] = insn_arm[i];
+                    block_stats_add_insn(sdelta, nx->op);
+                    i++;
+                    fused = true;
+                } else if (in->op == OP_POP && in->rm_reg && !in->sub && in->sz == 8 && in->rm != 4 &&
+                           nx->op == OP_RET && nx->imm == 0) {
+                    // 5) POP r1; RET -> ldp r1, x16, [x4], #16 + 4-insn RAS return
+                    bool use_l1_ret = use_native_l1(tr_cpl, tr_compat);
+                    u64 ret_miss_va = use_l1_ret
+                                          ? STUB(PRIV_VA + OFF_STUBS + STUB_OFF_RET_MISS_L1)
+                                          : STUB(tr_stub_ret_miss);
+                    AotStubId ret_sid = use_l1_ret ? AOT_STUB_RET_MISS_L1 : AOT_STUB_RET_MISS;
+                    E(0xA8C00000u | (2u << 15) | (u32)S0 << 10 | 4u << 5 | (u32)in->rm);
+                    if (cfg.no_return_prediction) {
+                        tr_aot_note_stub(tr_cc, ret_sid, false);
+                        b_rel((int)((i64)(ret_miss_va - tr_cc_va(tr_cc)) / 4));
+                    } else {
+                        E(0xA8C00000u | 2 << 15 | LR << 10 | RS << 5 | S1); // ldp x17, x30, [x26], #16
+                        logic_reg(1, 2, 0, S1, S1, S0);
+                        cbz(1, 1, S1, 2);
+                        ret_reg(LR);
+                        tr_aot_note_stub(tr_cc, ret_sid, false);
+                        b_rel((int)((i64)(ret_miss_va - tr_cc_va(tr_cc)) / 4));
+                    }
+                    tr_ad_page = ~0ULL;
+                    tr_zext8 = tr_zext16 = 0;
+                    ext_ymm_cache_reset();
+                    insn_arm[i + 1] = insn_arm[i];
+                    block_stats_add_insn(sdelta, nx->op);
+                    i++;
+                    fused = true;
+                } else if (in->op == OP_MOV && nx->op == OP_MOV &&
+                           !in->has_imm && !nx->has_imm && !in->rm_reg && !nx->rm_reg &&
+                           in->sz == nx->sz && (in->sz == 4 || in->sz == 8) &&
+                           in->to_reg == nx->to_reg &&
+                           !in->riprel && !nx->riprel && !in->no_base && !nx->no_base &&
+                           in->no_index && nx->no_index && in->seg == 0 && nx->seg == 0 &&
+                           !in->addr32 && !nx->addr32 && !in->addr16 && !nx->addr16 &&
+                           in->base == nx->base &&
+                           (tr_cpl == 3 || in->base == 4 || in->base == 5)) {
+                    // 6) Adjacent MOV [base+d], r1; MOV [base+d+sz], r2 -> STP/LDP (Win64 prologues/epilogues & struct spills).
+                    int sz = in->sz;
+                    bool fwd_pair = (nx->disp == in->disp + sz);
+                    bool rev_pair = (in->disp == nx->disp + sz);
+                    if (fwd_pair || rev_pair) {
+                        i64 lo = fwd_pair ? in->disp : nx->disp;
+                        int rt1 = fwd_pair ? in->reg : nx->reg;
+                        int rt2 = fwd_pair ? nx->reg : in->reg;
+                        bool load = in->to_reg;
+                        bool ldp_ok = !load || (rt1 != rt2 && in->reg != in->base && nx->reg != in->base);
+                        if (ldp_ok && (lo & (sz - 1)) == 0 && lo >= -64 * sz && lo <= 63 * sz) {
+                            u32 imm7 = (u32)(lo / sz) & 0x7fu;
+                            u32 base_opc = sz == 8 ? (load ? 0xA9400000u : 0xA9000000u)
+                                                   : (load ? 0x29400000u : 0x29000000u);
+                            E(base_opc | imm7 << 15 | (u32)rt2 << 10 | (u32)in->base << 5 | (u32)rt1);
+                            if (load) {
+                                u16 clr = (u16)((1u << rt1) | (1u << rt2));
+                                tr_zext8 &= (u16)~clr;
+                                tr_zext16 &= (u16)~clr;
+                            }
+                            insn_arm[i + 1] = insn_arm[i];
+                            block_stats_add_insn(sdelta, nx->op);
+                            i++;
+                            fused = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        if (!fused) {
+            switch (in->op) {
+                case OP_JCC:
+                case OP_JRCXZ:
+                case OP_JMP:
+                case OP_CALL:
+                case OP_CALLI:
+                case OP_JMPI:
+                case OP_RET:
+                    emit_control(in, i, live_after[i]);
+                    if (in->op == OP_CALL || in->op == OP_CALLI || in->op == OP_JMPI || in->op == OP_RET) {
+                        ext_ymm_cache_reset();
+                        tr_ad_page = ~0ULL;
+                        tr_zext8 = tr_zext16 = 0;
+                    } else {
+                        update_zext(in);
+                    }
+                    break;
+                case OP_BAD:
+                    emit_stop(in->rip, in->why);
+                    tr_zext8 = tr_zext16 = 0;
+                    break;
+                case OP_UD:
+                    svc(SVC_UD);
+                    tr_zext8 = tr_zext16 = 0;
+                    break;
+                case OP_SSE:
+                case OP_LDMXCSR:
+                case OP_STMXCSR:
+                    emit_sse(in, live_after[i]);
+                    tr_zext8 = tr_zext16 = 0;
+                    break;
+                case OP_X87:
+                    emit_x87(in);
+                    tr_ad_page = ~0ULL;
+                    tr_zext8 = tr_zext16 = 0;
+                    break;
+                case OP_EXT:
+                    emit_ext(in, live_after[i]);
+                    tr_zext8 = tr_zext16 = 0;
+                    break;
+                case OP_SYSCALL:
+                case OP_SYSRET:
+                case OP_IRET:
+                case OP_INT:
+                case OP_INT3:
+                case OP_HLT:
+                case OP_CPUID:
+                case OP_RDTSC:
+                case OP_RDTSCP:
+                case OP_RDMSR:
+                case OP_WRMSR:
+                case OP_CLI:
+                case OP_STI:
+                case OP_MOV_CR:
+                    if (i && in->reg == 3 && !in->to_reg && in->rm == 0 && !cfg.keep_kernel_tables && tr_cpl == 0) {
+                        const Insn *p = &list[i - 1];
+                        if (p->op == OP_MOV && p->seg == 2 && p->to_reg && p->reg == 0 && !p->rm_reg) {
+                            if (p->disp == 0x138) {
+                                tr_zext8 = tr_zext16 = 0;
+                                break;
+                            }
+                            if (p->disp == 0x140) {
+                                Addr a = {.base = CTX, .imm = __builtin_offsetof(EngineCtx, cr3)};
+                                ldst(1, 8, S0, a);
+                                logic_sh(1, 2, 0, S0, S0, 0, 0, 0); // eor with rax
+                                ubfx(1, S0, S0, 12, 40); // the tables, whatever the PCID
+                                u32 *same = tr_cc;
+                                cbz(0, 1, S0, 0);
+                                emit_monitor_op(in);
+                                *same |= ((u32)(tr_cc - same) & 0x7ffff) << 5;
+                                ext_ymm_cache_reset();
+                                tr_ad_page = ~0ULL;
+                                tr_zext8 = tr_zext16 = 0;
+                                break;
+                            }
+                        }
+                    }
+                    emit_monitor_op(in);
+                    ext_ymm_cache_reset();
+                    tr_ad_page = ~0ULL;
+                    tr_zext8 = tr_zext16 = 0;
+                    break;
+                case OP_MOV_DR:
+                case OP_INVLPG:
+                case OP_INVPCID:
+                case OP_WBINVD:
+                case OP_CLTS:
+                case OP_LGDT:
+                case OP_LTR:
+                case OP_MOV_SEG:
+                case OP_IN:
+                case OP_OUT:
+                case OP_SWAPGS:
+                case OP_SYSENTER:
+                case OP_SYSEXIT:
+                case OP_FAR:
+                case OP_FXSAVE:
+                case OP_FXRSTOR:
+                    emit_monitor_op(in);
+                    ext_ymm_cache_reset();
+                    tr_ad_page = ~0ULL;
+                    tr_zext8 = tr_zext16 = 0;
+                    break;
+                default:
+                    emit_int(in, live_after[i]);
+                    update_zext(in);
+                    break;
+            }
+        }
+
+        // Non-adjacent fallthrough inside Forward-DAG: emit exit/branch before next disconnected sub-block.
+        const Insn *end_in = &list[i];
+        if (i + 1 < count && !is_uncond_term_op(end_in->op) && end_in->next != list[i + 1].rip) {
+            if (tr_aes_mask)
+                sse_aes_flush_all();
+            if (ext_ymm_cache_has_dirty())
+                ext_ymm_cache_flush_dirty();
+            u32 *back = internal_target(end_in->next, i);
+            int fwd = back ? -1 : forward_target_idx(end_in->next, i);
+            if (back) {
+                b_rel((int)(back - tr_cc));
+            } else if (fwd >= 0) {
+                add_fwd(tr_cc, fwd, 1);
+                b_rel(0);
+            } else {
+                u32 *direct = (!is_monitor_or_stop_op(end_in->op) && end_in->op != OP_POPF)
+                                  ? try_direct_link_target(cur_key, cur_entry_rip, cur_page, end_in->next, cur_single)
+                                  : NULL;
+                i64 dd = direct ? (direct - tr_cc) : 0;
+                if (direct && dd >= -(1 << 25) && dd < (1 << 25)) {
+                    b_rel((int)dd);
+                } else {
+                    u32 *svc_site = tr_cc;
+                    svc(SVC_DIRECT);
+                    tr_aot_note_cc_branch(svc_site, AOT_CC_DIRECT, tr_cc);
+                    stub_lit(end_in->next);
+                }
+            }
+        }
+    }
+    if (tr_aes_mask)
+        sse_aes_flush_all();
+    if (ext_ymm_cache_has_dirty())
+        ext_ymm_cache_flush_dirty();
+    for (int i = 0; i < fwd_count; i++)
+        fix(fwd_fix[i].site, fwd_fix[i].form, insn_arm[fwd_fix[i].target_idx]);
+    u32 *tail = tr_cc;
+    block_stats_add_words(sdelta, last->op, (u32)(tr_cc - insn_arm[count - 1]));
+    if (fallthrough_end) {
+        u32 *direct = (!is_monitor_or_stop_op(last->op) && last->op != OP_POPF)
+                          ? try_direct_link_target(cur_key, cur_entry_rip, cur_page, last->next, cur_single)
+                          : NULL;
+        i64 dd = direct ? (direct - tr_cc) : 0;
+        if (direct && dd >= -(1 << 25) && dd < (1 << 25)) {
+            b_rel((int)dd);
+        } else {
+            u32 *svc_site = tr_cc;
+            svc(SVC_DIRECT);
+            tr_aot_note_cc_branch(svc_site, AOT_CC_DIRECT, tr_cc);
+            stub_lit(last->next);
+        }
+    }
+    for (int i = 0; i < pend_count; i++) {
+        if (code_cap && (u32)(tr_cc - start) + 16U >= code_cap) {
+            out->overflow = true;
+            return;
+        }
+        u32 *stub = tr_cc;
+        svc(pend[i].kind);
+        u32 *lit_site = tr_cc;
+        stub_lit(pend[i].target);
+        if (pend[i].kind == SVC_JCC) {
+            E((u32)(stub - pend[i].site));
+            tr_aot_note_cc_branch(pend[i].site, AOT_CC_JCC, lit_site);
+        } else if (pend[i].kind == SVC_CALL) {
+            tr_aot_note_cc_branch(pend[i].site, AOT_CC_CALL, lit_site);
+        }
+        fix(pend[i].site, pend[i].form, stub);
+    }
+    for (int i = 0; i < l1_miss_count; i++) {
+        if (code_cap && (u32)(tr_cc - start) + 16U >= code_cap) {
+            out->overflow = true;
+            return;
+        }
+        u32 *miss = tr_cc;
+        tr_aot_note_stub(tr_cc, AOT_STUB_LOOKUP_L1, true);
+        bl_rel((int)((i64)(STUB(PRIV_VA + OFF_STUBS + STUB_OFF_LOOKUP_L1) - tr_cc_va(tr_cc)) / 4));
+        if (l1_miss[i].is_call)
+            b_rel((int)(l1_miss[i].blr_site - tr_cc));
+        else
+            br(S2);
+        fix(l1_miss[i].site1, 0, miss);
+        fix(l1_miss[i].site2, 0, miss);
+    }
+    sdelta->exit_words = (u32)(tr_cc - tail);
+    out->pcm_written = pcm_n;
+    out->t2_patch_off = t2_patch_off;
+
+    if (t2_head_i >= 0 && t2_patch_off != ~0U) {
+        int t2_tail_i = t2_head_i;
+        for (int k = t2_head_i; k < count; k++) {
+            u8 op = list[k].op;
+            if ((op == OP_JCC || op == OP_JRCXZ || op == OP_JMP) && tgt_idx[k] == t2_head_i)
+                t2_tail_i = k;
+        }
+        u64 lo = list[t2_head_i].rip, hi = list[t2_head_i].next;
+        for (int k = t2_head_i; k <= t2_tail_i; k++) {
+            if (list[k].rip < lo) lo = list[k].rip;
+            if (list[k].next > hi) hi = list[k].next;
+        }
+        // Include up to 64 post-loop same-page bytes in the SMC-verified snapshot so Tier-2 can peek exit flag liveness!
+        u64 snap_hi = hi + 64 <= page + 4096 ? hi + 64 : page + 4096;
+        if ((lo & ~0xfffULL) == page && hi <= page + 4096 && hi > lo) {
+            out->t2_head_rip = list[t2_head_i].rip;
+            out->aot_t2_min_off = (u16)(lo & 0xfffULL);
+            out->aot_t2_span_bytes = (u16)(snap_hi - lo);
+            if (t2_patch_off < AOT_NO_PATCH_WORD) {
+                out->aot_t2_patch_off = (u16)t2_patch_off;
+                out->aot_t2_head_off = (u16)(list[t2_head_i].rip - rip);
+            }
+        }
+    }
+}
+
+static void tr_aot_promote_t2_post(u32 idx, u32 part, u32 slot, u64 t2_ep, u32 key, u8 cpl, bool compat,
+                                   u32 entry_word, u32 arm_words, u32 t2_patch_word,
+                                   u64 rip, u64 head_rip, u64 frame0, u64 aot_page_hash,
+                                   u16 t2_min_off, u16 t2_span_bytes) {
+    bool promoted = false;
+    if (tr_aot_active && aot_cache && t2_enabled() && t2_span_bytes > 0 &&
+        (u32)t2_min_off + t2_span_bytes <= 4096U && frame0 < cfg.ram_size) {
+        AotKey t2key = {
+            .page_hash = aot_page_hash,
+            .abi_hash = aot_abi_hash,
+            .mode_bits = aot_build_mode_bits((int)cpl, compat, true),
+            .page_offset = (u16)(head_rip & 0xFFFULL),
+            .flags = 0,
+        };
+        AotBlockView t2view;
+        if (aot_lookup(aot_cache, &t2key, &t2view) && t2view.code_words <= 8192U && t2view.pcm_count <= 1024U) {
+            u32 t2_buf[8192];
+            PcMap t2_pcm[1024];
+            u32 bail_sites[32];
+            u32 bail_cnt = 0;
+            bool bail_ok = true;
+            bool has_stub = false;
+            for (u16 ri = 0; ri < t2view.reloc_count; ri++) {
+                if (t2view.relocs[ri].type == AOT_RELOC_T2_BAILOUT) {
+                    if (bail_cnt >= 32U) { bail_ok = false; break; }
+                    bail_sites[bail_cnt++] = t2view.relocs[ri].word_off;
+                } else if (t2view.relocs[ri].type == AOT_RELOC_STUB_BRANCH) {
+                    has_stub = true;
+                }
+            }
+            if (bail_ok && !has_stub) {
+                u64 t2_base_va = tr_cc_va(cc_base + (part ? CC_T2_WORD1 : CC_T2_WORD0));
+                if (aot_materialize(aot_cache, &t2view, head_rip, t2_buf, 8192U,
+                                    t2_pcm, 1024U, t2_base_va, (int)part,
+                                    &aot_stubs, NULL, NULL)) {
+                    promoted = tr_t2_publish(idx, part, slot, t2_ep, head_rip,
+                                             key, cpl, compat, t2_patch_word,
+                                             frame0, t2_min_off, t2_span_bytes,
+                                             ram_at(frame0 + t2_min_off),
+                                             t2_buf, t2view.code_words, t2_pcm, t2view.pcm_count,
+                                             t2view.has_t2_meta ? &t2view.t2_meta : NULL,
+                                             bail_cnt ? bail_sites : NULL, bail_cnt);
+                }
+            }
+        }
+    }
+    if (!promoted && t2_enabled() && t2_span_bytes > 0 && (u32)t2_min_off + t2_span_bytes <= 4096U &&
+        !__atomic_load_n(&hblocks[idx].dead, __ATOMIC_ACQUIRE)) {
+        t2_register_loop(idx, part, slot, entry_word, arm_words,
+                         t2_patch_word, rip, head_rip, frame0,
+                         t2_min_off, t2_span_bytes, key, cpl, compat, t2_ep);
+        if (t2_eager_mode())
+            t2_eager_promote_now(idx);
+    }
+}
+
+static TrResult do_translate(int key, int view, u64 cr3, int cpl, u64 rip, bool single);
+
+// 1-lock parallel fast entry: runs 100% UNLOCKED before acquiring translatorLock!
+// Returns true iff a cold/AOT block was prepared in TLS and is ready for a single-lock tr_translate_commit().
+// Returns false if likely a block_map fast-hit, dead-block reuse candidate, unprotected frame, or flush-needed.
+bool tr_translate_try_prepare_unlocked(int view, uint64_t cr3, int cpl, bool compat, uint64_t rip) {
+    if (!par_translate_enabled || cfg.profile_compile_inputs)
+        return false;
+
+    tr_compat = compat;
+    tr_cpl = cpl;
+    walk_cr3 = cr3;
+    walk_cpl = cpl;
+    fetch_cache_valid = false;
+    __atomic_store_n(&tr_fpcr_merges_scalar, ctx_ptr->fpcr_merges_scalar != 0, __ATOMIC_RELAXED);
+
+    int key = block_key(view, cr3, cpl, rip);
+    // Advisory lock-free hit check (78% of Win2022 HC_TRANSLATE): skip prepare and let locked fast path return in ~150 ns.
+    if (map_find_hint(key, rip))
+        return false;
+    // Advisory dead-block reuse hint: if a dead candidate exists at this exact slot, let locked fast path revive it.
+    if (!cfg.no_reuse) {
+        u32 it = __atomic_load_n(&dead_slots[dead_slot((u32)key, rip)], __ATOMIC_RELAXED);
+        if (it && __atomic_load_n(&hblocks[it - 1].rip, __ATOMIC_RELAXED) == rip)
+            return false;
+    }
+
+    u64 frame;
+    if (frame_unprotected(rip, &frame))
+        return false;
+
+    ParScratch *ps = par_scratch_get();
+    if (!ps)
+        return false;
+
+    ps->prep_ticks = 0;
+    ps->view = view;
+    ps->key = key;
+    ps->cpl = cpl;
+    ps->cr3 = cr3;
+    ps->rip = rip;
+    ps->page = rip & ~0xfffULL;
+    ps->compat = compat;
+    ps->fgen_flush = __atomic_load_n(&tr_flush_gen, __ATOMIC_ACQUIRE);
+    ps->pt_gen = __atomic_load_n(&tr_pt_inval_gen, __ATOMIC_ACQUIRE);
+    u64 gpa0 = 0;
+    ps->have_gpa0 = fetch_walk(rip, &gpa0);
+    ps->frame0 = ps->have_gpa0 ? (gpa0 & ~0xfffULL) : ~0ULL;
+    ps->frame1 = ~0ULL;
+    ps->fgen0 = (ps->frame0 != ~0ULL)
+                    ? __atomic_load_n(&tr_frame_inval_gen[(ps->frame0 >> 12) & (PAR_GEN_BUCKETS - 1U)], __ATOMIC_ACQUIRE)
+                    : 0ULL;
+    ps->fgen1 = 0ULL;
+    ps->res_kind = PAR_RES_NONE;
+    ps->need_post = false;
+    ps->par_overflow = false;
+
+    tr_translate_prepare();
+    return true;
+}
+
+bool tr_translate_fast(int view, uint64_t cr3, int cpl, bool compat, uint64_t rip, bool single, TrResult *out) {
+    memset(out, 0, sizeof *out);
+    out->frames[0] = out->frames[1] = ~0ULL;
+    tr_compat = compat;
+    tr_cpl = cpl;
+    walk_cr3 = cr3;
+    walk_cpl = cpl;
+    fetch_cache_valid = false;
+    __atomic_store_n(&tr_fpcr_merges_scalar, ctx_ptr->fpcr_merges_scalar != 0, __ATOMIC_RELAXED);
+    if (view > view_high)
+        view_high = view;
+    int key = block_key(view, cr3, cpl, rip);
+    out->key = key;
+
+    if (!single) {
+        u32 hit = map_find(key, rip);
+        if (hit) {
+            if ((key & KEY_DOMAIN) && cpl == 3)
+                stats.shared_found++;
+            stats.par_fast_hits++;
+            out->arm = tr_cc_va(cc_base + hblocks[hit - 1].entry_word);
+            out->frames[0] = hblocks[hit - 1].frame[0];
+            out->frames[1] = hblocks[hit - 1].frame[1];
+            return true;
+        }
+    }
+
+    if (tr_needs_flush()) {
+        if (ctx_ptr->vcpu_count > 1) {
+            out->needs_flush = true;
+            return true;
+        }
+        flush_everything();
+        out->flushed = true;
+    }
+    cur_part = KEY_PART(key);
+    if (cur_part == 0 && p0_ring_enabled && !p0_try_advance_empty_slot()) {
+        if (ctx_ptr->vcpu_count > 1) {
+            out->needs_flush = true;
+            return true;
+        }
+        flush_everything();
+        out->flushed = true;
+    }
+
+    if (!single) {
+        u64 frame;
+        if (frame_unprotected(rip, &frame)) {
+            out->unprotected = frame + 1;
+            return true;
+        }
+        u64 t_reuse = mach_absolute_time();
+        if (reuse_dead_block((u32)key, cpl, rip, out)) {
+            stats.translate_ns += mach_absolute_time() - t_reuse;
+            return true;
+        }
+    }
+
+    if (!par_translate_enabled || single || cfg.profile_compile_inputs) {
+        *out = do_translate(key, view, cr3, cpl, rip, single);
+        if ((key & KEY_DOMAIN) && cpl == 3 && !out->unprotected && !out->needs_flush)
+            stats.shared_blocks++;
+        out->key = key;
+        return true;
+    }
+
+    ParScratch *ps = par_scratch_get();
+    if (!ps) {
+        *out = do_translate(key, view, cr3, cpl, rip, single);
+        if ((key & KEY_DOMAIN) && cpl == 3 && !out->unprotected && !out->needs_flush)
+            stats.shared_blocks++;
+        out->key = key;
+        return true;
+    }
+
+    // Snapshot concurrency tokens & frame0 BEFORE releasing translatorLock.
+    ps->prep_ticks = 0;
+    ps->view = view;
+    ps->key = key;
+    ps->cpl = cpl;
+    ps->cr3 = cr3;
+    ps->rip = rip;
+    ps->page = rip & ~0xfffULL;
+    ps->compat = compat;
+    ps->fgen_flush = __atomic_load_n(&tr_flush_gen, __ATOMIC_ACQUIRE);
+    ps->pt_gen = __atomic_load_n(&tr_pt_inval_gen, __ATOMIC_ACQUIRE);
+    u64 gpa0 = 0;
+    ps->have_gpa0 = fetch_walk(rip, &gpa0);
+    ps->frame0 = ps->have_gpa0 ? (gpa0 & ~0xfffULL) : ~0ULL;
+    ps->frame1 = ~0ULL;
+    ps->fgen0 = (ps->frame0 != ~0ULL)
+                    ? __atomic_load_n(&tr_frame_inval_gen[(ps->frame0 >> 12) & (PAR_GEN_BUCKETS - 1U)], __ATOMIC_ACQUIRE)
+                    : 0ULL;
+    ps->fgen1 = 0ULL;
+    ps->res_kind = PAR_RES_NONE;
+    ps->need_post = false;
+    ps->par_overflow = false;
+    return false;
+}
+
+void tr_translate_prepare(void) {
+    ParScratch *ps = tls_par;
+    if (!ps)
+        return;
+    u64 prep_t0 = mach_absolute_time();
+
+    tr_compat = ps->compat;
+    tr_cpl = ps->cpl;
+    walk_cr3 = ps->cr3;
+    walk_cpl = ps->cpl;
+    cur_part = KEY_PART(ps->key);
+    fetch_cache_valid = false;
+    fetch_lo = ~0ULL;
+    fetch_hi = 0;
+    ps->stub_cnt = 0;
+    ps->link_cnt = 0;
+    ps->code_words = 0;
+    ps->pcm_count = 0;
+    ps->snap_off = 0;
+    ps->snap_len = 0;
+    ps->aot_have_page_hash = false;
+    ps->aot_page_hash = 0;
+    ps->aot_record_eligible = false;
+    ps->t2_has_loop = false;
+    ps->t2_patch_off = ~0U;
+    ps->aot_t2_patch_off = AOT_NO_PATCH_WORD;
+    ps->aot_t2_head_off = 0;
+    ps->aot_t2_min_off = 0;
+    ps->aot_t2_span_bytes = 0;
+    ps->t2_head_rip = 0;
+    ps->par_overflow = false;
+    block_stats_reset(&ps->sdelta);
+
+    // ---- Lock-Free Persistent AOT Fast Path (mmap disk + lock-free stage table + seqlock frame hash) ----
+    if (tr_aot_active && aot_cache && ps->have_gpa0 && ps->frame0 < cfg.ram_size) {
+        ps->aot_page_hash = aot_hash_frame_cached(aot_cache, ps->frame0, ram_at(ps->frame0));
+        ps->aot_have_page_hash = true;
+        AotKey akey = {
+            .page_hash = ps->aot_page_hash,
+            .abi_hash = aot_abi_hash,
+            .mode_bits = aot_build_mode_bits(ps->cpl, ps->compat, false),
+            .page_offset = (u16)(ps->rip & 0xFFFULL),
+            .flags = 0,
+        };
+        AotBlockView aview;
+        if (aot_lookup(aot_cache, &akey, &aview) &&
+            aview.code_words > 0 && aview.code_words <= PAR_CODE_CAP &&
+            aview.pcm_count <= PAR_PCM_CAP) {
+            if (aot_materialize(aot_cache, &aview, ps->rip, ps->code, PAR_CODE_CAP,
+                                ps->pcm, PAR_PCM_CAP, 0ULL, cur_part,
+                                &aot_stubs, NULL, NULL)) {
+                bool reloc_ok = true;
+                for (u16 ri = 0; ri < aview.reloc_count; ri++) {
+                    const AotReloc *r = &aview.relocs[ri];
+                    if (r->type == AOT_RELOC_STUB_BRANCH) {
+                        if (ps->stub_cnt >= PAR_MAX_STUBS) { reloc_ok = false; break; }
+                        ps->stubs[ps->stub_cnt++] = (ParStubSite){
+                            r->word_off, (u8)(r->aux & 0x7FU), (u8)((r->aux & 0x80U) ? 1u : 0u)
+                        };
+                    } else if (r->type == AOT_RELOC_CC_BRANCH) {
+                        if (ps->link_cnt >= PAR_MAX_LINKS) { reloc_ok = false; break; }
+                        ps->links[ps->link_cnt++] = (ParLinkSite){ r->word_off, r->aux2, r->aux };
+                    }
+                }
+                if (reloc_ok) {
+                    ps->code_words = aview.code_words;
+                    ps->pcm_count = aview.pcm_count;
+                    if (aview.read_bytes > 0 && (u32)aview.read_off + aview.read_bytes <= 4096U) {
+                        ps->snap_off = aview.read_off;
+                        ps->snap_len = aview.read_bytes;
+                        memcpy(ps->snap_bytes, ram_at(ps->frame0 + aview.read_off), aview.read_bytes);
+                    }
+                    ps->t2_has_loop = (aview.t2_patch_word_off != AOT_NO_PATCH_WORD);
+                    ps->t2_patch_off = ps->t2_has_loop ? aview.t2_patch_word_off : ~0U;
+                    ps->aot_t2_patch_off = aview.t2_patch_word_off;
+                    ps->aot_t2_head_off = aview.t2_head_off;
+                    ps->aot_t2_min_off = aview.t2_min_off;
+                    ps->aot_t2_span_bytes = aview.t2_span_bytes;
+                    ps->t2_head_rip = ps->rip + aview.t2_head_off;
+                    ps->res_kind = PAR_RES_AOT_HIT;
+                    ps->prep_ticks = mach_absolute_time() - prep_t0;
+                    return;
+                }
+                ps->stub_cnt = 0;
+                ps->link_cnt = 0;
+            }
+        }
+    }
+
+    // ---- Lock-Free Cold Decode + Forward-DAG + Flag Liveness + ARM64 Emit into TLS Scratch ----
+    Insn *list = ps->list;
+    int count = 0;
+    u64 pc = ps->rip, page = ps->page, gpa1 = ~0ULL, frame;
+    do {
+        if ((pc & 0xfff) > 4096 - 15) {
+            if (!fetch_walk((pc | 0xfff) + 1, &gpa1))
+                gpa1 = ~0ULL;
+            if (gpa1 != ~0ULL && ps->frame1 == ~0ULL) {
+                u64 f1 = gpa1 & ~0xfffULL;
+                ps->fgen1 = __atomic_load_n(&tr_frame_inval_gen[(f1 >> 12) & (PAR_GEN_BUCKETS - 1U)], __ATOMIC_ACQUIRE);
+            }
+            if (frame_unprotected((pc | 0xfff) + 1, &frame)) {
+                ps->res_kind = PAR_RES_UNPROTECTED;
+                ps->fault_or_unprot = frame + 1;
+                ps->prep_ticks = mach_absolute_time() - prep_t0;
+                return;
+            }
+        }
+        x86_decode(pc, &list[count]);
+        Insn *in = &list[count];
+        if (in->op == OP_BAD && in->why && !strcmp(in->why, "FETCH_FAULT")) {
+            if (count == 0) {
+                ps->res_kind = PAR_RES_FETCH_FAULT;
+                ps->fault_or_unprot = in->target ? in->target : pc;
+                ps->prep_ticks = mach_absolute_time() - prep_t0;
+                return;
+            }
+            break;
+        }
+        if ((ps->key & KEY_USER_FRAME) == KEY_USER_FRAME && in->next > page + 4096 && count > 0)
+            break;
+        pc = in->next;
+        count++;
+        if (in->next > page + 4096 && count > 0) {
+            if (gpa1 != ~0ULL)
+                ps->frame1 = gpa1 & ~0xfffULL;
+            break;
+        }
+        if (t2_enabled() && (in->op == OP_JCC || in->op == OP_JRCXZ) &&
+            in->target >= ps->rip && in->target < in->rip)
+            break;
+    } while (count < MAX_INSNS && !insn_is_terminator(&list[count - 1]) && (pc & ~0xfffULL) == page);
+
+    tr_par_active = true;
+    tr_par_block_start = ps->code;
+    ColdEmitOut ceo;
+    emit_cold_block(ps->key, ps->rip, page, ps->cpl, false, ps->frame0, ps->frame1,
+                    list, count, ps->code, PAR_CODE_CAP, ps->pcm, PAR_PCM_CAP,
+                    &ps->sdelta, &ceo);
+    u32 emitted_words = (u32)(tr_cc - ps->code);
+    bool aot_ok = tr_aot_active && tr_aot_cap.active && !tr_aot_cap.ineligible &&
+                  ps->frame1 == ~0ULL && ps->frame0 < cfg.ram_size &&
+                  ps->aot_have_page_hash && fetch_lo >= page && fetch_hi <= page + 4096;
+    if (aot_ok)
+        ps->aot_cap = tr_aot_cap;
+    tr_aot_cap.active = false;
+    tr_par_active = false;
+
+    if (ceo.overflow || ps->par_overflow || emitted_words == 0 || emitted_words > PAR_CODE_CAP) {
+        ps->res_kind = PAR_RES_FALLBACK_LOCKED;
+        ps->prep_ticks = mach_absolute_time() - prep_t0;
+        return;
+    }
+
+    ps->code_words = emitted_words;
+    ps->pcm_count = ceo.pcm_written;
+    ps->aot_record_eligible = aot_ok;
+    ps->t2_has_loop = (ceo.t2_head_i >= 0 && ceo.t2_patch_off != ~0U);
+    ps->t2_patch_off = ceo.t2_patch_off;
+    ps->aot_t2_patch_off = ceo.aot_t2_patch_off;
+    ps->aot_t2_head_off = ceo.aot_t2_head_off;
+    ps->aot_t2_min_off = ceo.aot_t2_min_off;
+    ps->aot_t2_span_bytes = ceo.aot_t2_span_bytes;
+    ps->t2_head_rip = ceo.t2_head_rip;
+
+    if (ps->frame1 == ~0ULL && ps->frame0 < cfg.ram_size && fetch_lo < fetch_hi) {
+        u64 page_end = page + 4096;
+        u64 lo = fetch_lo < page ? page : fetch_lo;
+        u64 hi = fetch_hi < page_end ? fetch_hi : page_end;
+        if (hi > lo && hi - lo <= 4096ULL) {
+            ps->snap_off = (u16)(lo & 0xfffULL);
+            ps->snap_len = (u16)(hi - lo);
+            memcpy(ps->snap_bytes, ram_at(ps->frame0 + ps->snap_off), ps->snap_len);
+        }
+    }
+    ps->res_kind = PAR_RES_COLD;
+    ps->prep_ticks = mach_absolute_time() - prep_t0;
+}
+
+int tr_translate_commit(TrResult *out) {
+    u64 com_t0 = mach_absolute_time();
+    memset(out, 0, sizeof *out);
+    out->frames[0] = out->frames[1] = ~0ULL;
+    ParScratch *ps = tls_par;
+    if (!ps)
+        return 0;
+
+    tr_compat = ps->compat;
+    tr_cpl = ps->cpl;
+    walk_cr3 = ps->cr3;
+    walk_cpl = ps->cpl;
+    fetch_cache_valid = false;
+    if (ps->view > view_high)
+        view_high = ps->view;
+    out->key = ps->key;
+    ps->need_post = false;
+
+    if (ps->res_kind == PAR_RES_FALLBACK_LOCKED) {
+        stats.par_fallbacks++;
+        *out = do_translate(ps->key, ps->view, ps->cr3, ps->cpl, ps->rip, false);
+        if ((ps->key & KEY_DOMAIN) && ps->cpl == 3 && !out->unprotected && !out->needs_flush)
+            stats.shared_blocks++;
+        out->key = ps->key;
+        return out->needs_flush ? -1 : 1;
+    }
+
+    if (tr_needs_flush()) {
+        if (ctx_ptr->vcpu_count > 1) {
+            out->needs_flush = true;
+            return -1;
+        }
+        flush_everything();
+        out->flushed = true;
+    }
+
+    // 1. Re-verify translation domain key & concurrent duplicate publication.
+    int key_now = block_key(ps->view, ps->cr3, ps->cpl, ps->rip);
+    out->key = key_now;
+    if (key_now != ps->key) {
+        stats.par_retries++;
+        return 0;
+    }
+    u32 dup = map_find(key_now, ps->rip);
+    if (dup) {
+        stats.par_dups++;
+        if ((key_now & KEY_DOMAIN) && ps->cpl == 3)
+            stats.shared_found++;
+        out->arm = tr_cc_va(cc_base + hblocks[dup - 1].entry_word);
+        out->frames[0] = hblocks[dup - 1].frame[0];
+        out->frames[1] = hblocks[dup - 1].frame[1];
+        stats.translate_ns += ps->prep_ticks + (mach_absolute_time() - com_t0);
+        return 1;
+    }
+
+    // 2. Verify flush / page-table / SMC generations unchanged since before decode!
+    if (__atomic_load_n(&tr_flush_gen, __ATOMIC_ACQUIRE) != ps->fgen_flush) {
+        stats.par_retries++;
+        return 0;
+    }
+    if (ps->res_kind == PAR_RES_FETCH_FAULT || ps->res_kind == PAR_RES_UNPROTECTED) {
+        if (__atomic_load_n(&tr_pt_inval_gen, __ATOMIC_ACQUIRE) != ps->pt_gen) {
+            stats.par_retries++;
+            return 0;
+        }
+        if (ps->res_kind == PAR_RES_FETCH_FAULT)
+            out->fetch_fault_va = ps->fault_or_unprot;
+        else
+            out->unprotected = ps->fault_or_unprot;
+        return 1;
+    }
+
+    u64 frame;
+    if (frame_unprotected(ps->rip, &frame)) {
+        out->unprotected = frame + 1;
+        return 1;
+    }
+    if (ps->frame1 != ~0ULL && frame_unprotected(ps->page + 4096ULL, &frame)) {
+        out->unprotected = frame + 1;
+        return 1;
+    }
+    if (__atomic_load_n(&tr_pt_inval_gen, __ATOMIC_ACQUIRE) != ps->pt_gen) {
+        u64 g0 = 0, g1 = 0;
+        bool h0 = fetch_walk(ps->rip, &g0);
+        u64 f0 = h0 ? (g0 & ~0xfffULL) : ~0ULL;
+        if (h0 != ps->have_gpa0 || f0 != ps->frame0) {
+            stats.par_retries++;
+            return 0;
+        }
+        if (ps->frame1 != ~0ULL) {
+            if (!fetch_walk(ps->page + 4096ULL, &g1) || (g1 & ~0xfffULL) != ps->frame1) {
+                stats.par_retries++;
+                return 0;
+            }
+        }
+    }
+    if (ps->frame0 != ~0ULL &&
+        __atomic_load_n(&tr_frame_inval_gen[(ps->frame0 >> 12) & (PAR_GEN_BUCKETS - 1U)], __ATOMIC_ACQUIRE) != ps->fgen0) {
+        stats.par_retries++;
+        return 0;
+    }
+    if (ps->frame1 != ~0ULL &&
+        __atomic_load_n(&tr_frame_inval_gen[(ps->frame1 >> 12) & (PAR_GEN_BUCKETS - 1U)], __ATOMIC_ACQUIRE) != ps->fgen1) {
+        stats.par_retries++;
+        return 0;
+    }
+
+    // 3. Allocate slot in code cache (p0 4-slot ring or linear part 0/1) & PcMap.
+    cur_part = KEY_PART(key_now);
+    u32 alloc_slot = 0;
+    u32 *start;
+    u32 *pcm_cursor_p;
+    if (cur_part == 0 && p0_ring_enabled) {
+        if (!p0_try_advance_empty_slot()) {
+            if (ctx_ptr->vcpu_count > 1) {
+                out->needs_flush = true;
+                return -1;
+            }
+            flush_everything();
+            out->flushed = true;
+        }
+        alloc_slot = p0_cur_slot;
+        start = p0_cc_cursor[alloc_slot];
+        // p0_try_advance_empty_slot() already ensured start <= 59 MiB (2 MiB headroom before true slot end at 61 MiB).
+        u32 *slot_end = cc_base + engine_p0_slot_word_base(alloc_slot) + P0_SLOT_WORDS;
+        if (start + ps->code_words > slot_end || p0_block_count[alloc_slot] >= P0_BLOCKS_PER_SLOT ||
+            p0_pcmap_used[alloc_slot] + ps->pcm_count > (alloc_slot + 1U) * P0_PCMAP_PER_SLOT) {
+            out->needs_flush = true;
+            return -1;
+        }
+        pcm_cursor_p = &p0_pcmap_used[alloc_slot];
+    } else {
+        if (t2_enabled()) {
+            u32 t2w = cur_part == 1 ? CC_T2_WORD1 : CC_T2_WORD0;
+            if (cc_cursor[cur_part] + ps->code_words + 16U >= cc_base + t2w &&
+                cc_cursor[cur_part] < cc_base + t2w + CC_T2_WORDS) {
+                cc_cursor[cur_part] = cc_base + t2w + CC_T2_WORDS;
+            }
+        }
+        start = cc_cursor[cur_part];
+        u64 lim = cur_part == 1 && cc_limit >= CC_SIZE ? CC_SIZE - (4ULL << 20) : cc_limit;
+        u32 *part_end = cc_base + cur_part * CC_PART2_WORD + (u32)(lim / 4ULL);
+        u32 first_map = cur_part ? (OFF_PCMAP2 - OFF_PCMAP) / sizeof(PcMap) : 0;
+        if (start + ps->code_words > part_end || hblock_count[cur_part] >= PART_BLOCKS_MAX(cur_part) ||
+            pc_map_used[cur_part] + ps->pcm_count > first_map + PCMAP_ENTRIES) {
+            out->needs_flush = true;
+            return -1;
+        }
+        pcm_cursor_p = &pc_map_used[cur_part];
+    }
+
+    // 4. Copy code + PcMap, patch stub B/BL relocations for final VA, apply live eager direct links.
+    u32 map0 = *pcm_cursor_p;
+    memcpy(start, ps->code, (size_t)ps->code_words * sizeof(u32));
+    if (ps->pcm_count)
+        memcpy(&pc_map[map0], ps->pcm, (size_t)ps->pcm_count * sizeof(PcMap));
+    *pcm_cursor_p = map0 + ps->pcm_count;
+
+    u64 base_va = tr_cc_va(start);
+    for (u32 i = 0; i < ps->stub_cnt; i++) {
+        u32 w = ps->stubs[i].word_off;
+        if (w >= ps->code_words)
+            continue;
+        u64 pc_va = base_va + (u64)w * 4ULL;
+        u64 stub_va = aot_resolve_stub_va(&aot_stubs, (AotStubId)ps->stubs[i].stub_id, cur_part, pc_va);
+        i64 disp = (i64)(stub_va - pc_va) / 4;
+        start[w] = (ps->stubs[i].is_bl ? 0x94000000u : 0x14000000u) | ((u32)disp & 0x3FFFFFFu);
+    }
+    u32 first_word_after_stubs = *start;
+
+    if (aot_eager_link && ps->link_cnt > 0) {
+        AotLinkCtx lc = { .key = key_now, .entry_rip = ps->rip, .page = ps->page };
+        u64 linked = 0;
+        for (u32 i = 0; i < ps->link_cnt; i++) {
+            u32 w = ps->links[i].word_off;
+            u32 lit_w = ps->links[i].lit_off;
+            if (w >= ps->code_words || lit_w + 1U >= ps->code_words)
+                continue;
+            u64 target_rip = (u64)start[lit_w] | ((u64)start[lit_w + 1U] << 32);
+            u64 target_arm = aot_resolve_live_target(&lc, target_rip);
+            if (!target_arm)
+                continue;
+            i64 d = (i64)(target_arm - (base_va + (u64)w * 4ULL)) / 4;
+            if (ps->links[i].kind == AOT_CC_DIRECT && d >= -(1LL << 25) && d < (1LL << 25)) {
+                start[w] = 0x14000000u | ((u32)d & 0x3FFFFFFu);
+                linked++;
+            } else if (ps->links[i].kind == AOT_CC_CALL && d >= -(1LL << 25) && d < (1LL << 25)) {
+                start[w] = 0x94000000u | ((u32)d & 0x3FFFFFFu);
+                linked++;
+            } else if (ps->links[i].kind == AOT_CC_JCC && d >= -(1LL << 18) && d < (1LL << 18)) {
+                start[w] = (start[w] & ~(0x7FFFFu << 5)) | (((u32)d & 0x7FFFFu) << 5);
+                linked++;
+            }
+        }
+        if (ps->res_kind == PAR_RES_AOT_HIT && linked && aot_cache)
+            aot_note_eager_links(aot_cache, linked);
+    }
+
+    // 5. Register HostBlock + BlockEntry + block_map + icache invalidate + code_published.
+    if (ps->res_kind == PAR_RES_COLD && ps->compat && ps->cpl == 3)
+        stats.i386_blocks++;
+
+    u32 idx;
+    if (cur_part == 0 && p0_ring_enabled) {
+        idx = alloc_slot * P0_BLOCKS_PER_SLOT + p0_block_count[alloc_slot]++;
+    } else {
+        idx = BLOCK_BASE(cur_part) + hblock_count[cur_part]++;
+    }
+    HostBlock *hb = &hblocks[idx];
+    memset(hb, 0, sizeof *hb);
+    hb->rip = ps->rip;
+    hb->view = (u32)key_now;
+    hb->entry_word = (u32)(start - cc_base);
+    hb->frame[0] = ps->frame0;
+    hb->frame[1] = ps->frame1;
+    hb->cpl = (u8)ps->cpl;
+    hb->p0_slot = (u8)alloc_slot;
+    hb->compat = ps->compat;
+    hb->first_word = first_word_after_stubs;
+    hb->t2_has_loop = ps->t2_has_loop;
+    hb->t2_patch_word = (ps->t2_has_loop && ps->t2_patch_off != ~0U) ? (hb->entry_word + ps->t2_patch_off) : ~0U;
+    hb->on_frame = hb->on_page = hb->on_view = true;
+    if (!cfg.no_reuse && ps->frame1 == ~0ULL && ps->frame0 < cfg.ram_size && ps->snap_len > 0) {
+        u32 end = cur_part ? READ_COPY_BYTES : READ_COPY_BYTES / 2;
+        if (read_copied[cur_part] + ps->snap_len <= end) {
+            memcpy(read_copies + read_copied[cur_part], ps->snap_bytes, ps->snap_len);
+            hb->read_copy = read_copied[cur_part];
+            hb->read_off = ps->snap_off;
+            hb->read_bytes = ps->snap_len;
+            read_copied[cur_part] += ps->snap_len;
+        }
+    }
+
+    link_block(idx);
+    BlockEntry *be = &block_table[cur_part ? BLOCK_TABLE_PART2 + (idx - BLOCK_BASE(1)) : idx];
+    be->rip = ps->rip;
+    be->key = hb->view;
+    be->arm_off = hb->entry_word;
+    be->arm_words = ps->code_words;
+    be->map_off = map0;
+    be->map_count = ps->pcm_count;
+    map_insert((int)hb->view, ps->rip, idx + 1);
+    hb->registered = true;
+
+    u32 *end_cc = start + ps->code_words;
+    if (cur_part == 0 && p0_ring_enabled) {
+        __atomic_store_n(&ctx_ptr->p0_slot_block_count[alloc_slot], (u64)p0_block_count[alloc_slot], __ATOMIC_RELEASE);
+        p0_cc_cursor[alloc_slot] = end_cc;
+    } else {
+        if (cur_part == 0)
+            __atomic_store_n(&ctx_ptr->block_count, (u64)hblock_count[0], __ATOMIC_RELEASE);
+        else
+            __atomic_store_n(&ctx_ptr->block_count_private, (u64)hblock_count[1], __ATOMIC_RELEASE);
+        cc_cursor[cur_part] = end_cc;
+    }
+    sys_icache_invalidate(start, (size_t)ps->code_words * sizeof(u32));
+    code_published();
+
+    // Register cold Tier-2 loop under commit lock (~80 ns, prevents kill_block vs register race);
+    // heavy AOT record, Tier-2 AOT materialize/publish, and eager T2 promotion run unlocked in tr_translate_post()!
+    u64 t2_ep = __atomic_load_n(&t2_epoch[cur_part], __ATOMIC_RELAXED);
+    if (ps->res_kind == PAR_RES_COLD && hb->t2_has_loop && hb->t2_patch_word != ~0U && ps->aot_t2_span_bytes > 0) {
+        t2_register_loop(idx, (u32)cur_part, alloc_slot, hb->entry_word, ps->code_words,
+                         hb->t2_patch_word, ps->rip, ps->t2_head_rip, ps->frame0,
+                         ps->aot_t2_min_off, ps->aot_t2_span_bytes, (u32)key_now, (u8)ps->cpl, ps->compat, t2_ep);
+    }
+
+    ps->pub_idx = idx;
+    ps->pub_part = (u32)cur_part;
+    ps->pub_slot = alloc_slot;
+    ps->pub_entry_word = hb->entry_word;
+    ps->pub_arm_words = ps->code_words;
+    ps->pub_t2_patch_word = hb->t2_patch_word;
+    ps->pub_read_off = hb->read_off;
+    ps->pub_read_bytes = hb->read_bytes;
+    ps->pub_t2_epoch = t2_ep;
+    ps->post_is_aot_hit = (ps->res_kind == PAR_RES_AOT_HIT);
+    ps->need_post = (ps->res_kind == PAR_RES_COLD && (ps->aot_record_eligible || (hb->t2_has_loop && t2_eager_mode()))) ||
+                    (ps->res_kind == PAR_RES_AOT_HIT && hb->t2_has_loop && t2_enabled());
+
+    if (ps->res_kind == PAR_RES_COLD)
+        block_stats_merge(&ps->sdelta);
+    stats.blocks++;
+    stats.words += ps->code_words;
+    stats.par_translates++;
+    if ((key_now & KEY_DOMAIN) && ps->cpl == 3)
+        stats.shared_blocks++;
+    stats.translate_ns += ps->prep_ticks + (mach_absolute_time() - com_t0);
+
+    out->arm = base_va;
+    out->frames[0] = ps->frame0;
+    out->frames[1] = ps->frame1;
+    return 1;
+}
+
+void tr_translate_post(void) {
+    ParScratch *ps = tls_par;
+    if (!ps || !ps->need_post)
+        return;
+    ps->need_post = false;
+
+    if (!ps->post_is_aot_hit) {
+        // Cold block: record clean unlinked template in AOT cache outside translatorLock.
+        if (ps->aot_record_eligible && tr_aot_active && aot_cache) {
+            AotBlockView rec;
+            memset(&rec, 0, sizeof rec);
+            rec.key.page_hash = ps->aot_page_hash;
+            rec.key.abi_hash = aot_abi_hash;
+            rec.key.mode_bits = aot_build_mode_bits(ps->cpl, ps->compat, false);
+            rec.key.page_offset = (u16)(ps->rip & 0xFFFULL);
+            rec.orig_rip = ps->rip;
+            rec.code = ps->code;
+            rec.code_words = ps->code_words;
+            rec.pcm = ps->pcm;
+            rec.pcm_count = (u16)ps->pcm_count;
+            rec.relocs = ps->aot_cap.relocs;
+            rec.reloc_count = (u16)ps->aot_cap.count;
+            rec.read_off = ps->pub_read_off;
+            rec.read_bytes = ps->pub_read_bytes;
+            rec.t2_patch_word_off = ps->aot_t2_patch_off;
+            rec.t2_head_off = ps->aot_t2_head_off;
+            rec.t2_min_off = ps->aot_t2_min_off;
+            rec.t2_span_bytes = ps->aot_t2_span_bytes;
+            rec.priority = AOT_PRIO_TIER1;
+            if (aot_record(aot_cache, &rec))
+                aot_maybe_save_async(aot_cache, 65536U);
+        }
+        if (ps->t2_has_loop && ps->pub_t2_patch_word != ~0U && ps->aot_t2_span_bytes > 0 && t2_eager_mode())
+            t2_eager_promote_now(ps->pub_idx);
+        return;
+    }
+
+    // Warm AOT hit with Tier-2 loop: instant Tier-2 promotion outside translatorLock!
+    if (ps->t2_has_loop && ps->pub_t2_patch_word != ~0U) {
+        tr_aot_promote_t2_post(ps->pub_idx, ps->pub_part, ps->pub_slot, ps->pub_t2_epoch,
+                               (u32)ps->key, (u8)ps->cpl, ps->compat,
+                               ps->pub_entry_word, ps->pub_arm_words, ps->pub_t2_patch_word,
+                               ps->rip, ps->t2_head_rip, ps->frame0, ps->aot_page_hash,
+                               ps->aot_t2_min_off, ps->aot_t2_span_bytes);
     }
 }
 
@@ -3223,6 +4858,13 @@ void tr_init(const TrConfig *config) {
     const char *no_ymm = getenv("LC_HVDBT_NO_YMM_CACHE");
     tr_opt_ymm_cache = !(no_ymm && !strcmp(no_ymm, "1"));
     const char *no_ring = getenv("LC_HVDBT_NO_P0_RING");
+    const char *no_par = getenv("LC_HVDBT_NO_PAR_TRANSLATE");
+    par_translate_enabled = !(no_par && !strcmp(no_par, "1"));
+    no_uframe_share = getenv("LC_HVDBT_NO_USER_FRAME_SHARE") != NULL;
+    x86_decode_init();
+    memset(tr_frame_inval_gen, 0, sizeof tr_frame_inval_gen);
+    tr_pt_inval_gen = 0;
+    tr_flush_gen = 0;
     cfg = *config;
     if (cfg.profile_invalidations && (mach_timebase_info(&invalidation_timebase) != KERN_SUCCESS || !invalidation_timebase.denom))
         cfg.profile_invalidations = false;
@@ -3279,6 +4921,19 @@ void tr_init(const TrConfig *config) {
     tr_stub_ret_miss = cfg.stub_ret_miss;
     tr_stub_pushf = cfg.stub_pushf;
     tr_stub_sahf = cfg.stub_sahf;
+    // Always populate stub VA table so parallel stub relocation works with or without persistent AOT cache.
+    aot_stubs.va[AOT_STUB_LOOKUP] = tr_stub_lookup;
+    aot_stubs.va[AOT_STUB_RET_MISS] = tr_stub_ret_miss;
+    aot_stubs.va[AOT_STUB_PUSHF] = tr_stub_pushf;
+    aot_stubs.va[AOT_STUB_SAHF] = tr_stub_sahf;
+    aot_stubs.va[AOT_STUB_LOOKUP_L1] = PRIV_VA + OFF_STUBS + STUB_OFF_LOOKUP_L1;
+    aot_stubs.va[AOT_STUB_LOOKUP_L1_FAST] = PRIV_VA + OFF_STUBS + STUB_OFF_LOOKUP_L1_FAST;
+    aot_stubs.va[AOT_STUB_RET_MISS_L1] = PRIV_VA + OFF_STUBS + STUB_OFF_RET_MISS_L1;
+    aot_stubs.va[AOT_STUB_REP_MOVS] = PRIV_VA + OFF_STUBS + STUB_OFF_REP_MOVS;
+    aot_stubs.va[AOT_STUB_REP_STOS] = PRIV_VA + OFF_STUBS + STUB_OFF_REP_STOS;
+    aot_stubs.va[AOT_STUB_REP_PAGE_MOVS] = PRIV_VA + OFF_STUBS + STUB_OFF_REP_PAGE_MOVS;
+    aot_stubs.va[AOT_STUB_REP_PAGE_STOS] = PRIV_VA + OFF_STUBS + STUB_OFF_REP_PAGE_STOS;
+    stats.par_enabled = par_translate_enabled ? 1ULL : 0ULL;
     hblocks = calloc(BLOCKS_MAX + BLOCKS_MAX_PRIV, sizeof(HostBlock));
     free(shared_hash_views);
     shared_hash_views = NULL;
@@ -3441,8 +5096,32 @@ out:
 }
 
 static TrResult translate(int view, uint64_t cr3, int cpl, bool compat, uint64_t rip, bool single) {
+    // In single-vCPU / standalone C tests, also exercise the exact parallel prepare/reloc/commit/post pipeline
+    // unless disabled (LC_HVDBT_NO_PAR_TRANSLATE=1) or single-stepping / profiling compile inputs.
+    if (par_translate_enabled && !single && !cfg.profile_compile_inputs && ctx_ptr->vcpu_count <= 1) {
+        TrResult r;
+        bool flushed = false;
+        for (int attempt = 0; attempt < 3; attempt++) {
+            if (tr_translate_fast(view, cr3, cpl, compat, rip, false, &r)) {
+                r.flushed = r.flushed || flushed;
+                return r;
+            }
+            tr_translate_prepare();
+            int st = tr_translate_commit(&r);
+            flushed = flushed || r.flushed;
+            if (st > 0) {
+                r.flushed = flushed;
+                tr_translate_post();
+                return r;
+            }
+            if (st < 0) {
+                flush_everything();
+                flushed = true;
+            }
+        }
+    }
     tr_compat = compat; // the asking vCPU's: ctx_ptr is the first vCPU's, whatever it is running
-    tr_fpcr_merges_scalar = ctx_ptr->fpcr_merges_scalar != 0;
+    __atomic_store_n(&tr_fpcr_merges_scalar, ctx_ptr->fpcr_merges_scalar != 0, __ATOMIC_RELAXED);
     if (view > view_high)
         view_high = view;
     int key = block_key(view, cr3, cpl, rip);
@@ -3958,6 +5637,7 @@ static void kill_block(u32 idx) {
 int tr_invalidate_frame(uint64_t gpa, uint32_t why) {
     int n = 0;
     stats.kill_calls[why]++;
+    __atomic_fetch_add(&tr_frame_inval_gen[(gpa >> 12) & (PAR_GEN_BUCKETS - 1U)], 1ULL, __ATOMIC_RELEASE);
     if (aot_cache)
         aot_invalidate_frame_hash(aot_cache, gpa);
     if (gpa >= cfg.ram_size)
@@ -4020,6 +5700,7 @@ void tr_view_forget(int view) {
 
 int tr_invalidate_view_va(int view, uint64_t va, uint32_t why, bool unmoved, bool keeper) {
     int n = 0;
+    __atomic_fetch_add(&tr_pt_inval_gen, 1ULL, __ATOMIC_RELEASE);
     bool unmapped_shared = false;
     u64 page = va & ~0xfffULL;
     u32 slot = page_slot(page);
@@ -4057,6 +5738,7 @@ int tr_invalidate_view_va(int view, uint64_t va, uint32_t why, bool unmoved, boo
 }
 
 void tr_view_drop(int view) {
+    __atomic_fetch_add(&tr_pt_inval_gen, 1ULL, __ATOMIC_RELEASE);
     stats.kill_calls[KILL_VIEW_DROP]++;
     for (u32 it = view_head[view]; it; it = hblocks[it - 1].next_in_view) {
         hblocks[it - 1].on_view = false;
@@ -4101,6 +5783,7 @@ static void clear_code(u32 *from, u32 *to) {
 }
 
 void tr_flush_parked(bool everything) {
+    __atomic_fetch_add(&tr_flush_gen, 1ULL, __ATOMIC_RELEASE);
     bool ring_evict = p0_ring_enabled && p0_ring_need_evict;
     if (ring_evict) {
         // Part 0 4-slot ring wrap: recycle ONLY the oldest 61 MiB slot (25%), keeping 3 newest slots (183 MiB) + live T2 hot loops!
