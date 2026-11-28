@@ -493,6 +493,13 @@ typedef struct {
     uint64_t stat_hp_2m_splits;
     uint64_t stat_hp_64k_fills;
     uint64_t stat_hp_64k_breaks;
+    // Opt-in EL1 exact CNTVCT_EL0 time slicing (LC_HVDBT_PROFILE). Append-only.
+    uint32_t profile_el1_ticks;
+    uint32_t profile_el1_pad;
+    uint64_t stat_el1_sync_svc_ticks;
+    uint64_t stat_el1_sync_dabt_ticks;
+    uint64_t stat_el1_irq_ticks;
+    uint64_t stat_el1_hvc_ticks;
 } EngineCtx;
 _Static_assert(sizeof(EngineCtx) <= 32768, "EngineCtx must stay below the +32 KB per-vCPU scratch region");
 _Static_assert(sizeof(EngineCtx) <= CTX_SLOT, "EngineCtx must fit its existing per-vCPU slot");

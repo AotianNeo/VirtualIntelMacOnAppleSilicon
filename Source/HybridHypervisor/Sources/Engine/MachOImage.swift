@@ -13,6 +13,7 @@ public struct MachOImage {
     public let bytes: [UInt8]
     public let segments: [Segment]
     public let entry: UInt64?
+    public let symbols: [(name: String, address: UInt64)]
 
     public init(bytes: [UInt8]) throws {
         self.bytes = bytes
@@ -28,6 +29,7 @@ public struct MachOImage {
         var cursor = 32
         var segments: [Segment] = []
         var entry: UInt64?
+        var symbols: [(name: String, address: UInt64)] = []
         for _ in 0..<u32(16) {
             let command = u32(cursor)
             let size = Int(u32(cursor + 4))
@@ -42,11 +44,35 @@ public struct MachOImage {
                 let flavor = u32(cursor + 8)
                 let state = cursor + 16
                 entry = flavor == 4 ? u64(state + 16 * 8) : u64(state + 32 * 8)
+            } else if command == 0x2, size >= 24 {  // LC_SYMTAB
+                let symoff = Int(u32(cursor + 8))
+                let nsyms = Int(u32(cursor + 12))
+                let stroff = Int(u32(cursor + 16))
+                let strsize = Int(u32(cursor + 20))
+                if symoff > 0, stroff > 0, symoff + nsyms * 16 <= bytes.count, stroff + strsize <= bytes.count {
+                    for i in 0..<nsyms {
+                        let e = symoff + i * 16
+                        let strx = Int(u32(e))
+                        let nType = bytes[e + 4]
+                        let nSect = bytes[e + 5]
+                        let nValue = u64(e + 8)
+                        // Defined non-STAB symbols in section 1+ (__TEXT)
+                        if (nType & 0xE0) == 0, (nType & 0x0E) == 0x0E, nSect != 0, strx > 0, strx < strsize {
+                            let start = stroff + strx
+                            let end = bytes[start..<(stroff + strsize)].firstIndex(of: 0) ?? (stroff + strsize)
+                            if end > start {
+                                let name = String(decoding: bytes[start..<end], as: UTF8.self)
+                                symbols.append((name: name, address: nValue))
+                            }
+                        }
+                    }
+                }
             }
             cursor += size
         }
         self.segments = segments
         self.entry = entry
+        self.symbols = symbols
     }
 
     /// Copies each segment's file contents to `base + (address - origin)`.

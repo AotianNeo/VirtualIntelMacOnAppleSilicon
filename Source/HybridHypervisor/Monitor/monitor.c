@@ -71,6 +71,7 @@ typedef struct {
     u32 hybrid_apic_ver_val;
     u64 hv_hc_va_cached;
     u64 hv_hc_gpa_cached;
+    u64 hvc_ticks_local;
     u8 fx_area[512] __attribute__((aligned(16))); // the x87 save formats, one at a time
 } MonCpu;
 _Static_assert(sizeof(MonCpu) <= CTX_SLOT / 2, "the rest of the slot is the stack");
@@ -186,7 +187,13 @@ _Noreturn static void stop(u64 reason, u64 rip, u64 a, u64 b, u64 d);
 
 static inline void hostcall(u64 code) {
     register u64 x0 __asm__("x0") = code;
+    u64 h0 = c->profile_el1_ticks ? RSR(cntvct_el0) : 0;
     __asm__ volatile("hvc #1" : : "r"(x0) : "memory");
+    if (c->profile_el1_ticks) {
+        u64 dt = RSR(cntvct_el0) - h0;
+        me->hvc_ticks_local += dt;
+        c->stat_el1_hvc_ticks += dt;
+    }
 }
 
 // ---- Layout ----
@@ -5079,11 +5086,19 @@ static bool retry_unknown_code_fetch(void) {
 }
 
 void mon_sync(void) {
+    u64 prof_t0 = c->profile_el1_ticks ? RSR(cntvct_el0) : 0;
+    u64 prof_hvc0 = c->profile_el1_ticks ? me->hvc_ticks_local : 0;
     me->t2_synced = false;
     u32 ec = (u32)(c->esr >> 26);
     u32 n = (u32)c->esr & 0xffff;
-    if (ec == 0 && retry_unknown_code_fetch())
+    if (ec == 0 && retry_unknown_code_fetch()) {
+        if (c->profile_el1_ticks) {
+            u64 total = RSR(cntvct_el0) - prof_t0;
+            u64 hvc_dt = me->hvc_ticks_local - prof_hvc0;
+            c->stat_el1_sync_svc_ticks += total > hvc_dt ? (total - hvc_dt) : 0;
+        }
         return;
+    }
     me->code_retry_pc = 0; // anything else between two faults at one PC means the first retry got past it
     bool page_movs = false;
     bool page_rep = ec == 0x15 && n == SVC_REP_PAGE;
@@ -5647,9 +5662,20 @@ void mon_sync(void) {
     // it has not executed even if the new ARM PC is an exact x86 boundary.
     // A retryable data abort or internal REP service can also make no progress.
     exit_check(ec == 0x32 || (ec == 0x15 && !page_rep && n != SVC_DEAD), false);
+    if (c->profile_el1_ticks) {
+        u64 total = RSR(cntvct_el0) - prof_t0;
+        u64 hvc_dt = me->hvc_ticks_local - prof_hvc0;
+        u64 el1_dt = total > hvc_dt ? (total - hvc_dt) : 0;
+        if (ec == 0x24)
+            c->stat_el1_sync_dabt_ticks += el1_dt;
+        else
+            c->stat_el1_sync_svc_ticks += el1_dt;
+    }
 }
 
 void mon_irq(void) {
+    u64 prof_t0 = c->profile_el1_ticks ? RSR(cntvct_el0) : 0;
+    u64 prof_hvc0 = c->profile_el1_ticks ? me->hvc_ticks_local : 0;
     me->t2_synced = false;
     if (me->smc_held)
         __atomic_store_n(&me->smc_held, 0, __ATOMIC_RELEASE);
@@ -5668,6 +5694,11 @@ void mon_irq(void) {
         sync_host_irq(true);
     apic_merge_host();
     exit_check(false, c->hybrid);
+    if (c->profile_el1_ticks) {
+        u64 total = RSR(cntvct_el0) - prof_t0;
+        u64 hvc_dt = me->hvc_ticks_local - prof_hvc0;
+        c->stat_el1_irq_ticks += total > hvc_dt ? (total - hvc_dt) : 0;
+    }
 }
 
 void mon_fiq(void) {

@@ -4848,6 +4848,70 @@ static void emit_monitor_op(const Insn *in) {
     }
 }
 
+// Read-only profiler helper: fetch original x86 bytes of a block even after the guest process
+// has exited and Windows has torn down its CR3 page tables (uses read_copies or HostBlock.frame[]).
+size_t tr_profile_read_block_x86(uint32_t tbl_idx, bool priv_part, bool is_t2,
+                                 uint64_t rip, uint8_t *dst, size_t max_len) {
+    if (!dst || max_len == 0 || !hblocks)
+        return 0;
+    u32 hidx = ~0u;
+    if (is_t2) {
+        int part = priv_part ? 1 : 0;
+        if (!t2_meta[part] || tbl_idx >= T2_BLOCKS_MAX)
+            return 0;
+        hidx = t2_meta[part][tbl_idx].t1_idx;
+    } else {
+        hidx = (priv_part ? (u32)BLOCKS_MAX : 0u) + tbl_idx;
+    }
+    if (hidx >= (u32)(BLOCKS_MAX + BLOCKS_MAX_PRIV))
+        return 0;
+    const HostBlock *hb = &hblocks[hidx];
+    if (hb->read_bytes > 0 && read_copies && hb->rip <= rip) {
+        u64 delta = rip - hb->rip;
+        u32 base_off = (u32)(hb->rip & 0xfffu);
+        if (delta < hb->read_bytes && base_off >= hb->read_off) {
+            u32 rc_delta = (base_off - hb->read_off) + (u32)delta;
+            if (rc_delta < hb->read_bytes) {
+                size_t avail = (size_t)(hb->read_bytes - rc_delta);
+                if (avail > max_len) avail = max_len;
+                memcpy(dst, read_copies + hb->read_copy + rc_delta, avail);
+                return avail;
+            }
+        }
+    }
+    if (hb->frame[0] != ~0ULL && cfg.ram) {
+        size_t done = 0;
+        u64 host_ram_bytes = cfg.ram_below_4g ? (cfg.ram_size - ((1ULL << 32) - cfg.ram_below_4g)) : cfg.ram_size;
+        u64 off0 = rip & 0xfffULL;
+        size_t chunk0 = (size_t)(4096ULL - off0);
+        if (chunk0 > max_len) chunk0 = max_len;
+        u64 gpa0 = hb->frame[0] + off0;
+        bool in_hole0 = cfg.ram_below_4g && gpa0 >= cfg.ram_below_4g && gpa0 < (1ULL << 32);
+        if (!in_hole0 && gpa0 + chunk0 <= cfg.ram_size) {
+            u64 h0 = (cfg.ram_below_4g && gpa0 >= (1ULL << 32)) ? (gpa0 - (1ULL << 32) + cfg.ram_below_4g) : gpa0;
+            if (h0 + chunk0 <= host_ram_bytes) {
+                memcpy(dst, cfg.ram + h0, chunk0);
+                done = chunk0;
+            }
+        }
+        if (done < max_len && hb->frame[1] != ~0ULL) {
+            size_t chunk1 = max_len - done;
+            if (chunk1 > 4096U) chunk1 = 4096U;
+            u64 gpa1 = hb->frame[1];
+            bool in_hole1 = cfg.ram_below_4g && gpa1 >= cfg.ram_below_4g && gpa1 < (1ULL << 32);
+            if (!in_hole1 && gpa1 + chunk1 <= cfg.ram_size) {
+                u64 h1 = (cfg.ram_below_4g && gpa1 >= (1ULL << 32)) ? (gpa1 - (1ULL << 32) + cfg.ram_below_4g) : gpa1;
+                if (h1 + chunk1 <= host_ram_bytes) {
+                    memcpy(dst + done, cfg.ram + h1, chunk1);
+                    done += chunk1;
+                }
+            }
+        }
+        return done;
+    }
+    return 0;
+}
+
 void tr_init(const TrConfig *config) {
     const char *no_dag = getenv("LC_HVDBT_NO_NATIVE_DAG");
     native_dag = !(no_dag && !strcmp(no_dag, "1"));
@@ -4953,6 +5017,7 @@ void tr_init(const TrConfig *config) {
     read_copies = mmap(NULL, READ_COPY_BYTES, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
     page_head = calloc(PAGE_HEADS, sizeof(u32));
     t2_init(&cfg, ctx_ptr, cc_base);
+    tr_profile_init_mem(cfg.priv, cfg.ram, cfg.ram_size, cfg.ram_below_4g, ctx_ptr, NULL);
 
     // Optional persistent AOT code cache (default OFF unless LC_HVDBT_AOT_CACHE=<path>).
     if (aot_cache) {

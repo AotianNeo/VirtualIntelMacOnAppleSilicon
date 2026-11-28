@@ -120,6 +120,11 @@ public final class Engine {
     /// One past the highest RAM GPA. Below it there can be holes, which `PI_RAM` tells apart.
     public let ramTop: UInt64
     public var tally: Tally?
+    // Opt-in full-stack profiler (LC_HVDBT_PROFILE=<prefix>; default OFF = zero overhead).
+    private let profPending = UnsafeMutablePointer<UInt32>.allocate(capacity: 1)
+    private static let profCtlPath = "/tmp/hvdbt-profile.ctl"
+    private nonisolated(unsafe) var profThreadStarted = false
+    private var monSymbols: [(name: String, address: UInt64)] = []
     // For stall reports, read from another thread. One word each, written around each exit.
     private nonisolated(unsafe) var inVCPURun = false
     private nonisolated(unsafe) var lastHostCall = 0
@@ -237,11 +242,22 @@ public final class Engine {
         tr_init(&config)
         ctx.pointee.vcpu_count = 1
         gate.engines = [self]
+        profPending.initialize(to: 0)
+        if tr_profile_enabled() {
+            for (name, va) in monSymbols where va >= kPrivVA && va < kPrivVA + kOffMonData {
+                name.withCString { tr_profile_register_mon_sym(va, $0) }
+            }
+            startProfilerHostThread()
+        }
         try setUpVCPU()
     }
 
     deinit {
-        if cpuIndex == 0 { tr_aot_flush() }
+        if cpuIndex == 0 {
+            if tr_profile_enabled() { dumpProfileSlice(tag: "final") }
+            tr_aot_flush()
+        }
+        profPending.deallocate()
     }
 
     /// Another vCPU in `first`'s VM. Call on the thread that will run it. `prepareCount` must have been called before the first vCPU ran; this one may start later.
@@ -255,6 +271,7 @@ public final class Engine {
         ramTop = first.ramTop
         bootTTBR = first.bootTTBR
         ctx = (priv + Int(kOffCtx + UInt64(index) * kCtxSlot)).bindMemory(to: EngineCtx.self, capacity: 1)
+        profPending.initialize(to: 0)
         try setUpVCPU()
         // One clock: the TSC and the APIC timer read this counter on every vCPU.
         vtimerOffset = first.vtimerOffset
@@ -361,6 +378,7 @@ public final class Engine {
     private func loadMonitor() throws {
         let bytes = Array(UnsafeBufferPointer(start: engine_monitor_macho_ptr(), count: engine_monitor_macho_size()))
         let image = try MachOImage(bytes: bytes)
+        monSymbols = image.symbols
         image.copy(to: priv, origin: kPrivVA)
         let stubsBytes = Int(kOffCC - kOffStubs) // 2 MiB: covers all EL0 stubs (0x000..0xfff+)
         for dstOff in [kOffStubsHi, kOffStubs2, kOffStubs2Hi] {
@@ -483,6 +501,7 @@ public final class Engine {
         ctx.pointee.hybrid = options.hybrid ? 1 : 0
         let environment = ProcessInfo.processInfo.environment
         ctx.pointee.profile_mmu_observations = latencyTracing || environment["LC_HVDBT_MMU_OBSERVATIONS"] == "1" ? 1 : 0
+        ctx.pointee.profile_el1_ticks = tr_profile_enabled() ? 1 : 0
         ctx.pointee.keeper_inactive_guard = environment["LC_HVDBT_KEEPER_INACTIVE_GUARD"] == "1" ? 1 : 0
         ctx.pointee.profile_shift_helpers = environment["LC_HVDBT_PROFILE_SHIFT_HELPERS"] == "1" ? 1 : 0
         if environment["VIM_HYBRID_HELPER_CENSUS"] == "1" { ctx.pointee.profile_shift_helpers = 1 }
@@ -656,6 +675,26 @@ public final class Engine {
                 }
                 if let outcome { return outcome }
             case HV_EXIT_REASON_CANCELED:
+                if tr_profile_enabled() && tr_profile_flag_take(profPending) {
+                    var pc: UInt64 = 0, cpsr: UInt64 = 0, elr: UInt64 = 0, lr: UInt64 = 0
+                    hv_vcpu_get_reg(vcpu, HV_REG_PC, &pc)
+                    hv_vcpu_get_reg(vcpu, HV_REG_CPSR, &cpsr)
+                    let el = UInt16((cpsr >> 2) & 3)
+                    if el != 0 {
+                        hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_ELR_EL1, &elr)
+                        hv_vcpu_get_reg(vcpu, HV_REG_LR, &lr)
+                    }
+                    var s = TrProfSample(pc: pc, elr: elr, lr: lr, cr3: ctx.pointee.cr3,
+                                         cpu: cpuIndex, el: el, cpl: UInt16(truncatingIfNeeded: ctx.pointee.cpl))
+                    tr_profile_record_sample(&s)
+                    let fc = firstContext.pointee
+                    let ifOpen = (ctx.pointee.rflags_sys & 0x200) != 0
+                    let hasHostIrq = options.hybrid && (machine?.hasInterruptWaiting() ?? false) && ifOpen
+                    let otherWork = hasHostIrq || ctx.pointee.stop_requested != 0 || ctx.pointee.direct_flush != 0
+                        || (ctx.pointee.irq_pending != 0 && ifOpen)
+                        || fc.note_head != fc.note_tail || fc.note_overflow != 0
+                    if !otherWork && !watchdogFired { continue }
+                }
                 if watchdogFired {
                     var pc: UInt64 = 0
                     var elr: UInt64 = 0
@@ -1371,6 +1410,110 @@ public final class Engine {
         o += "registers at the last monitor entry, x0-x15 are rax rcx rdx rbx rsp rbp rsi rdi r8-r15:\n"
         for i in 0..<16 { o += hex(x[i]) + (i % 4 == 3 ? "\n" : " ") }
         return o
+    }
+
+    // ---- Opt-in Full-Stack Profiler Host Sampler & Per-Workload Slicer ----
+    private func collectVcpuSnapshots() -> [TrProfVcpuSnap] {
+        gate.condition.lock()
+        let list = gate.engines
+        gate.condition.unlock()
+        var out = [TrProfVcpuSnap]()
+        out.reserveCapacity(list.count)
+        for eng in list {
+            let c = eng.ctx.pointee
+            var snap = TrProfVcpuSnap()
+            snap.cpu = eng.cpuIndex
+            snap.ticks_in_vcpu = eng.ticksInVCPU
+            snap.el1_sync_svc_ticks = c.stat_el1_sync_svc_ticks
+            snap.el1_sync_dabt_ticks = c.stat_el1_sync_dabt_ticks
+            snap.el1_irq_ticks = c.stat_el1_irq_ticks
+            snap.el1_hvc_ticks = c.stat_el1_hvc_ticks
+            snap.translator_wait_ticks = eng.translatorWaitTicks
+            snap.vm_exits = eng.exitCount
+            snap.shadow_fills = c.stat_fills
+            snap.cr3_writes = c.stat_cr3
+            snap.syscalls = c.stat_syscall
+            snap.irets = c.stat_iret
+            snap.smc_events = c.stat_smc
+            snap.mon_wait_ticks = c.stat_mon_wait
+            withUnsafeMutableBytes(of: &snap.hc_count) { dst in
+                eng.hostCallCount.withUnsafeBytes { dst.copyMemory(from: $0) }
+            }
+            withUnsafeMutableBytes(of: &snap.hc_ticks) { dst in
+                eng.hostCallTicks.withUnsafeBytes { dst.copyMemory(from: $0) }
+            }
+            withUnsafeMutableBytes(of: &snap.svc_count) { dst in
+                withUnsafeBytes(of: c.stat_svc) { dst.copyMemory(from: $0) }
+            }
+            out.append(snap)
+        }
+        return out
+    }
+
+    private func dumpProfileSlice(tag: String) {
+        let snaps = collectVcpuSnapshots()
+        snaps.withUnsafeBufferPointer { buf in
+            tag.withCString { _ = tr_profile_dump($0, buf.baseAddress, UInt32(buf.count)) }
+        }
+    }
+
+    private func resetProfileSlice() {
+        let snaps = collectVcpuSnapshots()
+        snaps.withUnsafeBufferPointer { buf in
+            tr_profile_reset(buf.baseAddress, UInt32(buf.count))
+        }
+    }
+
+    private func startProfilerHostThread() {
+        guard !profThreadStarted else { return }
+        profThreadStarted = true
+        tr_profile_install_sigusr1()
+        let baseUs = max(250, Int(1_000_000 / max(100, tr_profile_hz())))
+        Thread.detachNewThread { [weak self] in
+            var rng: UInt64 = 0x9E37_79B9_7F4A_7C15
+            var ctlPoll = 0
+            var sigSeq = 0
+            while let self {
+                rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17
+                let span = max(1, baseUs * 15 / 100)
+                let jitter = Int(rng % UInt64(span * 2 + 1)) - span
+                usleep(useconds_t(max(100, baseUs + jitter)))
+
+                self.gate.condition.lock()
+                let list = self.gate.engines
+                self.gate.condition.unlock()
+                for eng in list where eng.inVCPURun && eng.ctx.pointee.halted == 0 {
+                    tr_profile_flag_set(eng.profPending)
+                    var v = eng.vcpu
+                    hv_vcpus_exit(&v, 1)
+                }
+
+                if tr_profile_take_sigusr1() {
+                    sigSeq += 1
+                    self.dumpProfileSlice(tag: "sigusr1_\(sigSeq)")
+                }
+                ctlPoll += 1
+                if ctlPoll >= 25 {
+                    ctlPoll = 0
+                    if let cmd = try? String(contentsOfFile: Self.profCtlPath, encoding: .utf8) {
+                        _ = unlink(Self.profCtlPath)
+                        let parts = cmd.trimmingCharacters(in: .whitespacesAndNewlines).split(separator: " ", maxSplits: 1)
+                        if let verb = parts.first {
+                            if verb == "reset" {
+                                self.resetProfileSlice()
+                            } else if verb == "dump" {
+                                let tag = parts.count > 1 ? String(parts[1]) : "slice"
+                                self.dumpProfileSlice(tag: tag)
+                            } else if verb == "dump_reset" {
+                                let tag = parts.count > 1 ? String(parts[1]) : "slice"
+                                self.dumpProfileSlice(tag: tag)
+                                self.resetProfileSlice()
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     func mxcsr() -> UInt32 {

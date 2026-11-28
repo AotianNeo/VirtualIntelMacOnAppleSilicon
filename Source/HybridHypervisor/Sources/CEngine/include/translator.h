@@ -3,6 +3,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include "engine_abi.h"
+#include "tr_profile.h"
 
 enum {
     TR_REUSE_DISABLED, TR_REUSE_NO_SLOT, TR_REUSE_NOT_DEAD, TR_REUSE_RIP, TR_REUSE_KEY,
