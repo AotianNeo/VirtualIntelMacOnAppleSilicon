@@ -418,6 +418,16 @@ public final class Tally: @unchecked Sendable {
         o += "page_rep_committed_prefixes \(c.stat_rep_page_prefixes)\n"
         o += "page_rep_committed_bytes \(c.stat_rep_page_bytes)\n"
         o += "Positive prefixes/bytes follow actual copy and architectural progress commit. Invocations include declines; async snapshots are not coherent.\n"
+        if t.aot_enabled != 0 {
+            let totalHits = t.aot_hits_t1 &+ t.aot_hits_t2
+            let hitRate = t.aot_lookups > 0 ? (Double(totalHits) * 100.0 / Double(t.aot_lookups)) : 0.0
+            let avgRelocNs = totalHits > 0 ? (Double(t.aot_reloc_ns) / Double(totalHits)) : 0.0
+            o += "\n== persistent AOT code cache (global, repeated per vCPU) ==\n"
+            o += "aot_loaded \(t.aot_loaded) aot_loaded_t2 \(t.aot_loaded_t2) aot_lookups \(t.aot_lookups) aot_hits_t1 \(t.aot_hits_t1) aot_hits_t2 \(t.aot_hits_t2) aot_misses \(t.aot_misses)\n"
+            o += String(format: "aot_hit_rate_pct %.2f aot_avg_reloc_ns %.1f aot_reloc_ms %.2f aot_eager_cc_links %llu aot_reloc_failures %llu\n",
+                        hitRate, avgRelocNs, Double(t.aot_reloc_ns) / 1_000_000.0, t.aot_eager_cc_links, t.aot_reloc_failures)
+            o += "aot_recorded_t1 \(t.aot_recorded_t1) aot_recorded_t2 \(t.aot_recorded_t2) aot_saves_ok \(t.aot_saves_ok) aot_saved_bytes \(t.aot_saved_bytes)\n"
+        }
         if c.profile_mmu_observations != 0 {
             o += "\n== MMU observations (this vCPU; count/timing only, no skipped operations) ==\n"
             o += "mmu_observations_enabled \(c.profile_mmu_observations)\n"

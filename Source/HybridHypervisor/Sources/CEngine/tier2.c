@@ -193,6 +193,13 @@ static void t2_clear_bucket(u32 b) {
 
 bool t2_enabled(void) { return t2_is_enabled; }
 bool t2_eager_mode(void) { return t2_is_enabled && t2_is_eager; }
+u32 t2_ablation_bits(void) {
+    u32 b = 0;
+    if (t2_no_mem_ymm) b |= AOT_MODE_T2_NO_MEM_YMM;
+    if (t2_no_stk_promo) b |= AOT_MODE_T2_NO_STK_PROMO;
+    if (t2_no_unroll4) b |= AOT_MODE_T2_NO_UNROLL4;
+    return b;
+}
 
 // ---- Tier-2 instruction classification & safety checks ----
 static bool t2_op_forbidden(const Insn *in) {
@@ -568,6 +575,7 @@ static int t2_find_rip(const Insn *list, int count, u64 rip) {
 }
 
 static inline void t2_stub_lit(u64 v) {
+    tr_aot_note_gva64_lit(tr_cc);
     E((u32)v);
     E((u32)(v >> 32));
 }
@@ -1354,6 +1362,10 @@ static bool t2_compile_and_publish(const T2LoopDesc *d) {
     bool overflow = false;
 
     tr_cc = local_buf;
+    if (tr_aot_active) {
+        tr_aot_block_start = local_buf;
+        aot_capture_begin(&tr_aot_cap);
+    }
     tr_ad_page = ~0ULL;
     tr_zext8 = tr_zext16 = 0;
     tr_aes_mask = 0;
@@ -1381,7 +1393,7 @@ static bool t2_compile_and_publish(const T2LoopDesc *d) {
     }
     // 4. Preheader LICM: hoist RIP-relative page base into AD (x20).
     if (licm_ad_page != ~0ULL) {
-        movimm(AD, licm_ad_page);
+        tr_emit_movimm_gva(AD, licm_ad_page, false);
         tr_ad_page = licm_ad_page;
     }
     if (dirty_ymm_boost)
@@ -1836,8 +1848,10 @@ static bool t2_compile_and_publish(const T2LoopDesc *d) {
     ext_ymm_cache_reset();
     tr_t2_mode = false;
 
-    if (overflow || code_words == 0 || code_words >= T2_MAX_CODE_WORDS)
+    if (overflow || code_words == 0 || code_words >= T2_MAX_CODE_WORDS) {
+        tr_aot_cap.active = false;
         return false;
+    }
 
     __atomic_add_fetch(&t2_stat_compiled, 1, __ATOMIC_RELAXED);
     bool ok = tr_t2_publish(d->t1_idx, d->part, d->p0_slot, d->epoch, d->head_rip,
@@ -1846,6 +1860,12 @@ static bool t2_compile_and_publish(const T2LoopDesc *d) {
                             local_buf, code_words, local_pcm, pcm_cnt,
                             &tmeta, bail_sites, bail_cnt);
     if (ok) {
+        if (tr_aot_active && tr_aot_cap.active && !tr_aot_cap.ineligible) {
+            tr_aot_record_t2(d->frame0, d->head_rip, d->cpl, d->compat,
+                             local_buf, code_words, local_pcm, pcm_cnt,
+                             &tmeta, bail_sites, bail_cnt, &tr_aot_cap);
+        }
+        tr_aot_cap.active = false;
         __atomic_add_fetch(&t2_stat_promoted, 1, __ATOMIC_RELAXED);
         if (copies == 4) __atomic_add_fetch(&t2_stat_unrolled4, 1, __ATOMIC_RELAXED);
         else if (copies == 2) __atomic_add_fetch(&t2_stat_unrolled, 1, __ATOMIC_RELAXED);
@@ -1859,6 +1879,8 @@ static bool t2_compile_and_publish(const T2LoopDesc *d) {
                     res_ymm_cnt, res_ymm_wr_mask, stk_cnt, stk_dirty_mask, pre_guard_cnt, iter_guard_cnt,
                     licm_ad_page != ~0ULL ? 1 : 0, code_words);
         }
+    } else {
+        tr_aot_cap.active = false;
     }
     return ok;
 }

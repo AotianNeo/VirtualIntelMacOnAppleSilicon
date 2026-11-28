@@ -118,7 +118,11 @@ typedef struct {
     // Exact matches versus the preceding retained observation: index (different_key * 2 + different_pfn).
     uint64_t compile_inputs_exact_joint[4];
     uint64_t page_rep_enabled; // configuration state, global and repeated; not a counter or per-vCPU value
+    // Persistent AOT code cache counters (zero when LC_HVDBT_AOT_CACHE is unset).
+    uint64_t aot_enabled, aot_loaded, aot_loaded_t2, aot_lookups, aot_hits_t1, aot_hits_t2, aot_misses;
+    uint64_t aot_reloc_failures, aot_eager_cc_links, aot_recorded_t1, aot_recorded_t2, aot_saves_ok, aot_saved_bytes, aot_reloc_ns;
 } TrStats;
 TrStats tr_stats(void);
+void tr_aot_flush(void);
 void tr_set_lock_hooks(void (*unlock)(void *), void (*relock)(void *), void *ctx);
 

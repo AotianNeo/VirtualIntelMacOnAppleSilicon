@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include "engine_abi.h"
 #include "translator.h"
+#include "aot_cache.h"
 
 typedef uint8_t u8;
 typedef uint16_t u16;
@@ -373,6 +374,47 @@ void emit_pcmpistri_el0(int d, int s, u8 imm, int live);
 // Stub entry points, relative to the stubs region. Filled in by the Swift loader from the monitor image's symbols.
 extern u64 tr_stub_lookup, tr_stub_ret_miss, tr_stub_pushf, tr_stub_sahf;
 extern _Thread_local int cur_part;
+
+// Persistent AOT cache relocation capture (inert when tr_aot_active == false).
+extern bool tr_aot_active;
+extern _Thread_local AotCapture tr_aot_cap;
+extern _Thread_local u32 *tr_aot_block_start;
+u32 t2_ablation_bits(void);
+void tr_aot_record_t2(u64 frame0, u64 head_rip, u8 cpl, bool compat,
+                      const u32 *code, u32 code_words, const PcMap *pcm, u32 pcm_count,
+                      const T2TrapMeta *trap_meta, const u32 *bail_sites, u32 bail_cnt,
+                      const AotCapture *cap);
+
+static inline void tr_emit_movimm_gva(int rd, u64 gva, bool force32) {
+    if (__builtin_expect(tr_aot_active && tr_aot_cap.active, 0)) {
+        aot_emit_movimm_gva(&tr_cc, tr_aot_block_start, &tr_aot_cap, rd, gva, force32);
+        return;
+    }
+    movimm(rd, force32 ? (gva & 0xffffffffULL) : gva);
+}
+
+static inline void tr_aot_note_gva64_lit(u32 *lit_site) {
+    if (__builtin_expect(tr_aot_active && tr_aot_cap.active, 0))
+        aot_capture_add(&tr_aot_cap, (u32)(lit_site - tr_aot_block_start), AOT_RELOC_GVA64_LIT, 0, 0);
+}
+
+static inline void tr_aot_note_stub(u32 *branch_site, AotStubId id, bool is_bl) {
+    if (__builtin_expect(tr_aot_active && tr_aot_cap.active, 0))
+        aot_capture_add(&tr_aot_cap, (u32)(branch_site - tr_aot_block_start),
+                        AOT_RELOC_STUB_BRANCH, (u8)((u8)id | (is_bl ? 0x80u : 0u)), 0);
+}
+
+static inline void tr_aot_note_cc_branch(u32 *site, AotCcBranchKind kind, u32 *lit_site) {
+    if (__builtin_expect(tr_aot_active && tr_aot_cap.active, 0)) {
+        u32 lit_off = (u32)(lit_site - tr_aot_block_start);
+        if (lit_off > 0xFFFFU) {
+            aot_capture_mark_ineligible(&tr_aot_cap);
+            return;
+        }
+        aot_capture_add(&tr_aot_cap, (u32)(site - tr_aot_block_start),
+                        AOT_RELOC_CC_BRANCH, (u8)kind, (u16)lit_off);
+    }
+}
 #ifdef OFF_STUBS_HI
 #define STUB(address) ((address) + ((tr_cc_va(tr_cc) >= PRIV_VA + (cur_part ? OFF_CC2 : OFF_CC) + (124ULL << 20)) \
     ? (cur_part ? (OFF_STUBS2_HI - OFF_STUBS) : (OFF_STUBS_HI - OFF_STUBS)) \

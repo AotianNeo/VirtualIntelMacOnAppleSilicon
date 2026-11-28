@@ -2760,7 +2760,7 @@ static void emit_fma128(int d, int op1, int op2, int op3, int order, int kind, b
 // S0 holds the sign-extended element index. The address is left in S1.
 static void gather_addr(const Insn *in) {
     if (in->riprel) {
-        movimm(S1, (u64)(in->next + in->disp));
+        tr_emit_movimm_gva(S1, (u64)(in->next + in->disp), false);
         add_reg(1, 0, 0, S1, S1, S0, in->scale);
     } else {
         if (in->no_base)

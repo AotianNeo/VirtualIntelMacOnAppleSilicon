@@ -74,7 +74,7 @@ int addr_reg(const Insn *in) {
     int segr = in->seg == 1 ? R_FS : in->seg == 2 ? R_GS : -1;
     int sf = !tr_compat; // 32-bit code's sums wrap at 4 GB, and its registers already have clear top halves
     if (in->riprel) {
-        movimm(AD, in->next + in->disp);
+        tr_emit_movimm_gva(AD, in->next + in->disp, false);
         cur = AD;
     } else {
         if (!in->no_base)
@@ -132,7 +132,7 @@ Addr addr_prepare(const Insn *in, int access) {
         u32 off = (u32)(target & 0xfffULL);
         if ((off & (u32)(access - 1)) == 0 || off < 256) {
             if (pg != tr_ad_page) {
-                movimm(AD, pg);
+                tr_emit_movimm_gva(AD, pg, false);
                 tr_ad_page = pg;
             }
             a.base = AD;
@@ -1917,6 +1917,9 @@ static void emit_string(const Insn *in) {
         }
         u64 stub = tr_page_rep ? (sub == 0 ? STUB_OFF_REP_PAGE_MOVS : STUB_OFF_REP_PAGE_STOS)
                                : (sub == 0 ? STUB_OFF_REP_MOVS : STUB_OFF_REP_STOS);
+        AotStubId sid = tr_page_rep ? (sub == 0 ? AOT_STUB_REP_PAGE_MOVS : AOT_STUB_REP_PAGE_STOS)
+                                    : (sub == 0 ? AOT_STUB_REP_MOVS : AOT_STUB_REP_STOS);
+        tr_aot_note_stub(tr_cc, sid, true);
         bl_abs(STUB(PRIV_VA + OFF_STUBS + stub));
         for (int i = 0; i < 2; i++)
             if (wraps[i])
@@ -2028,7 +2031,7 @@ static void emit_lea(const Insn *in) {
                     add_imm(sf, 0, 0, rd, AD, off);
                 return;
             }
-            movimm(rd, sf ? target : (target & 0xffffffffULL));
+            tr_emit_movimm_gva(rd, target, !sf);
             return;
         }
         int cur = in->no_base ? XZR : in->base;
@@ -2380,6 +2383,7 @@ void emit_int(const Insn *in, int live) {
             emit_pusha(in);
             break;
         case OP_PUSHF:
+            tr_aot_note_stub(tr_cc, AOT_STUB_PUSHF, true);
             bl_abs(STUB(tr_stub_pushf));
             if (sz == 8)
                 E(0xF8000C00u | ((u32)-8 & 0x1ff) << 12 | 4 << 5 | S0);
@@ -2517,11 +2521,13 @@ void emit_int(const Insn *in, int live) {
             }
             break;
         case OP_LAHF:
+            tr_aot_note_stub(tr_cc, AOT_STUB_PUSHF, true);
             bl_abs(STUB(tr_stub_pushf));
             bfi(1, 0, S0, 8, 8);
             break;
         case OP_SAHF:
             ubfx(1, S0, 0, 8, 8);
+            tr_aot_note_stub(tr_cc, AOT_STUB_SAHF, true);
             bl_abs(STUB(tr_stub_sahf));
             break;
         case OP_CMC:

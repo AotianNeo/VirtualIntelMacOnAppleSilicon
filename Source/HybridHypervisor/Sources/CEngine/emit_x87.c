@@ -26,6 +26,7 @@ static int mem_kind(int esc, int reg) {
 static void call_monitor(const Insn *in) {
     svc(SVC_X87);
     E((u32)(in->sub == 8 ? 0xFFFF : in->sub << 8 | in->opc) | (u32)in->seg << 16 | (in->pfx == 0x66 ? 1u << 18 : 0));
+    tr_aot_note_gva64_lit(tr_cc);
     E((u32)in->rip);
     E((u32)(in->rip >> 32));
 }

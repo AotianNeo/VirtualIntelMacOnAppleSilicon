@@ -240,6 +240,10 @@ public final class Engine {
         try setUpVCPU()
     }
 
+    deinit {
+        if cpuIndex == 0 { tr_aot_flush() }
+    }
+
     /// Another vCPU in `first`'s VM. Call on the thread that will run it. `prepareCount` must have been called before the first vCPU ran; this one may start later.
     public init(secondaryOf first: Engine, index: UInt32) throws {
         options = first.options
