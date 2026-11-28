@@ -1844,8 +1844,19 @@ static void emit_bitscan(const Insn *in, int live) {
     }
     if (sz == 8 && s1 != S1)
         mov_reg(1, S1, s1);
-    if (tr_hybrid) {
-        // Pure-integer 64-bit SWAR popcnt: never touches NEON, so CR0.TS=1 cannot #NM.
+    if (tr_opt_hw_popcnt && (!tr_hybrid || tr_cpl == 3)) {
+        // Hardware NEON POPCNT (4 insns vs 13-insn SWAR): ZF for a zero source, other arith flags clear.
+        // Uses v27 (outside YMM8..15 cache pool {v24,v25,v29,v31}) so YMM cache stays warm.
+        // In hybrid Ring-3, if CR0.TS=1 traps EC=0x07 on fmov d27, x17, Monitor/monitor.c emulates
+        // this exact 4-word sequence in EL1 without delivering a spurious #NM.
+        // Encodings: 0x9E67023B, 0x0E205B7B, 0x0E31BB7B, 0x1E260376.
+        enum { V_POP = 27 };
+        E(0x9E670000u | (u32)S1 << 5 | V_POP);
+        E(0x0E205800u | V_POP << 5 | V_POP);
+        E(0x0E31B800u | V_POP << 5 | V_POP);
+        E(0x1E260000u | V_POP << 5 | (u32)S2);
+    } else {
+        // Pure-integer 64-bit SWAR popcnt (Ring-0 hybrid or LC_HVDBT_NO_HW_POPCNT=1).
         // Preserves S1 for the ZF check below.
         lsr_imm(1, S2, S1, 1);
         and_imm_x(S2, S2, 0x5555555555555555ULL);
@@ -1860,13 +1871,6 @@ static void emit_bitscan(const Insn *in, int live) {
         add_reg_sh(1, 0, 0, S2, S2, S2, 1, 16);
         add_reg_sh(1, 0, 0, S2, S2, S2, 1, 32);
         and_imm_x(S2, S2, 0x7fULL);
-    } else {
-        // popcnt: ZF for a zero source, every other arithmetic flag clear.
-        // fmov d24, x17; cnt v24.8b, v24.8b; addv b24, v24.8b; fmov w22, s24
-        E(0x9E670000u | S1 << 5 | V_S0);
-        E(0x0E205800u | V_S0 << 5 | V_S0);
-        E(0x0E31B800u | V_S0 << 5 | V_S0);
-        E(0x1E260000u | V_S0 << 5 | S2);
     }
     gpr_write(in->reg, sz, false, S2);
     if (live) {

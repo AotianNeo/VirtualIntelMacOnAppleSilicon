@@ -1960,3 +1960,72 @@ void emit_sse(const Insn *in, int live) {
         }
     }
 }
+
+// Conservative straight-line deadness check for 128-bit SSE PMADDUBSW+PMADDWD+PADDD 3-insn fusion.
+static bool sse_xmm_dead_after(const Insn *list, int after_idx, int count, const bool *is_target, int r) {
+    for (int k = after_idx + 1; k < count; k++) {
+        if (is_target && is_target[k])
+            return false;
+        const Insn *nk = &list[k];
+        if (nk->op != OP_SSE) {
+            if (nk->op == OP_EXT || nk->op == OP_X87 || nk->op == OP_JCC || nk->op == OP_JRCXZ ||
+                nk->op == OP_JMP || nk->op == OP_JMPI || nk->op == OP_CALL || nk->op == OP_CALLI ||
+                nk->op == OP_RET || insn_is_terminator(nk) || nk->op >= OP_SYSCALL)
+                return false;
+            continue;
+        }
+        // Only recognize clean full-128b overwrites (movdqu/movdqa/movups/movaps load, pxor r,r) that do not read r.
+        if (nk->sub == 0 && !nk->rm_reg && nk->reg == (u8)r &&
+            (nk->opc == 0x6F || nk->opc == 0x28 || nk->opc == 0x10))
+            return true;
+        if (nk->sub == 0 && nk->rm_reg && nk->reg == (u8)r && nk->rm == (u8)r &&
+            (nk->opc == 0xEF || nk->opc == 0x57)) // pxor/xorps r, r
+            return true;
+        return false;
+    }
+    return false;
+}
+
+bool sse_try_emit_madd_dot(const Insn *list, int idx, int count, const bool *is_target, int *out_consumed) {
+    if (!tr_has_isa_i8mm && !tr_has_isa_dp)
+        return false;
+    if (idx + 1 >= count || (is_target && is_target[idx + 1]))
+        return false;
+    const Insn *in0 = &list[idx];
+    const Insn *in1 = &list[idx + 1];
+    if (in0->next != in1->rip)
+        return false;
+    // in0: SSSE3 PMADDUBSW (66 0F 38 04 -> op=OP_SSE, sub=1, pfx=0x66, opc=0x04)
+    if (in0->op != OP_SSE || in0->sub != 1 || in0->pfx != 0x66 || in0->opc != 0x04)
+        return false;
+    // in1: SSE2 PMADDWD (66 0F F5 -> op=OP_SSE, sub=0, pfx=0x66, opc=0xF5), reg-reg only for exact #PF semantics
+    if (in1->op != OP_SSE || in1->sub != 0 || in1->pfx != 0x66 || in1->opc != 0xF5 || !in1->rm_reg)
+        return false;
+    int tmp = in0->reg;
+    if (in1->reg != (u8)tmp || in1->rm == (u8)tmp)
+        return false;
+    int ones_reg = in1->rm;
+
+    bool accum = false;
+    int dst_reg = tmp;
+    int consumed = 2;
+    if (!tr_precise_flags && idx + 2 < count && !(is_target && is_target[idx + 2]) &&
+        in1->next == list[idx + 2].rip) {
+        const Insn *in2 = &list[idx + 2];
+        // in2: SSE2 PADDD acc, tmp (66 0F FE -> sub=0, pfx=0x66, opc=0xFE, rm_reg, rm==tmp, reg!=tmp)
+        if (in2->op == OP_SSE && in2->sub == 0 && in2->pfx == 0x66 && in2->opc == 0xFE &&
+            in2->rm_reg && in2->rm == (u8)tmp && in2->reg != (u8)tmp &&
+            sse_xmm_dead_after(list, idx + 2, count, is_target, tmp)) {
+            accum = true;
+            dst_reg = in2->reg;
+            consumed = 3;
+        }
+    }
+
+    if (tr_aes_mask)
+        sse_aes_flush_all();
+    int s = src_op(in0, 4, true); // loads mem into V_MEM first (exact #PF at in0->rip)
+    ext_emit_madd_dot_lane128(dst_reg, tmp, s, ones_reg, accum, false);
+    *out_consumed = consumed;
+    return true;
+}

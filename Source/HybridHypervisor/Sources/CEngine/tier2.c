@@ -787,7 +787,7 @@ static bool t2_compile_and_publish(const T2LoopDesc *d) {
         const Insn *in = &body[i];
         if (in->memop || in->op == OP_PUSH || in->op == OP_POP)
             has_memop = true;
-        if (in->op == OP_SSE || in->op == OP_LDMXCSR || in->op == OP_STMXCSR || in->op == OP_POPCNT) {
+        if (in->op == OP_SSE || in->op == OP_LDMXCSR || in->op == OP_STMXCSR) {
             all_ymm_safe = false;
         } else if (in->op == OP_EXT) {
             if (!ext_insn_keeps_ymm_cache(in))
@@ -1438,13 +1438,12 @@ static bool t2_compile_and_publish(const T2LoopDesc *d) {
         // resident slots (ymm_t2_resident_mask) are skipped by ext_ymm_cache_has_dirty() and stay live!
         bool op_needs_flush = dirty_ymm_boost
                                   ? (in->memop || u_is_target[i] || ext_ymm_cache_dirty_run() >= dirty_limit ||
-                                     in->op == OP_SSE || in->op == OP_LDMXCSR || in->op == OP_STMXCSR ||
-                                     in->op == OP_POPCNT)
+                                     in->op == OP_SSE || in->op == OP_LDMXCSR || in->op == OP_STMXCSR)
                                   : (in->op != OP_EXT || in->memop || u_is_target[i] || ext_ymm_cache_dirty_run() >= dirty_limit);
         if (ext_ymm_cache_has_dirty() && op_needs_flush) {
             ext_ymm_cache_flush_dirty();
         }
-        if (in->op == OP_SSE || in->op == OP_LDMXCSR || in->op == OP_STMXCSR || in->op == OP_POPCNT) {
+        if (in->op == OP_SSE || in->op == OP_LDMXCSR || in->op == OP_STMXCSR) {
             ext_ymm_cache_flush_and_drop();
         }
         if (licm_ad_page == ~0ULL && !tr_ad_page_safe_op(in->op))
@@ -1470,8 +1469,22 @@ static bool t2_compile_and_publish(const T2LoopDesc *d) {
                              (u_fall[i] == i + 1) && (in->next == ulist[i + 1].rip);
         if (tr_opt_peep && next_same_seq) {
             const Insn *nx = &ulist[i + 1];
-            // 1) TEST r,r / CMP r,0 + JZ/JNZ -> CBZ/CBNZ
-            if (in->op == OP_ALU && nx->op == OP_JCC && (nx->cc == 4 || nx->cc == 5) && live_after[i + 1] == 0) {
+            int madd_consumed = 0;
+            if (in->op == OP_EXT && nx->op == OP_EXT &&
+                ext_try_emit_madd_dot(ulist, i, ucnt, u_is_target, &madd_consumed)) {
+                for (int k = 1; k < madd_consumed; k++)
+                    insn_arm[i + k] = insn_arm[i];
+                tr_zext8 = tr_zext16 = 0;
+                i += madd_consumed - 1;
+                fused = true;
+            } else if (in->op == OP_SSE && nx->op == OP_SSE &&
+                       sse_try_emit_madd_dot(ulist, i, ucnt, u_is_target, &madd_consumed)) {
+                for (int k = 1; k < madd_consumed; k++)
+                    insn_arm[i + k] = insn_arm[i];
+                tr_zext8 = tr_zext16 = 0;
+                i += madd_consumed - 1;
+                fused = true;
+            } else if (in->op == OP_ALU && nx->op == OP_JCC && (nx->cc == 4 || nx->cc == 5) && live_after[i + 1] == 0) {
                 int cbz_reg = -1, cbz_sf = 0;
                 if (in->sub == ALU_TEST && !in->has_imm && in->rm_reg && !in->high_reg && !in->high_rm && in->reg == in->rm) {
                     if (in->sz == 4 || in->sz == 8) { cbz_reg = in->rm; cbz_sf = in->sz == 8; }

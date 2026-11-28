@@ -95,6 +95,8 @@ typedef struct {
 static _Thread_local YmmCacheSlot ymm_cache[YMM_CACHE_SLOTS];
 static _Thread_local u32 ymm_cache_clk;
 static _Thread_local u16 ymm_zero_mask; // bit r (0..15): architectural ymm_hi[r] is known all-zero
+static _Thread_local u16 ymm_allones128_mask, ymm_allones256_mask; // bit r: reg known all-0xFFFF (from vpcmpeqw r,x,x)
+static _Thread_local u16 ymm_ones16_128_mask, ymm_ones16_256_mask; // bit r: reg known all-0x0001 i16 lanes
 static _Thread_local int ymm_dirty_run_cnt;
 static _Thread_local u8 ymm_pinned_mask; // bit s (0..3): Preheader-pinned slot (never evicted/dropped inside loop)
 static _Thread_local u8 ymm_t2_resident_mask; // bit s (0..3): Tier-2 full RW resident slot (trap-synced via T2TrapMeta)
@@ -107,6 +109,8 @@ void ext_ymm_cache_reset(void) {
         ymm_cache[s].age = 0;
     }
     ymm_zero_mask = 0;
+    ymm_allones128_mask = ymm_allones256_mask = 0;
+    ymm_ones16_128_mask = ymm_ones16_256_mask = 0;
     ymm_dirty_run_cnt = 0;
     ymm_pinned_mask = 0;
     ymm_t2_resident_mask = 0;
@@ -122,6 +126,8 @@ void ext_ymm_cache_reset_unpinned(void) {
         ymm_cache[s].age = 0;
     }
     ymm_zero_mask = 0;
+    ymm_allones128_mask = ymm_allones256_mask = 0;
+    ymm_ones16_128_mask = ymm_ones16_256_mask = 0;
     ymm_dirty_run_cnt = 0;
 }
 
@@ -255,6 +261,8 @@ void ext_ymm_cache_flush_and_drop(void) {
         ymm_cache[s].xreg = -1;
         ymm_cache[s].dirty = false;
     }
+    ymm_allones128_mask = ymm_allones256_mask = 0;
+    ymm_ones16_128_mask = ymm_ones16_256_mask = 0;
     ymm_dirty_run_cnt = 0;
     ymm_pinned_mask = 0;
     ymm_t2_resident_mask = 0;
@@ -2257,15 +2265,34 @@ static void emit_lane128_op(ZydisMnemonic m, int d, int n, int s, int c, int imm
             RRR(0x4EA0BC00u, d, T0, T1);
             return;
         case ZYDIS_MNEMONIC_VPMADDUBSW:
-            RR(0x2F08A400u, T0, n);
-            RR(0x6F08A400u, T1, n);
-            RR(0x0F08A400u, T2, s);
-            RRR(0x4E609C00u, T0, T0, T2);
-            RR(0x4F08A400u, T2, s);
-            RRR(0x4E609C00u, T1, T1, T2);
-            RRR(0x4E401800u, T2, T0, T1);
-            RRR(0x4E405800u, T0, T0, T1);
-            RRR(0x4E600C00u, d, T2, T0);
+            if (d != n && d != s) {
+                // 9 insns, uses only T0(v27), T1(v28), d — NEVER clobbers T2(v29), preserving YMM8..15 cache!
+                RR(0x2F08A400u, T0, n);       // ushll  T0.8h, n.8b, #0
+                RR(0x0F08A400u, T1, s);       // sshll  T1.8h, s.8b, #0
+                RRR(0x4E609C00u, d, T0, T1);  // mul    d.8h, T0.8h, T1.8h
+                RR(0x6F08A400u, T0, n);       // ushll2 T0.8h, n.16b, #0
+                RR(0x4F08A400u, T1, s);       // sshll2 T1.8h, s.16b, #0
+                RRR(0x4E609C00u, T0, T0, T1); // mul    T0.8h, T0.8h, T1.8h
+                RRR(0x4E401800u, T1, d, T0);  // uzp1   T1.8h, d.8h, T0.8h
+                RRR(0x4E405800u, T0, d, T0);  // uzp2   T0.8h, d.8h, T0.8h
+                RRR(0x4E600C00u, d, T1, T0);  // sqadd  d.8h, T1.8h, T0.8h
+            } else {
+                // Aliasing (d == n || d == s): avoids T2(v29) by parking low 4x i16 in GPR S0.
+                RR(0x2F08A400u, T0, n);       // ushll  T0.8h, n.8b, #0
+                RR(0x0F08A400u, T1, s);       // sshll  T1.8h, s.8b, #0
+                RRR(0x4E609C00u, T0, T0, T1); // mul    T0.8h, T0.8h, T1.8h
+                RRR(0x4E401800u, T1, T0, T0); // uzp1   T1.8h, T0.8h, T0.8h
+                RRR(0x4E405800u, T0, T0, T0); // uzp2   T0.8h, T0.8h, T0.8h
+                RRR(0x0E600C00u, T0, T1, T0); // sqadd  T0.4h, T1.4h, T0.4h
+                RR(0x9E660000u, S0, T0);      // fmov   x16, d27
+                RR(0x6F08A400u, T0, n);       // ushll2 T0.8h, n.16b, #0
+                RR(0x4F08A400u, T1, s);       // sshll2 T1.8h, s.16b, #0
+                RRR(0x4E609C00u, T0, T0, T1); // mul    T0.8h, T0.8h, T1.8h
+                RRR(0x4E401800u, T1, T0, T0); // uzp1   T1.8h, T0.8h, T0.8h
+                RRR(0x4E405800u, T0, T0, T0); // uzp2   T0.8h, T0.8h, T0.8h
+                RRR(0x4E600C00u, d, T1, T0);  // sqadd  d.8h, T1.8h, T0.8h (lanes 4..7 in both halves)
+                ins_x(d, 0, S0);              // mov    d.d[0], x16
+            }
             return;
 
         // Shuffles / unpacks / packs / alignr
@@ -2819,7 +2846,7 @@ bool ext_insn_keeps_ymm_cache(const Insn *in) {
             if (ex->op_type[i] == EXT_OP_IMM)
                 has_imm = true;
         bool uses_t2 = mnem == ZYDIS_MNEMONIC_VPSIGNB || mnem == ZYDIS_MNEMONIC_VPSIGNW ||
-                       mnem == ZYDIS_MNEMONIC_VPSIGND || mnem == ZYDIS_MNEMONIC_VPMADDUBSW ||
+                       mnem == ZYDIS_MNEMONIC_VPSIGND ||
                        (tr_precise_flags && (mnem == ZYDIS_MNEMONIC_VADDSUBPS || mnem == ZYDIS_MNEMONIC_VADDSUBPD)) ||
                        (mnem == ZYDIS_MNEMONIC_VPERMILPS && !has_imm) ||
                        mnem == ZYDIS_MNEMONIC_VAESKEYGENASSIST;
@@ -2997,6 +3024,38 @@ u16 ext_insn_written_gprs(const Insn *in) {
     return 0;
 }
 
+static void ext_track_ones_mask(const Insn *in) {
+    u16 rd256 = 0, wr_any = 0;
+    ext_insn_ymm_rw(in, &rd256, &wr_any);
+    u16 prev_all128 = ymm_allones128_mask;
+    u16 prev_all256 = ymm_allones256_mask;
+    ymm_allones128_mask &= (u16)~wr_any;
+    ymm_allones256_mask &= (u16)~wr_any;
+    ymm_ones16_128_mask &= (u16)~wr_any;
+    ymm_ones16_256_mask &= (u16)~wr_any;
+    const ExtDecoded *ex = &in->ext;
+    ZydisMnemonic mnem = (ZydisMnemonic)ex->mnem;
+    if (mnem == ZYDIS_MNEMONIC_VPCMPEQW && ex->op_cnt == 3 &&
+        ex->op_type[0] == EXT_OP_VEC && ex->op_type[1] == EXT_OP_VEC &&
+        ex->op_type[2] == EXT_OP_VEC && ex->op_reg[1] == ex->op_reg[2]) {
+        u16 bit = (u16)(1u << ex->op_reg[0]);
+        ymm_allones128_mask |= bit;
+        if (ex->op_bytes[0] == 32)
+            ymm_allones256_mask |= bit;
+    } else if (mnem == ZYDIS_MNEMONIC_VPSRLW && ex->op_cnt == 3 &&
+               ex->op_type[0] == EXT_OP_VEC && ex->op_type[1] == EXT_OP_VEC &&
+               ex->op_type[2] == EXT_OP_IMM && ((u8)in->imm == 15)) {
+        u16 nbit = (u16)(1u << ex->op_reg[1]);
+        u16 dbit = (u16)(1u << ex->op_reg[0]);
+        if (ex->op_bytes[0] == 32 && (prev_all256 & nbit)) {
+            ymm_ones16_128_mask |= dbit;
+            ymm_ones16_256_mask |= dbit;
+        } else if (ex->op_bytes[0] == 16 && (prev_all128 & nbit)) {
+            ymm_ones16_128_mask |= dbit;
+        }
+    }
+}
+
 void emit_ext(const Insn *in, int live) {
     const ExtDecoded *ex = &in->ext;
     ZydisMnemonic mnem = (ZydisMnemonic)ex->mnem;
@@ -3005,6 +3064,7 @@ void emit_ext(const Insn *in, int live) {
         emit_stop(in->rip, "ext: invalid cached opcode");
         return;
     }
+    ext_track_ones_mask(in);
 
     int fma_ord = 0, fma_kind = 0;
     bool fma_sc = false, fma_dbl = false;
@@ -3103,7 +3163,7 @@ void emit_ext(const Insn *in, int live) {
                            mnem == ZYDIS_MNEMONIC_VPSRLD || mnem == ZYDIS_MNEMONIC_VPSRLQ ||
                            mnem == ZYDIS_MNEMONIC_VPSRAW || mnem == ZYDIS_MNEMONIC_VPSRAD) && !has_imm;
         bool uses_t2 = mnem == ZYDIS_MNEMONIC_VPSIGNB || mnem == ZYDIS_MNEMONIC_VPSIGNW ||
-                       mnem == ZYDIS_MNEMONIC_VPSIGND || mnem == ZYDIS_MNEMONIC_VPMADDUBSW ||
+                       mnem == ZYDIS_MNEMONIC_VPSIGND ||
                        (tr_precise_flags && (mnem == ZYDIS_MNEMONIC_VADDSUBPS || mnem == ZYDIS_MNEMONIC_VADDSUBPD)) ||
                        (mnem == ZYDIS_MNEMONIC_VPERMILPS && !has_imm) ||
                        mnem == ZYDIS_MNEMONIC_VAESKEYGENASSIST;
@@ -5182,4 +5242,376 @@ void emit_ext(const Insn *in, int live) {
     }
 
     emit_stop(in->rip, "ext: unimplemented opcode");
+}
+
+// ---- Fused VPMADDUBSW + VPMADDWD (+ optional VPADDD) -> Hardware USDOT (M4/M5) / SDOT (M1-M3) ----
+// Mathematically 100% bit-exact: guards `ones == all-1s` and `max(|s[2k]| + |s[2k+1]|) <= 128`
+// (guaranteeing |u8*s8 + u8*s8| <= 255*128 = 32640 <= 32767, so VPMADDUBSW never saturates i16).
+// Preserves NZCV (uses `add #127; lsr #8; cbnz`) and uses ONLY T0(v27), T1(v28), S0(x16) (never T2/v29).
+
+static void ext_emit_madd_dot_fast_lane(int d, int u, int s, bool accum) {
+    enum { T0 = 27, T1 = 28 };
+    if (tr_has_isa_i8mm) {
+        if (accum) {
+            RRR(0x4E809C00u, d, u, s); // usdot d.4s, u.16b, s.16b (1 insn!)
+        } else if (d != u && d != s) {
+            VEORQ(d, d, d);
+            RRR(0x4E809C00u, d, u, s); // 2 insns!
+        } else {
+            VEORQ(T0, T0, T0);
+            RRR(0x4E809C00u, T0, u, s);
+            vmov128(d, T0);            // 3 insns, alias-safe
+        }
+    } else {
+        // FEAT_DotProd (M1-M3 fallback): u8*s8 = (u^0x80)*s8 + 128*s8 (exact in i32).
+        if (accum) {
+            RR(0x4E202800u, T1, s);              // saddlp T1.8h, s.16b
+            RR(0x4E602800u, T1, T1);             // saddlp T1.4s, T1.8h
+            E(0x4F275400u | (u32)T1 << 5 | T1);  // shl    T1.4s, T1.4s, #7
+            E(0x4F04E400u | T0);                 // movi   T0.16b, #0x80
+            VEORQ(T0, u, T0);                    // eor    T0.16b, u.16b, T0.16b
+            RRR(0x4E809400u, d, T0, s);          // sdot   d.4s, T0.16b, s.16b
+            VADDQ_32(d, d, T1);                  // add    d.4s, d.4s, T1.4s
+        } else {
+            int out = (d != u && d != s) ? d : T1;
+            RR(0x4E202800u, out, s);             // saddlp out.8h, s.16b
+            RR(0x4E602800u, out, out);           // saddlp out.4s, out.8h
+            E(0x4F275400u | (u32)out << 5 | out);// shl    out.4s, out.4s, #7
+            E(0x4F04E400u | T0);                 // movi   T0.16b, #0x80
+            VEORQ(T0, u, T0);                    // eor    T0.16b, u.16b, T0.16b
+            RRR(0x4E809400u, out, T0, s);        // sdot   out.4s, T0.16b, s.16b
+            if (out != d)
+                vmov128(d, out);
+        }
+    }
+}
+
+static void ext_emit_madd_dot_slow_lane(int d, int u, int s, int ones, bool accum) {
+    enum { T0 = 27, T1 = 28 };
+    // Exact saturating VPMADDUBSW(u, s) -> T0, using only T0(v27), T1(v28), S0(x16).
+    RR(0x2F08A400u, T0, u);
+    RR(0x0F08A400u, T1, s);
+    RRR(0x4E609C00u, T0, T0, T1);
+    RRR(0x4E401800u, T1, T0, T0);
+    RRR(0x4E405800u, T0, T0, T0);
+    RRR(0x0E600C00u, T0, T1, T0); // sqadd T0.4h
+    RR(0x9E660000u, S0, T0);      // fmov x16, d27
+    RR(0x6F08A400u, T0, u);
+    RR(0x4F08A400u, T1, s);
+    RRR(0x4E609C00u, T0, T0, T1);
+    RRR(0x4E401800u, T1, T0, T0);
+    RRR(0x4E405800u, T0, T0, T0);
+    RRR(0x4E600C00u, T0, T1, T0); // sqadd T0.8h ([s4..s7, s4..s7])
+    ins_x(T0, 0, S0);             // T0.8h = [s0..s7]
+    // Exact VPMADDWD(T0, ones) -> T0
+    RRR(0x0E60C000u, T1, T0, ones); // smull  T1.4s, T0.4h, ones.4h
+    RRR(0x4E60C000u, T0, T0, ones); // smull2 T0.4s, T0.8h, ones.8h
+    RRR(0x4EA0BC00u, T0, T1, T0);   // addp   T0.4s, T1.4s, T0.4s
+    if (accum)
+        VADDQ_32(d, d, T0);
+    else
+        vmov128(d, T0);
+}
+
+void ext_emit_madd_dot_lane128(int dst, int u, int s, int ones, bool accum, bool ones_known) {
+    enum { T0 = 27, T1 = 28 };
+    RR(0x4E20B800u, T0, s);             // abs    T0.16b, s.16b (u8 range 0..128)
+    RR(0x6E202800u, T0, T0);            // uaddlp T0.8h, T0.16b (u16 range 0..256)
+    if (!ones_known) {
+        E(0x4F008420u | T1);            // movi   T1.8h, #1
+        VEORQ(T1, ones, T1);            // eor    T1.16b, ones.16b, T1.16b
+        RRR(0x4E608C00u, T1, T1, T1);   // cmtst  T1.8h, T1.8h, T1.8h (0xFFFF if any lane != 1)
+        VORRQ(T0, T0, T1);              // orr    T0.16b, T0.16b, T1.16b
+    }
+    RR(0x6E70A800u, T0, T0);            // umaxv  h27, T0.8h
+    E(0x1E260000u | (u32)T0 << 5 | S0); // fmov   w16, s27
+    add_imm(0, 0, 0, S0, S0, 127);      // add    w16, w16, #127 (NZCV-preserving!)
+    u32 *br_slow;
+    if (ones_known) {
+        // w16 in [127..383]: bit 8 is 1 iff original max in [129..256] (saves lsr #8!).
+        br_slow = tr_cc;
+        tbz(1, S0, 8, 0);               // tbnz   w16, #8, Lslow
+    } else {
+        lsr_imm(0, S0, S0, 8);          // lsr    w16, w16, #8 (0 iff max <= 128 && ones == 1)
+        br_slow = tr_cc;
+        cbz(1, 0, S0, 0);               // cbnz   w16, Lslow
+    }
+    ext_emit_madd_dot_fast_lane(dst, u, s, accum);
+    u32 *br_done = tr_cc;
+    b_rel(0);
+    u32 *slow = tr_cc;
+    if (ones_known)
+        *br_slow |= ((u32)(slow - br_slow) & 0x3fffu) << 5;
+    else
+        *br_slow |= ((u32)(slow - br_slow) & 0x7ffffu) << 5;
+    ext_emit_madd_dot_slow_lane(dst, u, s, ones, accum);
+    *br_done |= (u32)(tr_cc - br_done) & 0x3ffffffu;
+}
+
+static void ext_emit_madd_dot_pair256(int dst_lo, int dst_hi, int u_lo, int u_hi,
+                                      int s_lo, int s_hi, int ones_lo, int ones_hi,
+                                      bool accum, bool ones_known) {
+    enum { T0 = 27, T1 = 28 };
+    if (!ones_known) {
+        E(0x4F008420u | T1);            // movi   T1.8h, #1
+        VEORQ(T0, ones_lo, T1);         // T0 = ones_lo ^ 1
+        VEORQ(T1, ones_hi, T1);         // T1 = ones_hi ^ 1
+        VORRQ(T1, T0, T1);              // T1 = (ones_lo ^ 1) | (ones_hi ^ 1)
+        RRR(0x4E608C00u, T1, T1, T1);   // cmtst  T1.8h (0xFFFF if any lane != 1)
+        RR(0x4E20B800u, T0, s_lo);      // abs    T0.16b, s_lo.16b
+        RR(0x6E202800u, T0, T0);        // uaddlp T0.8h, T0.16b
+        VORRQ(T1, T1, T0);              // merge s_lo pair sums with ones error mask
+        RR(0x4E20B800u, T0, s_hi);      // abs    T0.16b, s_hi.16b
+        RR(0x6E202800u, T0, T0);        // uaddlp T0.8h, T0.16b
+        RRR(0x6E606400u, T0, T0, T1);   // umax   T0.8h, T0.8h, T1.8h
+    } else {
+        // Combine |s_lo| and |s_hi| with umax.16b BEFORE uaddlp.8h: ONLY 4 NEON ops!
+        // Soundness: max(|a0|,|b0|) + max(|a1|,|b1|) <= 128 => BOTH |a0|+|a1| <= 128 AND |b0|+|b1| <= 128.
+        RR(0x4E20B800u, T0, s_lo);      // abs    T0.16b, s_lo.16b
+        RR(0x4E20B800u, T1, s_hi);      // abs    T1.16b, s_hi.16b
+        RRR(0x6E206400u, T0, T0, T1);   // umax   T0.16b, T0.16b, T1.16b
+        RR(0x6E202800u, T0, T0);        // uaddlp T0.8h, T0.16b
+    }
+    RR(0x6E70A800u, T0, T0);            // umaxv  h27, T0.8h
+    E(0x1E260000u | (u32)T0 << 5 | S0); // fmov   w16, s27
+    add_imm(0, 0, 0, S0, S0, 127);      // add    w16, w16, #127 (NZCV-preserving!)
+    u32 *br_slow;
+    if (ones_known) {
+        br_slow = tr_cc;
+        tbz(1, S0, 8, 0);               // tbnz   w16, #8, Lslow
+    } else {
+        lsr_imm(0, S0, S0, 8);          // lsr    w16, w16, #8
+        br_slow = tr_cc;
+        cbz(1, 0, S0, 0);               // cbnz   w16, Lslow
+    }
+    ext_emit_madd_dot_fast_lane(dst_hi, u_hi, s_hi, accum);
+    ext_emit_madd_dot_fast_lane(dst_lo, u_lo, s_lo, accum);
+    u32 *br_done = tr_cc;
+    b_rel(0);
+    u32 *slow = tr_cc;
+    if (ones_known)
+        *br_slow |= ((u32)(slow - br_slow) & 0x3fffu) << 5;
+    else
+        *br_slow |= ((u32)(slow - br_slow) & 0x7ffffu) << 5;
+    ext_emit_madd_dot_slow_lane(dst_hi, u_hi, s_hi, ones_hi, accum);
+    ext_emit_madd_dot_slow_lane(dst_lo, u_lo, s_lo, ones_lo, accum);
+    *br_done |= (u32)(tr_cc - br_done) & 0x3ffffffu;
+}
+
+// Conservative straight-line deadness proof: returns true iff VEC reg `r` is unconditionally
+// fully overwritten (all 256 bits via VEX write) by a subsequent OP_EXT insn before any read or branch.
+static bool ext_vec_dead_after(const Insn *list, int after_idx, int count, const bool *is_target, int r) {
+    u16 bit = (u16)(1u << r);
+    for (int k = after_idx + 1; k < count; k++) {
+        if (is_target && is_target[k])
+            return false;
+        const Insn *nk = &list[k];
+        if (nk->op != OP_EXT) {
+            if (nk->op == OP_SSE || nk->op == OP_X87 || nk->op == OP_JCC || nk->op == OP_JRCXZ ||
+                nk->op == OP_JMP || nk->op == OP_JMPI || nk->op == OP_CALL || nk->op == OP_CALLI ||
+                nk->op == OP_RET || insn_is_terminator(nk) || nk->op >= OP_SYSCALL)
+                return false;
+            continue;
+        }
+        const ExtDecoded *ex = &nk->ext;
+        ZydisMnemonic m = (ZydisMnemonic)ex->mnem;
+        if (nk->vsib)
+            return false;
+        // Check if any source operand reads `r`.
+        int fma_o = 0, fma_k = 0;
+        bool fma_s = false, fma_d = false;
+        bool op0_reads = is_fma_mnemonic(m, &fma_o, &fma_k, &fma_s, &fma_d) ||
+                         m == ZYDIS_MNEMONIC_VPTEST || m == ZYDIS_MNEMONIC_VTESTPS ||
+                         m == ZYDIS_MNEMONIC_VTESTPD || m == ZYDIS_MNEMONIC_VUCOMISS ||
+                         m == ZYDIS_MNEMONIC_VUCOMISD || m == ZYDIS_MNEMONIC_VCOMISS ||
+                         m == ZYDIS_MNEMONIC_VCOMISD || m == ZYDIS_MNEMONIC_VPCMPISTRI;
+        for (u8 j = 0; j < ex->op_cnt; j++) {
+            if (ex->op_type[j] != EXT_OP_VEC)
+                continue;
+            if ((j > 0 || op0_reads) && ex->op_reg[j] == (u8)r)
+                return false;
+        }
+        if (m == ZYDIS_MNEMONIC_VZEROALL)
+            return true;
+        // Full 256-bit VEX overwrite (any VEX write to XMM or YMM overwrites/zeroes full YMM).
+        if (!op0_reads && ex->op_cnt >= 2 && ex->op_type[0] == EXT_OP_VEC && ex->op_reg[0] == (u8)r &&
+            (is_lanewise_vex(m) ||
+             m == ZYDIS_MNEMONIC_VMOVDQU || m == ZYDIS_MNEMONIC_VMOVDQA ||
+             m == ZYDIS_MNEMONIC_VMOVUPS || m == ZYDIS_MNEMONIC_VMOVAPS ||
+             m == ZYDIS_MNEMONIC_VMOVUPD || m == ZYDIS_MNEMONIC_VMOVAPD ||
+             m == ZYDIS_MNEMONIC_VLDDQU || m == ZYDIS_MNEMONIC_VPBROADCASTB ||
+             m == ZYDIS_MNEMONIC_VPBROADCASTW || m == ZYDIS_MNEMONIC_VPBROADCASTD ||
+             m == ZYDIS_MNEMONIC_VPBROADCASTQ || m == ZYDIS_MNEMONIC_VBROADCASTSS ||
+             m == ZYDIS_MNEMONIC_VBROADCASTSD || m == ZYDIS_MNEMONIC_VBROADCASTI128 ||
+             m == ZYDIS_MNEMONIC_VBROADCASTF128)) {
+            (void)bit;
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool ymm_cache_can_hold_regs(u16 hi_mask) {
+    u8 pinned_other = 0;
+    u16 already_pinned = 0;
+    for (int s = 0; s < YMM_CACHE_SLOTS; s++) {
+        if (ymm_pinned_mask & (1u << s)) {
+            if (ymm_cache[s].xreg >= 8 && (hi_mask & (1u << ymm_cache[s].xreg)))
+                already_pinned |= (u16)(1u << ymm_cache[s].xreg);
+            else
+                pinned_other++;
+        }
+    }
+    int need = __builtin_popcount((unsigned)(hi_mask & ~already_pinned));
+    return need <= (YMM_CACHE_SLOTS - (int)pinned_other);
+}
+
+static bool ymm_reg_is_pinned(int xreg) {
+    if (xreg < 8)
+        return false;
+    for (int s = 0; s < YMM_CACHE_SLOTS; s++)
+        if ((ymm_pinned_mask & (1u << s)) && ymm_cache[s].xreg == (int8_t)xreg)
+            return true;
+    return false;
+}
+
+bool ext_try_emit_madd_dot(const Insn *list, int idx, int count, const bool *is_target, int *out_consumed) {
+    if (!tr_has_isa_i8mm && !tr_has_isa_dp)
+        return false;
+    if (idx + 1 >= count)
+        return false;
+    if (is_target && is_target[idx + 1])
+        return false;
+    const Insn *in0 = &list[idx];
+    const Insn *in1 = &list[idx + 1];
+    if (in0->next != in1->rip)
+        return false;
+    if (in0->op != OP_EXT || in1->op != OP_EXT)
+        return false;
+    const ExtDecoded *e0 = &in0->ext;
+    const ExtDecoded *e1 = &in1->ext;
+    if ((ZydisMnemonic)e0->mnem != ZYDIS_MNEMONIC_VPMADDUBSW ||
+        (ZydisMnemonic)e1->mnem != ZYDIS_MNEMONIC_VPMADDWD)
+        return false;
+    if (e0->op_cnt != 3 || e1->op_cnt != 3 || in1->memop)
+        return false;
+    u8 vbytes = e0->op_bytes[0];
+    if ((vbytes != 16 && vbytes != 32) || e1->op_bytes[0] != vbytes)
+        return false;
+    if (e0->op_type[0] != EXT_OP_VEC || e0->op_type[1] != EXT_OP_VEC ||
+        (e0->op_type[2] != EXT_OP_VEC && e0->op_type[2] != EXT_OP_MEM))
+        return false;
+    if (e1->op_type[0] != EXT_OP_VEC || e1->op_type[1] != EXT_OP_VEC || e1->op_type[2] != EXT_OP_VEC)
+        return false;
+
+    int tmp = e0->op_reg[0];
+    int u_reg = e0->op_reg[1];
+    bool s_is_vec = (e0->op_type[2] == EXT_OP_VEC);
+    int s_reg = s_is_vec ? e0->op_reg[2] : -1;
+
+    // Require VPMADDWD overwrites tmp (d1 == tmp) and multiplies tmp by distinct `ones` reg.
+    if (e1->op_reg[0] != (u8)tmp)
+        return false;
+    int ones_reg = -1;
+    if (e1->op_reg[1] == (u8)tmp && e1->op_reg[2] != (u8)tmp)
+        ones_reg = e1->op_reg[2];
+    else if (e1->op_reg[2] == (u8)tmp && e1->op_reg[1] != (u8)tmp)
+        ones_reg = e1->op_reg[1];
+    else
+        return false;
+
+    // Check optional 3rd instruction: VPADDD acc, acc, tmp (with tmp provably dead afterwards).
+    bool accum = false;
+    int dst_reg = tmp;
+    int consumed = 2;
+    if (!tr_precise_flags && idx + 2 < count && !(is_target && is_target[idx + 2]) &&
+        in1->next == list[idx + 2].rip) {
+        const Insn *in2 = &list[idx + 2];
+        const ExtDecoded *e2 = &in2->ext;
+        if (in2->op == OP_EXT && (ZydisMnemonic)e2->mnem == ZYDIS_MNEMONIC_VPADDD &&
+            !in2->memop && e2->op_cnt == 3 && e2->op_bytes[0] == vbytes &&
+            e2->op_type[0] == EXT_OP_VEC && e2->op_type[1] == EXT_OP_VEC && e2->op_type[2] == EXT_OP_VEC) {
+            int acc = -1;
+            if (e2->op_reg[1] == (u8)tmp && e2->op_reg[2] != (u8)tmp && e2->op_reg[0] == e2->op_reg[2])
+                acc = e2->op_reg[2];
+            else if (e2->op_reg[2] == (u8)tmp && e2->op_reg[1] != (u8)tmp && e2->op_reg[0] == e2->op_reg[1])
+                acc = e2->op_reg[1];
+            if (acc >= 0 && !ymm_reg_is_pinned(tmp) &&
+                ext_vec_dead_after(list, idx + 2, count, is_target, tmp)) {
+                accum = true;
+                dst_reg = acc;
+                consumed = 3;
+            }
+        }
+    }
+
+    bool ones_known = (vbytes == 32)
+                          ? ((ymm_ones16_256_mask & (1u << ones_reg)) != 0)
+                          : ((ymm_ones16_128_mask & (1u << ones_reg)) != 0);
+
+    if (vbytes == 16) {
+        int s = s_is_vec ? s_reg : ext_vec_src128(in0, 2, V_MEM);
+        ext_emit_madd_dot_lane128(dst_reg, u_reg, s, ones_reg, accum, ones_known);
+        ymm_zero_hi(dst_reg);
+        u16 clr = (u16)((1u << dst_reg) | (1u << tmp));
+        ymm_allones128_mask &= (u16)~clr;
+        ymm_allones256_mask &= (u16)~clr;
+        ymm_ones16_128_mask &= (u16)~clr;
+        ymm_ones16_256_mask &= (u16)~clr;
+        *out_consumed = consumed;
+        return true;
+    }
+
+    // 256-bit YMM fused path: verify YMM8..15 cache can hold all distinct high operands without evicting pinned slots.
+    u16 hi_need = 0;
+    if (u_reg >= 8) hi_need |= (u16)(1u << u_reg);
+    if (s_is_vec && s_reg >= 8) hi_need |= (u16)(1u << s_reg);
+    if (ones_reg >= 8) hi_need |= (u16)(1u << ones_reg);
+    if (dst_reg >= 8) hi_need |= (u16)(1u << dst_reg);
+    if (tr_opt_ymm_cache && !ymm_cache_can_hold_regs(hi_need))
+        return false;
+
+    // Load memory operand FIRST (before mutating any architectural/cache state) for exact #PF semantics.
+    int s_lo = s_is_vec ? s_reg : V_MEM;
+    int s_hi = V_S2;
+    if (!s_is_vec)
+        ext_load256_pair(in0, V_MEM, V_S2);
+
+    if (tr_opt_ymm_cache) {
+        if (accum && tmp != dst_reg && tmp >= 8)
+            ymm_cache_drop_xreg(tmp);
+        u8 pin = 0;
+        int u_hi = ymm_cache_get(u_reg, true, false, &pin);
+        if (s_is_vec)
+            s_hi = ymm_cache_get(s_reg, true, false, &pin);
+        int ones_hi = ymm_cache_get(ones_reg, true, false, &pin);
+        int dst_hi = ymm_cache_get(dst_reg, accum, true, &pin);
+        ext_emit_madd_dot_pair256(dst_reg, dst_hi, u_reg, u_hi, s_lo, s_hi, ones_reg, ones_hi, accum, ones_known);
+        if (dst_reg >= 8)
+            ymm_dirty_run_cnt++;
+    } else {
+        int u_home = ymm_resident(u_reg);
+        int u_hi = u_home >= 0 ? u_home : (ymm_load_hi(V_S0, u_reg), V_S0);
+        if (s_is_vec) {
+            int s_home = ymm_resident(s_reg);
+            s_hi = s_home >= 0 ? s_home : (ymm_load_hi(V_S1, s_reg), V_S1);
+        }
+        int ones_home = ymm_resident(ones_reg);
+        int ones_hi = ones_home >= 0 ? ones_home : (ymm_load_hi(29, ones_reg), 29);
+        int dst_home = ymm_resident(dst_reg);
+        int dst_hi = dst_home >= 0 ? dst_home : (accum ? (ymm_load_hi(31, dst_reg), 31) : 31);
+        ext_emit_madd_dot_pair256(dst_reg, dst_hi, u_reg, u_hi, s_lo, s_hi, ones_reg, ones_hi, accum, ones_known);
+        if (dst_home < 0)
+            ymm_store_hi(dst_hi, dst_reg);
+        else
+            ymm_zero_mask &= (u16)~(1u << dst_reg);
+    }
+
+    u16 clr = (u16)((1u << dst_reg) | (1u << tmp));
+    ymm_allones128_mask &= (u16)~clr;
+    ymm_allones256_mask &= (u16)~clr;
+    ymm_ones16_128_mask &= (u16)~clr;
+    ymm_ones16_256_mask &= (u16)~clr;
+    *out_consumed = consumed;
+    return true;
 }

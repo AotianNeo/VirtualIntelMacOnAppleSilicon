@@ -98,6 +98,9 @@ bool tr_reload_backend(const char *dylib_path) {
 _Thread_local u32 *tr_cc;
 bool tr_precise_flags, tr_has_tzcnt, tr_hybrid, tr_no_bulk_rep;
 bool tr_fpcr_merges_scalar;
+bool tr_has_isa_dp, tr_has_isa_i8mm;
+bool tr_opt_hw_popcnt = true, tr_opt_inline_pic = true;
+static bool tr_no_isa_dp, tr_no_isa_i8mm;
 bool tr_profile_shift_helpers;
 bool tr_inline_shr8;
 bool tr_page_rep;
@@ -142,6 +145,147 @@ static u64 p0_slot_gen[P0_SLOTS];
 static u64 p0_gen_seq;
 static u32 p0_cur_slot;
 static bool p0_ring_need_evict;
+
+// Monomorphic inline PIC shared cached-RIP table (1 MiB at OFF_PIC_TABLE, EL0/EL1 rw).
+// Slot 0 is permanently reserved as ~0ULL sentinel for graceful fallback if a partition fills.
+static u64 *pic_table;
+static u32 pic_p0_next[P0_SLOTS];
+static u32 pic_linear_next[2];
+
+static inline void tr_refresh_isa_features(void) {
+    u32 feats = __atomic_load_n(&ctx_ptr->isa_features, __ATOMIC_ACQUIRE);
+    __atomic_store_n(&tr_has_isa_dp, !tr_no_isa_dp && ((feats & ISA_FEAT_DP) != 0), __ATOMIC_RELAXED);
+    __atomic_store_n(&tr_has_isa_i8mm, !tr_no_isa_i8mm && ((feats & ISA_FEAT_I8MM) != 0), __ATOMIC_RELAXED);
+}
+
+static void pic_reset_all(void) {
+    if (pic_table)
+        memset(&pic_table[(size_t)PIC_FIRST_SLOT * 2U], 0,
+               (size_t)(PIC_TABLE_ENTRIES - PIC_FIRST_SLOT) * PIC_ENTRY_BYTES);
+    for (u32 s = 0; s < P0_SLOTS; s++)
+        pic_p0_next[s] = s == 0 ? PIC_FIRST_SLOT : s * PIC_P0_SLOTS_PER_RING;
+    pic_linear_next[0] = PIC_FIRST_SLOT;
+    pic_linear_next[1] = PIC_P1_BASE;
+}
+
+static void pic_reset_p0_slot(u32 slot) {
+    if (slot >= P0_SLOTS)
+        return;
+    u32 base = slot == 0 ? PIC_FIRST_SLOT : slot * PIC_P0_SLOTS_PER_RING;
+    u32 end = (slot + 1U) * PIC_P0_SLOTS_PER_RING;
+    if (pic_table)
+        memset(&pic_table[(size_t)base * 2U], 0, (size_t)(end - base) * PIC_ENTRY_BYTES);
+    pic_p0_next[slot] = base;
+}
+
+static void pic_reset_part1(void) {
+    if (pic_table)
+        memset(&pic_table[(size_t)PIC_P1_BASE * 2U], 0, (size_t)(PIC_TABLE_ENTRIES - PIC_P1_BASE) * PIC_ENTRY_BYTES);
+    pic_linear_next[1] = PIC_P1_BASE;
+}
+
+static void pic_init_epochs(void) {
+    if (!ctx_ptr || !cfg.priv || !pic_table)
+        return;
+    memset(pic_table, 0, (size_t)PIC_FIRST_SLOT * PIC_ENTRY_BYTES);
+    PicEpochTable *et = (PicEpochTable *)pic_table;
+    u64 seq = 1ULL;
+    for (u32 v = 0; v < MAX_VIEWS; v++)
+        __atomic_store_n(&et->view_epoch[v], ++seq, __ATOMIC_RELAXED);
+    __atomic_store_n(&et->seq, seq, __ATOMIC_RELEASE);
+    u64 ep0 = et->view_epoch[0];
+    for (u32 vi = 0; vi < MAX_VCPUS; vi++) {
+        EngineCtx *vc_ctx = (EngineCtx *)(cfg.priv + OFF_CTX + (u64)vi * CTX_SLOT);
+        __atomic_store_n(&vc_ctx->pic_epoch, ep0, __ATOMIC_RELEASE);
+    }
+}
+
+static void pic_bump_view_epoch(int view) {
+    if (view < 0 || view >= MAX_VIEWS || !ctx_ptr || !cfg.priv || !pic_table)
+        return;
+    PicEpochTable *et = (PicEpochTable *)pic_table;
+    u64 ep = __atomic_add_fetch(&et->seq, 1ULL, __ATOMIC_SEQ_CST);
+    if (ep < 2ULL)
+        ep = __atomic_add_fetch(&et->seq, 2ULL, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&et->view_epoch[view], ep, __ATOMIC_SEQ_CST);
+    u32 vc = ctx_ptr->vcpu_count ? ctx_ptr->vcpu_count : 1U;
+    if (vc > MAX_VCPUS)
+        vc = MAX_VCPUS;
+    for (u32 vi = 0; vi < vc; vi++) {
+        EngineCtx *vc_ctx = (EngineCtx *)(cfg.priv + OFF_CTX + (u64)vi * CTX_SLOT);
+        if (__atomic_load_n(&vc_ctx->view, __ATOMIC_SEQ_CST) == (u32)view)
+            __atomic_store_n(&vc_ctx->pic_epoch, ep, __ATOMIC_RELEASE);
+    }
+}
+
+static inline bool pic_has_capacity(int part) {
+    if (!pic_table)
+        return false;
+    if (part == 0 && p0_ring_enabled) {
+        u32 s = __atomic_load_n(&p0_cur_slot, __ATOMIC_RELAXED);
+        if (s >= P0_SLOTS)
+            return false;
+        u32 limit = (s + 1U) * PIC_P0_SLOTS_PER_RING;
+        return __atomic_load_n(&pic_p0_next[s], __ATOMIC_RELAXED) + 64U < limit;
+    }
+    if (part == 0)
+        return __atomic_load_n(&pic_linear_next[0], __ATOMIC_RELAXED) + 64U < PIC_P1_BASE;
+    return __atomic_load_n(&pic_linear_next[1], __ATOMIC_RELAXED) + 64U < PIC_TABLE_ENTRIES;
+}
+
+static u32 pic_slot_alloc(int part, u32 alloc_slot) {
+    if (!pic_table)
+        return PIC_SLOT_NONE;
+    if (part == 0 && p0_ring_enabled) {
+        u32 limit = (alloc_slot + 1U) * PIC_P0_SLOTS_PER_RING;
+        u32 cur = __atomic_load_n(&pic_p0_next[alloc_slot], __ATOMIC_RELAXED);
+        if (cur >= limit)
+            return PIC_SLOT_NONE;
+        __atomic_store_n(&pic_p0_next[alloc_slot], cur + 1U, __ATOMIC_RELAXED);
+        return cur;
+    }
+    if (part == 0) {
+        u32 cur = __atomic_load_n(&pic_linear_next[0], __ATOMIC_RELAXED);
+        if (cur >= PIC_P1_BASE)
+            return PIC_SLOT_NONE;
+        __atomic_store_n(&pic_linear_next[0], cur + 1U, __ATOMIC_RELAXED);
+        return cur;
+    }
+    u32 cur = __atomic_load_n(&pic_linear_next[1], __ATOMIC_RELAXED);
+    if (cur >= PIC_TABLE_ENTRIES)
+        return PIC_SLOT_NONE;
+    __atomic_store_n(&pic_linear_next[1], cur + 1U, __ATOMIC_RELAXED);
+    return cur;
+}
+
+static void pic_bind_site(u32 *start, u32 code_words, int part, u32 alloc_slot, u32 add_off, u32 meta_slot_off) {
+    if (add_off + 2U >= code_words || meta_slot_off >= code_words || meta_slot_off < 3U)
+        return;
+    u32 slot = pic_slot_alloc(part, alloc_slot);
+    if (slot == PIC_SLOT_NONE) {
+        // Table partition full: point to permanent {0,0} sentinel at slot 255 (offset 4080 in page 0)
+        // and disable one-time fill trap so site runs pure EL0 lookup forever.
+        start[add_off] = (start[add_off] & ~(0xFFFU << 10)) | (0x100U << 10);
+        start[add_off + 1U] = (start[add_off + 1U] & ~(0xFFFU << 10)) | (510U << 10);
+        start[add_off + 2U] = (start[add_off + 2U] & ~(0xFFFU << 10)) | (511U << 10);
+        u32 init_off = meta_slot_off - 3U;
+        u32 off_gate = start[meta_slot_off - 1U];
+        if (off_gate > 0 && off_gate <= init_off)
+            start[init_off - off_gate] = 0xD503201Fu; // WORD_NOP
+        start[meta_slot_off] = PIC_SLOT_NONE;
+        return;
+    }
+    __atomic_store_n(&pic_table[(size_t)slot * 2U], 0ULL, __ATOMIC_RELAXED);
+    __atomic_store_n(&pic_table[(size_t)slot * 2U + 1U], 0ULL, __ATOMIC_RELEASE);
+    // Each 16-byte PicEntry: 256 entries per 4 KiB page (slot >> 8 in 0..255 -> page_imm 0x100..0x1FF).
+    u32 page_imm = (0x100U + (slot >> 8)) & 0xFFFU;
+    u32 ldr_imm0 = (slot & 255U) * 2U;
+    u32 ldr_imm1 = ldr_imm0 + 1U;
+    start[add_off] = (start[add_off] & ~(0xFFFU << 10)) | (page_imm << 10);
+    start[add_off + 1U] = (start[add_off + 1U] & ~(0xFFFU << 10)) | (ldr_imm0 << 10);
+    start[add_off + 2U] = (start[add_off + 2U] & ~(0xFFFU << 10)) | (ldr_imm1 << 10);
+    start[meta_slot_off] = slot;
+}
 static u64 p0_ring_evictions;
 
 // Tier-2 code cache state (CC_T2 mid-cache islands at +120..+124 MiB of part 0 and part 1).
@@ -822,6 +966,18 @@ typedef struct {
 static _Thread_local L1Miss l1_miss[MAX_L1_MISS];
 static _Thread_local int l1_miss_count;
 
+typedef struct {
+    u32 *add_site;       // add x20, x20, #(0x100+page), lsl #12 (followed by ldr x17, [x20, #off])
+    u32 *cbnz_site;      // cbnz x17, Lpic_miss
+    u32 *br_site;        // Lpic_br: initially b Lpic_lookup; patched ONCE to B/BL cached_arm
+    u32 *landing_pad;    // for OP_CALLI: next x86 instruction address right after Lpic_br
+    u32 *meta_slot_site; // filled when cold stub is emitted (for single-threaded do_translate binding)
+    bool is_call;
+} PicSite;
+#define MAX_PIC_SITES MAX_INSNS
+static _Thread_local PicSite pic_sites[MAX_PIC_SITES];
+static _Thread_local int pic_site_count;
+
 static _Thread_local int cur_key;
 static _Thread_local u64 cur_entry_rip, cur_page;
 static _Thread_local bool cur_single;
@@ -842,9 +998,43 @@ static u32 *try_direct_link_target(int key, u64 entry_rip, u64 page, u64 target,
     return cc_base + hb->entry_word;
 }
 
-static void emit_indirect_tail(void) {
+static void emit_pic_check(bool is_call) {
+    // View-epoch-guarded monomorphic inline PIC for CPL=3 64-bit OP_CALLI and RIP-relative IAT OP_JMPI.
+    // Verifies (target_rip == pic_ent.rip && c->pic_epoch == pic_ent.epoch) while preserving NZCV,
+    // then executes a direct `BL/B cached_arm` (zero lookup stub, zero indirect branch mispredict).
+    tr_ad_page = ~0ULL;
+    if (is_call) {
+        // landing_pad sits at +12 words from adr (adr, stp, and, add, ldr, ldr, ldr, eor, eor, orr, cbnz, b/bl, landing_pad).
+        adr_words(AD, 12);
+        E(0xA9800000u | ((u32)-2 & 0x7f) << 15 | AD << 10 | RS << 5 | S1);
+    }
+    E(0x926CAE54u);                                  // and x20, x18, #0xfffffffffff00000 (PRIV_VA + OFF_CTX)
+    u32 *add_site = tr_cc;
+    add_imm_lsl12(1, 0, 0, AD, AD, 0x100);           // add x20, x20, #(0x100 + page), lsl #12 (bound at commit)
+    E(0xF9400000u | (u32)AD << 5 | (u32)S1);         // ldr x17, [x20, #(idx*16)]     (cached_rip, bound at commit)
+    E(0xF9400000u | (u32)AD << 5 | (u32)S3);         // ldr x23, [x20, #(idx*16 + 8)] (cached_epoch, bound at commit)
+    E(0xF9400000u | ((u32)(offsetof(EngineCtx, pic_epoch) >> 3) << 10) | (u32)CTX << 5 | (u32)AD); // ldr x20, [x18, #pic_epoch]
+    logic_reg(1, 2, 0, S1, S1, S0);                  // eor x17, x17, x16
+    logic_reg(1, 2, 0, S3, S3, AD);                  // eor x23, x23, x20
+    logic_reg(1, 1, 0, S1, S1, S3);                  // orr x17, x17, x23
+    u32 *cbnz_site = tr_cc;
+    cbz(1, 1, S1, 0);                                // cbnz x17, Lpic_miss
+    u32 *br_site = tr_cc;
+    b_rel(0);                                        // Lpic_br: b Lpic_lookup -> patched ONCE to bl/b cached_arm
+    pic_sites[pic_site_count++] = (PicSite){add_site, cbnz_site, br_site, is_call ? tr_cc : NULL, NULL, is_call};
+}
+
+static void emit_indirect_tail(bool monomorphic_hint) {
     // x16 holds the x86 target. Lookup returns the translation in x22, and the branch stays here so that each site has
     // its own predictor entry.
+    // Only use monomorphic inline PIC for RIP-relative IAT/GOT tail-call thunks in CPL=3 64-bit;
+    // register/indexed switch jump tables keep the 9-insn polymorphic inline L1 probe!
+    if (monomorphic_hint && tr_opt_inline_pic && !cur_single &&
+        use_native_l1(tr_cpl, tr_compat) && pic_site_count < MAX_PIC_SITES &&
+        pic_has_capacity(cur_part)) {
+        emit_pic_check(false);
+        return;
+    }
     if (use_native_l1(tr_cpl, tr_compat) && l1_miss_count < MAX_L1_MISS) {
         tr_ad_page = ~0ULL;
         u32 *s1 = tr_cc;
@@ -1066,6 +1256,14 @@ static void emit_control(const Insn *in, int idx, int live_after) {
                 E(0xB8000C00u | ((u32)-4 & 0x1ff) << 12 | 4 << 5 | S1);
             else
                 E(0xF8000C00u | ((u32)-8 & 0x1ff) << 12 | 4 << 5 | S1);
+            // Only emit monomorphic inline PIC for RIP-relative IAT/static-fnptr calls (FF 15 disp32) in CPL=3 64-bit;
+            // polymorphic register/indexed calls (vtable/JS/Python dispatch) stay on compact bl _stub_lookup_l1_fast!
+            if (tr_opt_inline_pic && !cur_single && !in->rm_reg && in->riprel &&
+                use_native_l1(tr_cpl, tr_compat) && pic_site_count < MAX_PIC_SITES &&
+                pic_has_capacity(cur_part)) {
+                emit_pic_check(true);
+                break;
+            }
             if (use_native_l1(tr_cpl, tr_compat)) {
                 tr_ad_page = ~0ULL;
                 adr_words(AD, 4);
@@ -1088,7 +1286,7 @@ static void emit_control(const Insn *in, int idx, int live_after) {
                 mov_reg(1, S0, in->rm);
             else
                 ldst(1, in->sz, S0, addr_prepare(in, in->sz));
-            emit_indirect_tail();
+            emit_indirect_tail(!in->rm_reg && in->riprel);
             break;
         case OP_RET: {
             // shortcut: post-index leaves esp past 4 GB for a stack at the very top of memory. No XNU process has one, as the commpage sits there
@@ -1772,6 +1970,10 @@ static u32 aot_build_mode_bits(int cpl, bool compat, bool is_t2) {
     if (cfg.inline_shr8) m |= AOT_MODE_INLINE_SHR8;
     if (cfg.page_rep) m |= AOT_MODE_PAGE_REP;
     m |= t2_ablation_bits();
+    if (__atomic_load_n(&tr_has_isa_dp, __ATOMIC_RELAXED)) m |= AOT_MODE_ISA_DP;
+    if (__atomic_load_n(&tr_has_isa_i8mm, __ATOMIC_RELAXED)) m |= AOT_MODE_ISA_I8MM;
+    if (tr_opt_hw_popcnt) m |= AOT_MODE_HW_POPCNT;
+    if (tr_opt_inline_pic) m |= AOT_MODE_INLINE_PIC;
     return m;
 }
 
@@ -1984,6 +2186,7 @@ typedef struct {
     u32 pcm_count;
     u32 stub_cnt;
     u32 link_cnt;
+    u32 pic_cnt;
     bool par_overflow;
 
     // Guest read-bytes snapshot for remember_reads()
@@ -2015,6 +2218,7 @@ typedef struct {
     Insn list[MAX_INSNS];
     ParStubSite stubs[PAR_MAX_STUBS];
     ParLinkSite links[PAR_MAX_LINKS];
+    struct { u32 add_off; u32 meta_slot_off; } pics[MAX_PIC_SITES];
     AotCapture aot_cap;
 } ParScratch;
 
@@ -2044,6 +2248,18 @@ void tr_par_record_cc_branch(u32 word_off, AotCcBranchKind kind, u32 lit_off) {
         return;
     }
     ps->links[ps->link_cnt++] = (ParLinkSite){ word_off, lit_off, (u8)kind };
+}
+
+void tr_par_record_pic(u32 add_off, u32 meta_slot_off) {
+    ParScratch *ps = tls_par;
+    if (!ps || ps->pic_cnt >= MAX_PIC_SITES) {
+        if (ps)
+            ps->par_overflow = true;
+        return;
+    }
+    ps->pics[ps->pic_cnt].add_off = add_off;
+    ps->pics[ps->pic_cnt].meta_slot_off = meta_slot_off;
+    ps->pic_cnt++;
 }
 
 bool tr_par_enabled(void) {
@@ -2099,6 +2315,7 @@ static void emit_cold_block(int key, u64 rip, u64 page, int cpl, bool single, u6
     cur_page = page;
     cur_single = single;
     l1_miss_count = 0;
+    pic_site_count = 0;
     tr_zext8 = tr_zext16 = 0;
     ext_ymm_cache_reset();
 
@@ -2217,8 +2434,7 @@ static void emit_cold_block(int key, u64 rip, u64 page, int cpl, bool single, u6
             (in->op != OP_EXT || in->memop || is_target[i] || ext_ymm_cache_dirty_run() >= 8)) {
             ext_ymm_cache_flush_dirty();
         }
-        if (in->op == OP_SSE || in->op == OP_LDMXCSR || in->op == OP_STMXCSR ||
-            in->op == OP_X87 || (in->op == OP_POPCNT && !tr_hybrid)) {
+        if (in->op == OP_SSE || in->op == OP_LDMXCSR || in->op == OP_STMXCSR || in->op == OP_X87) {
             ext_ymm_cache_flush_and_drop();
         }
         if ((!tr_opt_peep && in->op != OP_SSE && in->op != OP_EXT) ||
@@ -2253,8 +2469,27 @@ static void emit_cold_block(int key, u64 rip, u64 page, int cpl, bool single, u6
         bool fused = false;
         if (tr_opt_peep && !single && i + 1 < count && !is_target[i + 1] && in->next == list[i + 1].rip) {
             const Insn *nx = &list[i + 1];
-            // 1) TEST r, r / CMP r, 0 + JE/JNE -> CBZ/CBNZ (flags dead after Jcc).
-            if (in->op == OP_ALU && nx->op == OP_JCC && (nx->cc == 4 || nx->cc == 5) && live_after[i + 1] == 0) {
+            int madd_consumed = 0;
+            // 0) Fused VPMADDUBSW+VPMADDWD(+VPADDD) / PMADDUBSW+PMADDWD(+PADDD) -> hardware USDOT/SDOT.
+            if (in->op == OP_EXT && nx->op == OP_EXT &&
+                ext_try_emit_madd_dot(list, i, count, is_target, &madd_consumed)) {
+                for (int k = 1; k < madd_consumed; k++) {
+                    insn_arm[i + k] = insn_arm[i];
+                    block_stats_add_insn(sdelta, list[i + k].op);
+                }
+                tr_zext8 = tr_zext16 = 0;
+                i += madd_consumed - 1;
+                fused = true;
+            } else if (in->op == OP_SSE && nx->op == OP_SSE &&
+                       sse_try_emit_madd_dot(list, i, count, is_target, &madd_consumed)) {
+                for (int k = 1; k < madd_consumed; k++) {
+                    insn_arm[i + k] = insn_arm[i];
+                    block_stats_add_insn(sdelta, list[i + k].op);
+                }
+                tr_zext8 = tr_zext16 = 0;
+                i += madd_consumed - 1;
+                fused = true;
+            } else if (in->op == OP_ALU && nx->op == OP_JCC && (nx->cc == 4 || nx->cc == 5) && live_after[i + 1] == 0) {
                 int cbz_reg = -1, cbz_sf = 0;
                 if (in->sub == ALU_TEST && !in->has_imm && in->rm_reg && !in->high_reg && !in->high_rm && in->reg == in->rm) {
                     if (in->sz == 4 || in->sz == 8) {
@@ -2677,6 +2912,39 @@ static void emit_cold_block(int key, u64 rip, u64 page, int cpl, bool single, u6
         fix(l1_miss[i].site1, 0, miss);
         fix(l1_miss[i].site2, 0, miss);
     }
+    for (int i = 0; i < pic_site_count; i++) {
+        if (code_cap && (u32)(tr_cc - start) + 16U >= code_cap) {
+            out->overflow = true;
+            return;
+        }
+        bool l1 = use_native_l1(tr_cpl, tr_compat);
+        AotStubId sid = l1 ? AOT_STUB_LOOKUP_L1_FAST : AOT_STUB_LOOKUP;
+        u64 stub_va = l1 ? STUB(PRIV_VA + OFF_STUBS + STUB_OFF_LOOKUP_L1_FAST) : STUB(tr_stub_lookup);
+        u32 *miss = tr_cc;
+        u32 *gate = tr_cc;
+        b_rel(0); // Lpic_gate: initially b Lpic_init; patched ONCE atomically to NOP!
+        u32 *lookup = tr_cc;
+        tr_aot_note_stub(tr_cc, sid, true);
+        bl_rel((int)((i64)(stub_va - tr_cc_va(tr_cc)) / 4));
+        if (pic_sites[i].is_call) {
+            blr(S2);
+            b_rel((int)(pic_sites[i].landing_pad - tr_cc));
+        } else {
+            br(S2);
+        }
+        u32 *init = tr_cc;
+        svc(SVC_PIC_FILL);
+        E((u32)(init - pic_sites[i].br_site)); // meta[0]: off_br
+        E((u32)(init - gate));                 // meta[1]: off_gate
+        u32 *meta_slot = tr_cc;
+        E(0U);                                 // meta[2]: pic_slot (bound at commit/materialize)
+        E(pic_sites[i].is_call ? 1U : 0U);     // meta[3]: is_call
+        pic_sites[i].meta_slot_site = meta_slot;
+        fix(pic_sites[i].cbnz_site, 0, miss);
+        fix(pic_sites[i].br_site, 1, lookup);
+        fix(gate, 1, init);
+        tr_aot_note_pic(pic_sites[i].add_site, meta_slot);
+    }
     sdelta->exit_words = (u32)(tr_cc - tail);
     out->pcm_written = pcm_n;
     out->t2_patch_off = t2_patch_off;
@@ -2778,6 +3046,7 @@ bool tr_translate_try_prepare_unlocked(int view, uint64_t cr3, int cpl, bool com
     walk_cpl = cpl;
     fetch_cache_valid = false;
     __atomic_store_n(&tr_fpcr_merges_scalar, ctx_ptr->fpcr_merges_scalar != 0, __ATOMIC_RELAXED);
+    tr_refresh_isa_features();
 
     int key = block_key(view, cr3, cpl, rip);
     // Advisory lock-free hit check (78% of Win2022 HC_TRANSLATE): skip prepare and let locked fast path return in ~150 ns.
@@ -2833,6 +3102,7 @@ bool tr_translate_fast(int view, uint64_t cr3, int cpl, bool compat, uint64_t ri
     walk_cpl = cpl;
     fetch_cache_valid = false;
     __atomic_store_n(&tr_fpcr_merges_scalar, ctx_ptr->fpcr_merges_scalar != 0, __ATOMIC_RELAXED);
+    tr_refresh_isa_features();
     if (view > view_high)
         view_high = view;
     int key = block_key(view, cr3, cpl, rip);
@@ -2940,6 +3210,7 @@ void tr_translate_prepare(void) {
     fetch_hi = 0;
     ps->stub_cnt = 0;
     ps->link_cnt = 0;
+    ps->pic_cnt = 0;
     ps->code_words = 0;
     ps->pcm_count = 0;
     ps->snap_off = 0;
@@ -2986,6 +3257,11 @@ void tr_translate_prepare(void) {
                     } else if (r->type == AOT_RELOC_CC_BRANCH) {
                         if (ps->link_cnt >= PAR_MAX_LINKS) { reloc_ok = false; break; }
                         ps->links[ps->link_cnt++] = (ParLinkSite){ r->word_off, r->aux2, r->aux };
+                    } else if (r->type == AOT_RELOC_PIC_SLOT) {
+                        if (ps->pic_cnt >= MAX_PIC_SITES) { reloc_ok = false; break; }
+                        ps->pics[ps->pic_cnt].add_off = r->word_off;
+                        ps->pics[ps->pic_cnt].meta_slot_off = r->aux2;
+                        ps->pic_cnt++;
                     }
                 }
                 if (reloc_ok) {
@@ -3009,6 +3285,7 @@ void tr_translate_prepare(void) {
                 }
                 ps->stub_cnt = 0;
                 ps->link_cnt = 0;
+                ps->pic_cnt = 0;
             }
         }
     }
@@ -3271,6 +3548,8 @@ int tr_translate_commit(TrResult *out) {
         i64 disp = (i64)(stub_va - pc_va) / 4;
         start[w] = (ps->stubs[i].is_bl ? 0x94000000u : 0x14000000u) | ((u32)disp & 0x3FFFFFFu);
     }
+    for (u32 i = 0; i < ps->pic_cnt; i++)
+        pic_bind_site(start, ps->code_words, cur_part, alloc_slot, ps->pics[i].add_off, ps->pics[i].meta_slot_off);
     u32 first_word_after_stubs = *start;
 
     if (aot_eager_link && ps->link_cnt > 0) {
@@ -3530,6 +3809,11 @@ static TrResult do_translate(int key, int view, u64 cr3, int cpl, u64 rip, bool 
             if (aot_materialize(aot_cache, &aview, rip, start, cc_cap_words,
                                 &pc_map[map0], pcm_cap, tr_cc_va(start), cur_part,
                                 &aot_stubs, aot_resolve_live_target, &lc)) {
+                for (u16 ri = 0; ri < aview.reloc_count; ri++) {
+                    const AotReloc *r = &aview.relocs[ri];
+                    if (r->type == AOT_RELOC_PIC_SLOT)
+                        pic_bind_site(start, aview.code_words, cur_part, alloc_slot, r->word_off, r->aux2);
+                }
                 tr_cc = start + aview.code_words;
                 *pcm_cursor_p = map0 + aview.pcm_count;
 
@@ -3712,6 +3996,7 @@ static TrResult do_translate(int key, int view, u64 cr3, int cpl, u64 rip, bool 
     cur_page = page;
     cur_single = single;
     l1_miss_count = 0;
+    pic_site_count = 0;
     tr_zext8 = tr_zext16 = 0;
     ext_ymm_cache_reset();
 
@@ -3824,8 +4109,7 @@ static TrResult do_translate(int key, int view, u64 cr3, int cpl, u64 rip, bool 
             (in->op != OP_EXT || in->memop || is_target[i] || ext_ymm_cache_dirty_run() >= 8)) {
             ext_ymm_cache_flush_dirty();
         }
-        if (in->op == OP_SSE || in->op == OP_LDMXCSR || in->op == OP_STMXCSR ||
-            in->op == OP_X87 || (in->op == OP_POPCNT && !tr_hybrid)) {
+        if (in->op == OP_SSE || in->op == OP_LDMXCSR || in->op == OP_STMXCSR || in->op == OP_X87) {
             ext_ymm_cache_flush_and_drop();
         }
         if ((!tr_opt_peep && in->op != OP_SSE && in->op != OP_EXT) ||
@@ -3859,8 +4143,29 @@ static TrResult do_translate(int key, int view, u64 cr3, int cpl, u64 rip, bool 
         bool fused = false;
         if (tr_opt_peep && !single && i + 1 < count && !is_target[i + 1] && in->next == list[i + 1].rip) {
             const Insn *nx = &list[i + 1];
-            // 1) TEST r, r / CMP r, 0 + JE/JNE -> CBZ/CBNZ (flags dead after Jcc).
-            if (in->op == OP_ALU && nx->op == OP_JCC && (nx->cc == 4 || nx->cc == 5) && live_after[i + 1] == 0) {
+            int madd_consumed = 0;
+            // 0) Fused VPMADDUBSW+VPMADDWD(+VPADDD) / PMADDUBSW+PMADDWD(+PADDD) -> hardware USDOT/SDOT.
+            if (in->op == OP_EXT && nx->op == OP_EXT &&
+                ext_try_emit_madd_dot(list, i, count, is_target, &madd_consumed)) {
+                for (int k = 1; k < madd_consumed; k++) {
+                    insn_arm[i + k] = insn_arm[i];
+                    stats.op_insns[list[i + k].op & 127]++;
+                    stats.insns++;
+                }
+                tr_zext8 = tr_zext16 = 0;
+                i += madd_consumed - 1;
+                fused = true;
+            } else if (in->op == OP_SSE && nx->op == OP_SSE &&
+                       sse_try_emit_madd_dot(list, i, count, is_target, &madd_consumed)) {
+                for (int k = 1; k < madd_consumed; k++) {
+                    insn_arm[i + k] = insn_arm[i];
+                    stats.op_insns[list[i + k].op & 127]++;
+                    stats.insns++;
+                }
+                tr_zext8 = tr_zext16 = 0;
+                i += madd_consumed - 1;
+                fused = true;
+            } else if (in->op == OP_ALU && nx->op == OP_JCC && (nx->cc == 4 || nx->cc == 5) && live_after[i + 1] == 0) {
                 int cbz_reg = -1, cbz_sf = 0;
                 if (in->sub == ALU_TEST && !in->has_imm && in->rm_reg && !in->high_reg && !in->high_rm && in->reg == in->rm) {
                     if (in->sz == 4 || in->sz == 8) {
@@ -4286,6 +4591,35 @@ static TrResult do_translate(int key, int view, u64 cr3, int cpl, u64 rip, bool 
         fix(l1_miss[i].site1, 0, miss);
         fix(l1_miss[i].site2, 0, miss);
     }
+    for (int i = 0; i < pic_site_count; i++) {
+        bool l1 = use_native_l1(tr_cpl, tr_compat);
+        AotStubId sid = l1 ? AOT_STUB_LOOKUP_L1_FAST : AOT_STUB_LOOKUP;
+        u64 stub_va = l1 ? STUB(PRIV_VA + OFF_STUBS + STUB_OFF_LOOKUP_L1_FAST) : STUB(tr_stub_lookup);
+        u32 *miss = tr_cc;
+        u32 *gate = tr_cc;
+        b_rel(0); // Lpic_gate: initially b Lpic_init; patched ONCE atomically to NOP!
+        u32 *lookup = tr_cc;
+        tr_aot_note_stub(tr_cc, sid, true);
+        bl_rel((int)((i64)(stub_va - tr_cc_va(tr_cc)) / 4));
+        if (pic_sites[i].is_call) {
+            blr(S2);
+            b_rel((int)(pic_sites[i].landing_pad - tr_cc));
+        } else {
+            br(S2);
+        }
+        u32 *init = tr_cc;
+        svc(SVC_PIC_FILL);
+        E((u32)(init - pic_sites[i].br_site)); // meta[0]: off_br
+        E((u32)(init - gate));                 // meta[1]: off_gate
+        u32 *meta_slot = tr_cc;
+        E(0U);                                 // meta[2]: pic_slot (bound after aot_record)
+        E(pic_sites[i].is_call ? 1U : 0U);     // meta[3]: is_call
+        pic_sites[i].meta_slot_site = meta_slot;
+        fix(pic_sites[i].cbnz_site, 0, miss);
+        fix(pic_sites[i].br_site, 1, lookup);
+        fix(gate, 1, init);
+        tr_aot_note_pic(pic_sites[i].add_site, meta_slot);
+    }
     compile_inputs_finish();
     (void)tail;
 
@@ -4397,6 +4731,11 @@ static TrResult do_translate(int key, int view, u64 cr3, int cpl, u64 rip, bool 
             aot_apply_live_eager_links(start, rec.code_words, &tr_aot_cap, &lc);
         }
         tr_aot_cap.active = false;
+    }
+    for (int i = 0; i < pic_site_count; i++) {
+        pic_bind_site(start, (u32)(tr_cc - start), cur_part, alloc_slot,
+                      (u32)(pic_sites[i].add_site - start),
+                      (u32)(pic_sites[i].meta_slot_site - start));
     }
 
     link_block(idx);
@@ -4924,6 +5263,14 @@ void tr_init(const TrConfig *config) {
     const char *no_ring = getenv("LC_HVDBT_NO_P0_RING");
     const char *no_par = getenv("LC_HVDBT_NO_PAR_TRANSLATE");
     par_translate_enabled = !(no_par && !strcmp(no_par, "1"));
+    const char *no_isa_dot = getenv("LC_HVDBT_NO_ISA_DOT");
+    tr_no_isa_dp = (no_isa_dot && !strcmp(no_isa_dot, "1"));
+    const char *no_isa_i8mm = getenv("LC_HVDBT_NO_ISA_I8MM");
+    tr_no_isa_i8mm = (no_isa_i8mm && !strcmp(no_isa_i8mm, "1"));
+    const char *no_hw_popcnt = getenv("LC_HVDBT_NO_HW_POPCNT");
+    tr_opt_hw_popcnt = !(no_hw_popcnt && !strcmp(no_hw_popcnt, "1"));
+    const char *no_inline_pic = getenv("LC_HVDBT_NO_INLINE_PIC");
+    tr_opt_inline_pic = !(no_inline_pic && !strcmp(no_inline_pic, "1"));
     no_uframe_share = getenv("LC_HVDBT_NO_USER_FRAME_SHARE") != NULL;
     x86_decode_init();
     memset(tr_frame_inval_gen, 0, sizeof tr_frame_inval_gen);
@@ -4943,6 +5290,10 @@ void tr_init(const TrConfig *config) {
     t2_pc_map = (PcMap *)(cfg.priv + OFF_PCMAP_T2);
     t2_trap_meta = (T2TrapMeta *)(cfg.priv + OFF_META_T2);
     ctx_ptr = (EngineCtx *)(cfg.priv + OFF_CTX);
+    pic_table = cfg.priv ? (u64 *)(cfg.priv + OFF_PIC_TABLE) : NULL;
+    pic_reset_all();
+    pic_init_epochs();
+    tr_refresh_isa_features();
     compile_inputs_init();
     tr_precise_flags = cfg.precise_flags;
     tr_has_tzcnt = cfg.has_tzcnt_lzcnt;
@@ -5187,6 +5538,7 @@ static TrResult translate(int view, uint64_t cr3, int cpl, bool compat, uint64_t
     }
     tr_compat = compat; // the asking vCPU's: ctx_ptr is the first vCPU's, whatever it is running
     __atomic_store_n(&tr_fpcr_merges_scalar, ctx_ptr->fpcr_merges_scalar != 0, __ATOMIC_RELAXED);
+    tr_refresh_isa_features();
     if (view > view_high)
         view_high = view;
     int key = block_key(view, cr3, cpl, rip);
@@ -5760,6 +6112,7 @@ void tr_view_forget(int view) {
     hash_empty(view);
     hash_slots_used[view] = 0;
     fex_l1_clear_view(view);
+    pic_bump_view_epoch(view);
     stats.hash_forgets++;
 }
 
@@ -5793,8 +6146,11 @@ int tr_invalidate_view_va(int view, uint64_t va, uint32_t why, bool unmoved, boo
         }
         link = next;
     }
-    if (unmapped_shared)
+    if (unmapped_shared) {
+        if (!unmoved || why != KILL_RECLAIM)
+            pic_bump_view_epoch(view);
         __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    }
     stats.kill_calls[why]++;
     stats.killed[why] += (u64)n;
     if (unmoved)
@@ -5816,6 +6172,7 @@ void tr_view_drop(int view) {
     memset(hash_table(view), 0, HASH_BYTES);
     hash_slots_used[view] = 0;
     fex_l1_clear_view(view);
+    pic_bump_view_epoch(view);
     ctx_ptr->tr_flushed = 1;
 }
 
@@ -5895,6 +6252,7 @@ void tr_flush_parked(bool everything) {
         p0_block_count[victim] = 0;
         p0_pcmap_used[victim] = victim * P0_PCMAP_PER_SLOT;
         __atomic_store_n(&ctx_ptr->p0_slot_block_count[victim], 0ULL, __ATOMIC_RELEASE);
+        pic_reset_p0_slot(victim);
 
         if (reset_p1) {
             clear_code(cc_base + CC_PART2_WORD, cc_cursor[1]);
@@ -5908,6 +6266,7 @@ void tr_flush_parked(bool everything) {
             t2_block_cnt[1] = 0;
             t2_pcmap_used[1] = T2_PCMAP_ENTRIES;
             __atomic_store_n(&ctx_ptr->t2_block_count[1], 0ULL, __ATOMIC_RELEASE);
+            pic_reset_part1();
             stats.cache_private_resets++;
         } else {
             for (u32 i = 0; i < hblock_count[1]; i++) {
@@ -6040,11 +6399,13 @@ void tr_flush_parked(bool everything) {
         t2_block_cnt[0] = 0;
         t2_pcmap_used[0] = 0;
         __atomic_store_n(&ctx_ptr->t2_block_count[0], 0ULL, __ATOMIC_RELEASE);
+        pic_reset_all();
         u64 ep0 = t2_epoch[0], ep1 = t2_epoch[1];
         pthread_mutex_unlock(&t2_pub_lock);
         t2_on_flush(true, -1, ep0, ep1);
         return;
     }
+    pic_reset_part1();
     stats.cache_private_resets++;
     // The shared part stays, and finds its way back onto what was just emptied. Its dead blocks stay off, as a kill took them.
     if (p0_ring_enabled) {

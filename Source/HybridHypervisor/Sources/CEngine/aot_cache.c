@@ -237,6 +237,10 @@ uint64_t aot_compute_abi_hash(uint64_t build_stamp) {
         (uint64_t)OFF_STUBS2_HI,
         (uint64_t)(OFF_FEX_L1 - OFF_CTX),
         (uint64_t)FEX_L1_ENTRIES,
+        (uint64_t)(OFF_PIC_TABLE - OFF_CTX),
+        (uint64_t)PIC_ENTRY_BYTES,
+        (uint64_t)PIC_TABLE_ENTRIES,
+        (uint64_t)offsetof(EngineCtx, pic_epoch),
         (uint64_t)STUB_OFF_REP_MOVS,
         (uint64_t)STUB_OFF_REP_STOS,
         (uint64_t)STUB_OFF_REP_PAGE_MOVS,
@@ -1061,6 +1065,7 @@ bool aot_materialize(AotCache *c,
             }
             case AOT_RELOC_CC_BRANCH:
             case AOT_RELOC_T2_BAILOUT:
+            case AOT_RELOC_PIC_SLOT:
                 break;
             default:
                 goto reloc_fail;

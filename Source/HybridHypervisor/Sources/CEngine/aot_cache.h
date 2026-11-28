@@ -22,7 +22,7 @@ extern "C" {
 
 #define AOT_MAGIC_STR "HVDBTAOT"
 #define AOT_FORMAT_VERSION 2U
-#define AOT_EMITTER_EPOCH 2U
+#define AOT_EMITTER_EPOCH 3U
 #define AOT_MAX_RELOCS_PER_BLOCK 512U
 #define AOT_DEFAULT_MAX_BYTES (512ULL << 20) // 512 MiB default disk budget (covers full OS + heavy workloads)
 #define AOT_NO_PATCH_WORD 0xFFFFU
@@ -60,6 +60,10 @@ typedef struct {
 #define AOT_MODE_T2_NO_MEM_YMM   (1U << 21)  // LC_HVDBT_T2_NO_MEM_YMM=1
 #define AOT_MODE_T2_NO_STK_PROMO (1U << 22)  // LC_HVDBT_T2_NO_STK_PROMO=1
 #define AOT_MODE_T2_NO_UNROLL4   (1U << 23)  // LC_HVDBT_T2_NO_UNROLL4=1
+#define AOT_MODE_ISA_DP          (1U << 24)  // tr_has_isa_dp (FEAT_DotProd: SDOT/UDOT)
+#define AOT_MODE_ISA_I8MM        (1U << 25)  // tr_has_isa_i8mm (FEAT_I8MM: USDOT/SUDOT)
+#define AOT_MODE_HW_POPCNT       (1U << 26)  // tr_opt_hw_popcnt (Ring-3 NEON CNT/ADDV POPCNT)
+#define AOT_MODE_INLINE_PIC      (1U << 27)  // tr_opt_inline_pic (monomorphic inline PIC for JMPI/CALLI)
 
 // Record persistence priority (higher persisted first; Tier-2 never evicted by Tier-1).
 typedef enum {
@@ -84,6 +88,8 @@ typedef enum {
     AOT_RELOC_CC_BRANCH = 6,
     // Tier-2 Round 2 alias-guard bailout site: patched by tr_t2_publish() to B (t1_patch + 1).
     AOT_RELOC_T2_BAILOUT = 7,
+    // Monomorphic inline PIC slot binding: word_off = ADD+LDR pair, aux2 = Lpic_init meta[2] word_off.
+    AOT_RELOC_PIC_SLOT = 8,
 } AotRelocType;
 
 // Cross-block branch kinds for AOT_RELOC_CC_BRANCH.

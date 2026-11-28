@@ -874,6 +874,46 @@ static void rflags_set(u64 r) {
 static u64 fex_view_gen[MAX_VIEWS] __attribute__((aligned(64)));
 static u64 fex_gen_seq __attribute__((aligned(64)));
 
+#define pic_epochs ((PicEpochTable *)(PRIV_VA + OFF_PIC_TABLE))
+
+static inline u64 pic_alloc_epoch_el1(void) {
+    u64 ep = __atomic_add_fetch(&pic_epochs->seq, 1ULL, __ATOMIC_SEQ_CST);
+    if (ep < 2ULL) {
+        ep = __atomic_add_fetch(&pic_epochs->seq, 2ULL, __ATOMIC_SEQ_CST);
+    }
+    return ep;
+}
+
+static inline void pic_bump_view_epoch_el1(u32 vi) {
+    if (vi >= MAX_VIEWS)
+        return;
+    u64 ep = pic_alloc_epoch_el1();
+    __atomic_store_n(&pic_epochs->view_epoch[vi], ep, __ATOMIC_SEQ_CST);
+    u32 vc = c0->vcpu_count ? c0->vcpu_count : 1U;
+    if (vc > MAX_VCPUS)
+        vc = MAX_VCPUS;
+    for (u32 i = 0; i < vc; i++) {
+        EngineCtx *vc_ctx = (EngineCtx *)(PRIV_VA + OFF_CTX + (u64)i * CTX_SLOT);
+        if (__atomic_load_n(&vc_ctx->view, __ATOMIC_SEQ_CST) == vi)
+            __atomic_store_n(&vc_ctx->pic_epoch, ep, __ATOMIC_RELEASE);
+    }
+}
+
+static inline void pic_sync_vcpu_epoch(u32 vi) {
+    if (vi >= MAX_VIEWS)
+        return;
+    for (;;) {
+        u64 ep = __atomic_load_n(&pic_epochs->view_epoch[vi], __ATOMIC_SEQ_CST);
+        if (ep < 2ULL) {
+            ep = pic_alloc_epoch_el1();
+            __atomic_store_n(&pic_epochs->view_epoch[vi], ep, __ATOMIC_SEQ_CST);
+        }
+        __atomic_store_n(&c->pic_epoch, ep, __ATOMIC_SEQ_CST);
+        if (__atomic_load_n(&pic_epochs->view_epoch[vi], __ATOMIC_SEQ_CST) == ep)
+            break;
+    }
+}
+
 static void view_rs_prepare(u32 idx) {
     me->rs_saved[idx] = view_rs_top(idx);
     u64 *sent = (u64 *)view_rs_top(idx);
@@ -884,6 +924,7 @@ static void view_rs_prepare(u32 idx) {
 static void view_build(u32 idx, u64 key, u32 cpl) {
     View *v = &views[idx];
     __atomic_store_n(&fex_view_gen[idx], __atomic_add_fetch(&fex_gen_seq, 1, __ATOMIC_ACQ_REL), __ATOMIC_RELEASE);
+    pic_bump_view_epoch_el1(idx);
     v->cr3 = key;
     v->cpl = cpl;
     u32 r0 = pool_alloc(idx, 3, key & X_ADDR, 0);
@@ -937,6 +978,7 @@ static void view_drop(u32 best) {
     c->req_a[0] = best;
     hostcall(HC_VIEW_DROP);
     __atomic_store_n(&fex_view_gen[best], __atomic_add_fetch(&fex_gen_seq, 1, __ATOMIC_ACQ_REL), __ATOMIC_RELEASE);
+    pic_bump_view_epoch_el1(best);
     v->valid = 0;
     if (smp)
         reset_all_return_stacks();
@@ -962,6 +1004,9 @@ static void shadow_drop_all(void) {
         }
     }
     tlbi_all();
+    for (u32 i = 0; i < view_count; i++)
+        if (views[i].valid)
+            pic_bump_view_epoch_el1(i);
     reset_all_return_stacks();
 }
 
@@ -1098,7 +1143,9 @@ static void view_activate_core(View *v) {
         c->x[R_RS] = me->rs_saved[v - views];
         c->x[R_HASH] = v->hash_va;
     }
-    __atomic_store_n(&c->view, (u32)(v - views), __ATOMIC_SEQ_CST);
+    u32 vi = (u32)(v - views);
+    __atomic_store_n(&c->view, vi, __ATOMIC_SEQ_CST);
+    pic_sync_vcpu_epoch(vi);
     WSR(ttbr0_el1, v->ttbr0);
     WSR(ttbr1_el1, v->ttbr1);
     __asm__ volatile("isb");
@@ -1451,6 +1498,11 @@ static u64 view_lookup(u64 rip) {
 
 static inline void code_changed(u32 *word) {
     __asm__ volatile("dc cvau, %0\n dsb ish\n ic ivau, %0\n dsb ish\n isb" : : "r"(word) : "memory");
+}
+
+static inline bool in_code_cache(u64 pc, u64 len) {
+    return (pc >= PRIV_VA + OFF_CC && pc + len <= PRIV_VA + OFF_CC + CC_SIZE) ||
+           (pc >= PRIV_VA + OFF_CC2 && pc + len <= PRIV_VA + OFF_CC2 + CC_SIZE);
 }
 
 // In Part 0 4-slot ring mode, a newer slot must never permanently direct-branch into an older slot
@@ -5142,6 +5194,78 @@ void mon_sync(void) {
                 c->elr = c->x[R_LR];
                 break;
             }
+            case SVC_PIC_FILL: {
+                // One-time view-epoch-guarded monomorphic inline PIC fill for CPL=3 OP_CALLI / IAT OP_JMPI.
+                // Layout at c->elr - 4: svc #SVC_PIC_FILL; .word off_br, off_gate, pic_slot, is_call
+                u64 init_va = c->elr - 4;
+                u64 target = c->x[R_S0];
+                u32 cur_view = c->view;
+                u64 ep_before = cur_view < MAX_VIEWS ? __atomic_load_n(&pic_epochs->view_epoch[cur_view], __ATOMIC_ACQUIRE) : 0ULL;
+                event_delivered = false;
+                code_cache_reset = false;
+                u64 arm = translate_here(target, 0, SVC_LOOKUP_MISS, false);
+                if (event_delivered || code_cache_reset) {
+                    c->elr = arm;
+                    break;
+                }
+                if (in_code_cache(init_va, 20)) {
+                    const u32 *meta = (const u32 *)c->elr;
+                    u32 off_br = meta[0];
+                    u32 off_gate = meta[1];
+                    u32 pic_slot = meta[2];
+                    u32 is_call = meta[3];
+                    u64 br_va = init_va - (u64)off_br * 4ULL;
+                    u64 gate_va = init_va - (u64)off_gate * 4ULL;
+                    if (off_br > 0 && off_gate > 0 && in_code_cache(br_va, 4) && in_code_cache(gate_va, 4)) {
+                        u32 *pic_br = (u32 *)br_va;
+                        u32 *pic_gate = (u32 *)gate_va;
+                        u32 expected_gate = 0x14000000u | (off_gate & 0x3ffffffu);
+                        // Exclusive one-time ownership via atomic CAS of Lpic_gate: b Lpic_init -> NOP.
+                        // Polymorphic misses then fall straight into pure EL0 lookup with zero EL1 traps.
+                        if (__atomic_compare_exchange_n(pic_gate, &expected_gate, 0xD503201Fu,
+                                                        false, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
+                            u64 ep_after = (c->view == cur_view && cur_view < MAX_VIEWS)
+                                               ? __atomic_load_n(&pic_epochs->view_epoch[cur_view], __ATOMIC_ACQUIRE)
+                                               : 0ULL;
+                            u64 vcpu_ep = __atomic_load_n(&c->pic_epoch, __ATOMIC_ACQUIRE);
+                            if (target && target != ~0ULL && pic_slot >= PIC_FIRST_SLOT && pic_slot < PIC_TABLE_ENTRIES &&
+                                ep_before >= 2ULL && ep_before == ep_after && ep_after == vcpu_ep) {
+                                BlockEntry *from = find_block(br_va);
+                                BlockEntry *to = find_block(arm);
+                                bool cpl3_user = ((c->cpl & 3) == 3) && !c->compat;
+                                bool same_domain = false;
+                                if (from && to && from->key == to->key) {
+                                    same_domain = ((from->key & 0xE0000000u) != 0x60000000u) ||
+                                                  ((from->rip & ~0xfffULL) == (to->rip & ~0xfffULL));
+                                }
+                                i64 d = ((i64)arm - (i64)br_va) >> 2;
+                                // For CPL=3 64-bit, cross-page KEY_USER_FRAME links are 100% safe because:
+                                // 1) Every hit verifies (target == pic_ent.rip && c->pic_epoch == pic_ent.epoch);
+                                // 2) View unmap/forget/evict bumps view_pic_epoch + vc->pic_epoch;
+                                // 3) SMC poisons target entry with WORD_DEAD;
+                                // 4) !bad_ring_link + +-128 MiB reach keeps from/to in same partition & safe ring order.
+                                if (from && to && (cpl3_user || same_domain) &&
+                                    !bad_ring_link(br_va, arm) && br_va != arm &&
+                                    d >= -(1 << 25) && d < (1 << 25)) {
+                                    u32 new_br = (is_call ? 0x94000000u : 0x14000000u) | ((u32)d & 0x3ffffffu);
+                                    __atomic_store_n(pic_br, new_br, __ATOMIC_RELEASE);
+                                    code_changed(pic_br);
+                                    u64 *pic_ent = (u64 *)(PRIV_VA + OFF_PIC_TABLE + (u64)pic_slot * PIC_ENTRY_BYTES);
+                                    __atomic_store_n(&pic_ent[0], target, __ATOMIC_RELEASE);
+                                    __atomic_thread_fence(__ATOMIC_RELEASE);
+                                    __atomic_store_n(&pic_ent[1], ep_after, __ATOMIC_RELEASE);
+                                    c->stat_links_here++;
+                                }
+                            }
+                            code_changed(pic_gate);
+                        }
+                        if (is_call)
+                            c->x[R_LR] = br_va + 4ULL;
+                    }
+                }
+                c->elr = arm;
+                break;
+            }
             case SVC_DEAD: {
                 // Entry of an invalidated block: find it and go to a fresh translation.
                 bool from_fex = (c->x[R_FS] == (u64)c + 32768ULL);
@@ -5646,6 +5770,19 @@ void mon_sync(void) {
     } else if (ec == 0x07) { // SIMD with CR0.TS set
         if (in_rep_stub(c->elr)) { // no x86 FP here, only rep stos's stub, which hybrid mode does not use: on with the plain loop at the call site
             c->elr = c->x[R_LR];
+        } else if (in_code_cache(c->elr, 16) &&
+                   *(const u32 *)c->elr == 0x9E67023Bu &&
+                   *(const u32 *)(c->elr + 4) == 0x0E205B7Bu &&
+                   *(const u32 *)(c->elr + 8) == 0x0E31BB7Bu &&
+                   *(const u32 *)(c->elr + 12) == 0x1E260376u) {
+            // Ring-3 hardware POPCNT trapped because CR0.TS=1; x86 POPCNT never raises #NM.
+            // Compute exact 64-bit integer popcount in EL1 without touching NEON and advance past the 4-word sequence.
+            u64 v = c->x[R_S1];
+            v = v - ((v >> 1) & 0x5555555555555555ULL);
+            v = (v & 0x3333333333333333ULL) + ((v >> 2) & 0x3333333333333333ULL);
+            v = (v + (v >> 4)) & 0x0F0F0F0F0F0F0F0FULL;
+            c->x[R_S2] = (v * 0x0101010101010101ULL) >> 56;
+            c->elr += 16;
         } else {
             c->stat_nm++;
             deliver(7, 0, false, rip_here(c->elr), false);
@@ -5715,7 +5852,8 @@ void mon_init(void) {
     hole_entry_priv = desc_hole[0];
     hole_entry_ram = desc_hole[1];
     View *v = view_find(cr3_key(c->cr3), view_mode());
-    c->view = (u32)(v - views);
+    __atomic_store_n(&c->view, (u32)(v - views), __ATOMIC_SEQ_CST);
+    pic_sync_vcpu_epoch(c->view);
     if (!me->rs_saved[c->view]) // built by another vCPU
         view_rs_prepare(c->view);
     c->x[R_RS] = me->rs_saved[c->view];
@@ -5727,9 +5865,17 @@ void mon_init(void) {
     __asm__ volatile("isb");
     mxcsr_apply(c->hybrid ? c->resume_mxcsr : 0x1F80);
     if (!cpu_index()) {
-        // Measure the FPCR Hypervisor actually exposes, not the host model.
-        // All vCPUs in this VM use that feature set and mxcsr_apply's policy.
+        // Measure the FPCR and ISA extensions Hypervisor actually exposes, not the host model.
+        // All vCPUs in this VM use that feature set, mxcsr_apply's policy, and AOT mode_bits.
         c->fpcr_merges_scalar = (RSR(S3_3_C4_C4_0) & 4) != 0;
+        u64 isar0 = RSR(id_aa64isar0_el1);
+        u64 isar1 = RSR(id_aa64isar1_el1);
+        u32 feats = 0;
+        if (((isar0 >> 44) & 0xFu) >= 1U)
+            feats |= ISA_FEAT_DP;
+        if (((isar1 >> 52) & 0xFu) >= 1U)
+            feats |= ISA_FEAT_I8MM;
+        __atomic_store_n(&c->isa_features, feats, __ATOMIC_RELEASE);
     }
     if (!c->hybrid && !c->fcw)
         c->fcw = 0x37F;

@@ -175,6 +175,8 @@ bool insn_is_terminator(const Insn *in);
 extern _Thread_local u32 *tr_cc; // write cursor
 extern bool tr_precise_flags, tr_has_tzcnt, tr_hybrid, tr_no_bulk_rep;
 extern bool tr_fpcr_merges_scalar;
+extern bool tr_has_isa_dp, tr_has_isa_i8mm;
+extern bool tr_opt_hw_popcnt, tr_opt_inline_pic;
 extern _Thread_local u64 tr_ad_page;
 extern _Thread_local u16 tr_zext8, tr_zext16;
 extern bool tr_opt_peep, tr_opt_ymm_cache;
@@ -370,6 +372,9 @@ void emit_x87(const Insn *in); // OP_X87
 // bytes run off a page, so the caller must raise a fetch fault and try again.
 int x86_decode_ext(u64 rip, Insn *in, const u8 *b, int avail);
 void emit_ext(const Insn *in, int live);
+bool ext_try_emit_madd_dot(const Insn *list, int idx, int count, const bool *is_target, int *out_consumed);
+void ext_emit_madd_dot_lane128(int dst, int u, int s, int ones, bool accum, bool ones_known);
+bool sse_try_emit_madd_dot(const Insn *list, int idx, int count, const bool *is_target, int *out_consumed);
 
 // Inline EL0 PCMPISTRI/VPCMPISTRI lowering (shared by emit_sse.c and emit_ext.c).
 void emit_pcmpistri_el0(int d, int s, u8 imm, int live);
@@ -383,6 +388,7 @@ extern _Thread_local bool tr_par_active;
 extern _Thread_local u32 *tr_par_block_start;
 void tr_par_record_stub(u32 word_off, AotStubId id, bool is_bl);
 void tr_par_record_cc_branch(u32 word_off, AotCcBranchKind kind, u32 lit_off);
+void tr_par_record_pic(u32 add_off, u32 meta_slot_off);
 
 // Persistent AOT cache relocation capture (inert when tr_aot_active == false).
 extern bool tr_aot_active;
@@ -426,6 +432,20 @@ static inline void tr_aot_note_cc_branch(u32 *site, AotCcBranchKind kind, u32 *l
         }
         aot_capture_add(&tr_aot_cap, (u32)(site - tr_aot_block_start),
                         AOT_RELOC_CC_BRANCH, (u8)kind, (u16)lit_off);
+    }
+}
+
+static inline void tr_aot_note_pic(u32 *add_site, u32 *meta_slot_site) {
+    if (__builtin_expect(tr_par_active, 0))
+        tr_par_record_pic((u32)(add_site - tr_par_block_start), (u32)(meta_slot_site - tr_par_block_start));
+    if (__builtin_expect(tr_aot_active && tr_aot_cap.active, 0)) {
+        u32 meta_off = (u32)(meta_slot_site - tr_aot_block_start);
+        if (meta_off > 0xFFFFU) {
+            aot_capture_mark_ineligible(&tr_aot_cap);
+            return;
+        }
+        aot_capture_add(&tr_aot_cap, (u32)(add_site - tr_aot_block_start),
+                        AOT_RELOC_PIC_SLOT, 0, (u16)meta_off);
     }
 }
 #ifdef OFF_STUBS_HI

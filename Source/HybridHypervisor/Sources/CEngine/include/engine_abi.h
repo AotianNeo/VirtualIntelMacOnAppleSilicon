@@ -36,6 +36,16 @@
 #define MAX_VCPUS 16
 #define CTX_SLOT (64ULL << 10)
 #define OFF_MON_CPU (OFF_MON_DATA + (1ULL << 20)) // EL1 rw: per vCPU, CTX_SLOT apart too, the monitor's own state and stack
+#define OFF_PIC_TABLE (OFF_CTX + (1ULL << 20)) // 785 MB: EL0/EL1 rw, 1 MiB shared monomorphic PIC table
+#define PIC_TABLE_BYTES (1ULL << 20)
+#define PIC_ENTRY_BYTES 16ULL // { uint64_t rip; uint64_t epoch; } (epoch==0 is permanent miss sentinel)
+#define PIC_TABLE_ENTRIES (PIC_TABLE_BYTES / PIC_ENTRY_BYTES) // 65,536 16-byte entries
+// Page 0 of OFF_PIC_TABLE (slots 0..255 = 4 KiB) stores PicEpochTable { seq, view_epoch[MAX_VIEWS] }.
+// Allocatable PIC slots start at PIC_FIRST_SLOT (256 = page 1).
+#define PIC_FIRST_SLOT 256U
+#define PIC_P0_SLOTS_PER_RING 14336U // Slot 0: [256..14335], Slots 1..3: 14,336 each (57,344 total Part 0)
+#define PIC_P1_BASE 57344U           // 8,192 slots [57344..65535] for Part 1 private cache
+#define PIC_SLOT_NONE 0xFFFFFFFFU
 #define OFF_CTX_END (OFF_CTX + (2ULL << 20))
 #define OFF_FEX_L1 (OFF_CTX + (4ULL << 20)) // 788 MB: EL0 rw, per vCPU 64 KB direct-mapped L1 lookup table (x18 + 4 MiB invariant)
 #define FEX_L1_ENTRIES 4096ULL
@@ -137,6 +147,8 @@ _Static_assert(CC_T2_OFF + CC_T2_SIZE + 2ULL * P0_SLOT_BYTES <= CC_SIZE, "P0 rin
 _Static_assert(OFF_BLOCKS_T2 + 2ULL * T2_BLOCKS_MAX * 32ULL <= OFF_META_T2, "OFF_BLOCKS_T2 runs past OFF_META_T2");
 _Static_assert(OFF_META_T2 + 2ULL * T2_BLOCKS_MAX * sizeof(T2TrapMeta) <= OFF_PCMAP_T2, "OFF_META_T2 runs past OFF_PCMAP_T2");
 _Static_assert(OFF_PCMAP_T2 + 2ULL * T2_PCMAP_ENTRIES * 4ULL <= OFF_HASH, "OFF_PCMAP_T2 runs past OFF_HASH");
+_Static_assert(OFF_CTX + MAX_VCPUS * CTX_SLOT <= OFF_PIC_TABLE, "vCPU contexts overlap OFF_PIC_TABLE");
+_Static_assert(OFF_PIC_TABLE + PIC_TABLE_BYTES <= OFF_CTX_END, "OFF_PIC_TABLE exceeds OFF_CTX_END");
 _Static_assert(OFF_FEX_L1 - OFF_CTX == (4ULL << 20), "OFF_FEX_L1 must remain exactly 4 MiB past OFF_CTX for vectors.s and L1 inline probes");
 _Static_assert(OFF_STUBS_HI + (2ULL << 20) <= OFF_PT, "part 0 code cache + high stubs run past OFF_PT");
 _Static_assert(OFF_PCMAP + PCMAP_BYTES <= OFF_HASH, "part 0 pcmap runs past OFF_HASH");
@@ -186,6 +198,7 @@ enum {
     SVC_STOP, // literal: u32 stop reason index
     SVC_SINGLE_DONE, // end of a one-off single-instruction block, literal target follows
     SVC_FEX_LINK, // FEX direct branch lazy linker: ELR points to 4 movz/movk words
+    SVC_PIC_FILL, // Monomorphic inline PIC one-time fill: x16 target, ELR points to 4 u32 meta words (off_br, off_gate, pic_slot, is_call)
     // x86 events
     SVC_SYSCALL = 16, // x16 next rip
     SVC_SYSRET,
@@ -500,7 +513,25 @@ typedef struct {
     uint64_t stat_el1_sync_dabt_ticks;
     uint64_t stat_el1_irq_ticks;
     uint64_t stat_el1_hvc_ticks;
+    // Dynamic HVF-exposed ARM64 ISA capabilities (ISA_FEAT_*), probed in EL1 mon_init on vCPU 0. Append-only.
+    uint32_t isa_features;
+    uint32_t isa_features_pad;
+    // Per-vCPU active view PIC epoch (always >= 2; shared view_epoch[] lives in page 0 of OFF_PIC_TABLE). Append-only.
+    uint64_t pic_epoch;
 } EngineCtx;
+// Stored in page 0 (4 KiB) of OFF_PIC_TABLE (shared EL0/EL1/Host rw).
+typedef struct {
+    uint64_t seq;
+    uint64_t view_epoch[MAX_VIEWS];
+} PicEpochTable;
+_Static_assert(sizeof(PicEpochTable) <= (PIC_FIRST_SLOT * PIC_ENTRY_BYTES),
+               "PicEpochTable must fit inside page 0 of OFF_PIC_TABLE");
+// Dynamic HVF-exposed ARM64 ISA feature bits (probed from EL1 ID registers in mon_init on vCPU 0).
+#define ISA_FEAT_DP   (1U << 0) // ID_AA64ISAR0_EL1.DP [47:44] >= 1 (SDOT/UDOT; Apple M1+)
+#define ISA_FEAT_I8MM (1U << 1) // ID_AA64ISAR1_EL1.I8MM [55:52] >= 1 (USDOT/SUDOT; Apple M4/M5+)
+_Static_assert((__builtin_offsetof(EngineCtx, pic_epoch) & 7ULL) == 0 &&
+               __builtin_offsetof(EngineCtx, pic_epoch) < 32768ULL,
+               "EngineCtx.pic_epoch must fit 8B-aligned unsigned LDR immediate");
 _Static_assert(sizeof(EngineCtx) <= 32768, "EngineCtx must stay below the +32 KB per-vCPU scratch region");
 _Static_assert(sizeof(EngineCtx) <= CTX_SLOT, "EngineCtx must fit its existing per-vCPU slot");
 // Monitor/vectors.s reads these two from x18 with fixed offsets.
