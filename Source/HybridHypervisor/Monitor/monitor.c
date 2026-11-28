@@ -1284,18 +1284,55 @@ static bool t2_sync_on_trap(void) {
     if (rel < tm->body_start_word || rel >= tm->body_end_word)
         return false;
     me->t2_synced = true;
+    u64 fp[16][2] __attribute__((aligned(16)));
+    bool fp_loaded = false;
     if (tm->ymm_wr_mask) {
-        u64 pool[4][2] __attribute__((aligned(16)));
+        u64 pool[6][2] __attribute__((aligned(16)));
         mon_t2_read_pool(pool);
-        for (u32 s = 0; s < 4; s++) {
+        for (u32 s = 0; s < T2_MAX_YMM_SLOTS; s++) {
             if (!(tm->ymm_wr_mask & (1U << s)))
                 continue;
             u32 reg = tm->ymm_reg[s];
-            if (reg >= 8U && reg < 16U) {
-                c->ymm_hi[reg][0] = pool[s][0];
-                c->ymm_hi[reg][1] = pool[s][1];
+            u32 vr = tm->ymm_vreg[s];
+            if (reg < 8U || reg >= 16U)
+                continue;
+            const u64 *src = NULL;
+            switch (vr) {
+                case 24: src = pool[0]; break;
+                case 25: src = pool[1]; break;
+                case 26: src = pool[2]; break;
+                case 29: src = pool[3]; break;
+                case 30: src = pool[4]; break;
+                case 31: src = pool[5]; break;
+                default:
+                    if (vr < 16U) {
+                        if (!fp_loaded) {
+                            mon_fp_save(fp);
+                            fp_loaded = true;
+                        }
+                        src = fp[vr];
+                    }
+                    break;
+            }
+            if (src) {
+                c->ymm_hi[reg][0] = src[0];
+                c->ymm_hi[reg][1] = src[1];
             }
         }
+    }
+    if (tm->borrow_cnt) {
+        if (!fp_loaded) {
+            mon_fp_save(fp);
+            fp_loaded = true;
+        }
+        for (u32 j = 0; j < tm->borrow_cnt && j < T2_MAX_BORROW_XMM; j++) {
+            u32 vr = tm->borrow_vreg[j];
+            if (vr < 16U) {
+                fp[vr][0] = c->t2_saved_xmm[j][0];
+                fp[vr][1] = c->t2_saved_xmm[j][1];
+            }
+        }
+        mon_fp_restore(fp);
     }
     if (tm->stk_cnt && tm->stk_dirty_mask && tm->stk_base < 16U) {
         u32 access = c->cpl == 3 ? 4U : 0U;
@@ -6398,7 +6435,16 @@ void mon_sync(void) {
     if (!page_rep && me->smc_held)
         __atomic_store_n(&me->smc_held, 0, __ATOMIC_RELEASE);
     if (ec == 0x24) {
+        u64 fills_before = c->stat_fills;
+        u64 dabt_pc = c->elr;
         handle_data_abort(true);
+        // Zero-overhead 1-in-256 shadow-fill PC sample supplements IRQ sampling for streaming hot loops.
+        if (c->stat_fills != fills_before && (c->stat_fills & 255U) == 0 &&
+            dabt_pc >= PRIV_VA + OFF_CC && dabt_pc < PRIV_VA + OFF_CC2 + CC_SIZE) {
+            u32 sh = c->t2_sample_head;
+            c->t2_sample_ring[sh & (T2_SAMPLE_RING - 1U)] = dabt_pc;
+            __atomic_store_n(&c->t2_sample_head, sh + 1U, __ATOMIC_RELEASE);
+        }
     } else if (ec == 0x15) {
         c->stat_svc[n & 127]++;
         switch (n) {

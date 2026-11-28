@@ -110,26 +110,32 @@ static inline uint64_t engine_shared_compat_domain(uint64_t rip, uint64_t table)
 #define T2_PCMAP_ENTRIES (1U << 20)
 #define T2_SAMPLE_RING 64U
 #define T2_MAX_STK_SLOTS 2U
+#define T2_MAX_YMM_SLOTS 8U
+#define T2_MAX_BORROW_XMM 2U
 #define T2_META_FLAG_ACTIVE 1U
 
 // Per-Tier-2-block trap reconstruction metadata (EL1 rw at OFF_META_T2).
 // When EL0 traps inside [body_start_word, body_end_word), Monitor/monitor.c uses this table to flush
-// live resident ymm8..15 highs (q24,q25,q29,q31) to EngineCtx.ymm_hi and dirty promoted stack slots
-// (x29/S5, x24/S4) to guest RAM before exception/IRQ delivery, SMC redirect, or HC_FALLBACK/HC_BOUNDARY.
+// live resident ymm8..15 highs (up to 8 slots across {q24,q25,q29,q31,q26,q30} + borrowed unused XMMs),
+// restore any borrowed unused guest XMM registers from EngineCtx.t2_saved_xmm, and write back dirty
+// promoted stack slots (x29/S5, x24/S4) to guest RAM before exception/IRQ delivery, SMC redirect, or stop.
 typedef struct {
-    uint32_t body_start_word; // relative to block arm_off
-    uint32_t body_end_word;   // relative to block arm_off (before epilogue/exit stubs)
-    uint8_t ymm_reg[4];       // pool slot s in {0:q24,1:q25,2:q29,3:q31}: x86 ymm 8..15, or 0 if unused
-    uint8_t ymm_wr_mask;      // bit s (0..3): slot s may be written in loop body (dirty)
-    uint8_t stk_cnt;          // 0..2 promoted stack slots
-    uint8_t stk_base;         // x86 base GPR index (4=RSP, 5=RBP)
-    uint8_t stk_dirty_mask;   // bit k (0..1): slot k is written in loop body (needs trap writeback)
-    uint8_t stk_sz[T2_MAX_STK_SLOTS];   // 4 or 8 bytes
-    uint8_t stk_phys[T2_MAX_STK_SLOTS]; // ARM64 GPR index (29=S5, 24=S4)
-    uint8_t flags;            // T2_META_FLAG_ACTIVE when resident YMM or dirty stack state exists
-    uint8_t pad[3];
-    int64_t stk_disp[T2_MAX_STK_SLOTS]; // signed displacement from stk_base
-    uint64_t rsvd[3];
+    uint32_t body_start_word;                 // relative to block arm_off
+    uint32_t body_end_word;                   // relative to block arm_off (before epilogue/exit stubs)
+    uint8_t ymm_reg[T2_MAX_YMM_SLOTS];        // pool slot s in 0..7: x86 ymm 8..15, or 0 if unused
+    uint8_t ymm_vreg[T2_MAX_YMM_SLOTS];       // ARM64 vreg (0..31) backing pool slot s
+    uint8_t ymm_wr_mask;                      // bit s (0..7): slot s may be written in loop body (dirty)
+    uint8_t stk_cnt;                          // 0..2 promoted stack slots
+    uint8_t stk_base;                         // x86 base GPR index (4=RSP, 5=RBP)
+    uint8_t stk_dirty_mask;                   // bit k (0..1): slot k is written in loop body (needs trap writeback)
+    uint8_t stk_sz[T2_MAX_STK_SLOTS];         // 4 or 8 bytes
+    uint8_t stk_phys[T2_MAX_STK_SLOTS];       // ARM64 GPR index (29=S5, 24=S4)
+    uint8_t flags;                            // T2_META_FLAG_ACTIVE when resident YMM, borrowed XMM, or dirty stack exists
+    uint8_t borrow_cnt;                       // 0..2 borrowed unused guest XMM regs saved in EngineCtx.t2_saved_xmm
+    uint8_t borrow_vreg[T2_MAX_BORROW_XMM];   // guest XMM index (0..15) saved in t2_saved_xmm[j]
+    uint8_t pad[4];
+    int64_t stk_disp[T2_MAX_STK_SLOTS];       // signed displacement from stk_base
+    uint64_t rsvd;
 } T2TrapMeta;
 _Static_assert(sizeof(T2TrapMeta) == 64, "T2TrapMeta must be 64 bytes");
 
@@ -521,6 +527,8 @@ typedef struct {
     // Fine-grained shadow PT lock ablation switch (LC_HVDBT_GLOBAL_MON_LOCK=1 forces legacy global mon_lock). Append-only.
     uint32_t global_mon_lock;
     uint32_t global_mon_lock_pad;
+    // Tier-2 borrowed unused guest XMM save area (saved in Preheader, restored on exit or trap). Append-only.
+    uint64_t t2_saved_xmm[T2_MAX_BORROW_XMM][2] __attribute__((aligned(16)));
 } EngineCtx;
 // Stored in page 0 (4 KiB) of OFF_PIC_TABLE (shared EL0/EL1/Host rw).
 typedef struct {
@@ -535,6 +543,9 @@ _Static_assert(sizeof(PicEpochTable) <= (PIC_FIRST_SLOT * PIC_ENTRY_BYTES),
 _Static_assert((__builtin_offsetof(EngineCtx, pic_epoch) & 7ULL) == 0 &&
                __builtin_offsetof(EngineCtx, pic_epoch) < 32768ULL,
                "EngineCtx.pic_epoch must fit 8B-aligned unsigned LDR immediate");
+_Static_assert((__builtin_offsetof(EngineCtx, t2_saved_xmm) & 15ULL) == 0 &&
+               __builtin_offsetof(EngineCtx, t2_saved_xmm) < 32768ULL,
+               "EngineCtx.t2_saved_xmm must be 16B-aligned and fit unsigned 128-bit LDR/STR immediate");
 _Static_assert(sizeof(EngineCtx) <= 32768, "EngineCtx must stay below the +32 KB per-vCPU scratch region");
 _Static_assert(sizeof(EngineCtx) <= CTX_SLOT, "EngineCtx must fit its existing per-vCPU slot");
 // Monitor/vectors.s reads these two from x18 with fixed offsets.

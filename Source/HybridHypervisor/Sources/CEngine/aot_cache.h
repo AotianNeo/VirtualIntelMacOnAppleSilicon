@@ -22,7 +22,7 @@ extern "C" {
 
 #define AOT_MAGIC_STR "HVDBTAOT"
 #define AOT_FORMAT_VERSION 2U
-#define AOT_EMITTER_EPOCH 3U
+#define AOT_EMITTER_EPOCH 4U
 #define AOT_MAX_RELOCS_PER_BLOCK 512U
 #define AOT_DEFAULT_MAX_BYTES (512ULL << 20) // 512 MiB default disk budget (covers full OS + heavy workloads)
 #define AOT_NO_PATCH_WORD 0xFFFFU
@@ -64,6 +64,10 @@ typedef struct {
 #define AOT_MODE_ISA_I8MM        (1U << 25)  // tr_has_isa_i8mm (FEAT_I8MM: USDOT/SUDOT)
 #define AOT_MODE_HW_POPCNT       (1U << 26)  // tr_opt_hw_popcnt (Ring-3 NEON CNT/ADDV POPCNT)
 #define AOT_MODE_INLINE_PIC      (1U << 27)  // tr_opt_inline_pic (monomorphic inline PIC for JMPI/CALLI)
+#define AOT_MODE_NO_DEAD_YMM_Z   (1U << 28)  // LC_HVDBT_NO_DEAD_YMM_ZERO=1
+#define AOT_MODE_NO_SDOT_GEMM    (1U << 29)  // LC_HVDBT_NO_SDOT_GEMM=1
+#define AOT_MODE_T2_MAX96        (1U << 30)  // LC_HVDBT_T2_MAX96=1
+#define AOT_MODE_T2_NO_WIDE_POOL (1U << 31)  // LC_HVDBT_T2_NO_WIDE_POOL=1
 
 // Record persistence priority (higher persisted first; Tier-2 never evicted by Tier-1).
 typedef enum {

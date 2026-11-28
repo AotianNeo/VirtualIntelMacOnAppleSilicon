@@ -173,14 +173,15 @@ _mon_fp_restore:
     ldp q14, q15, [x0, #224]
     ret
 
-// Tier-2 resident YMM8..15 pool reader ({q24, q25, q29, q31} -> 64B buffer in x0).
-// Monitor C code is built with -mgeneral-regs-only and SAVE_ALL/mon_fp_save never touch q24/q25/q29/q31,
+// Tier-2 resident YMM8..15 pool reader ({q24, q25, q26, q29, q30, q31} -> 96B buffer in x0).
+// Index: 0=q24, 1=q25, 2=q26, 3=q29, 4=q30, 5=q31.
+// Monitor C code is built with -mgeneral-regs-only and SAVE_ALL/mon_fp_save never touch q24..q31,
 // so zero instructions are added to the normal trap path; called lazily only on Tier-2 body trap exit.
     .globl _mon_t2_read_pool
 _mon_t2_read_pool:
     stp q24, q25, [x0, #0]
-    str q29, [x0, #32]
-    str q31, [x0, #48]
+    stp q26, q29, [x0, #32]
+    stp q30, q31, [x0, #64]
     ret
 
 // ---- EL0 stubs. Fixed offsets, the translator calls them by address; see EngineLayout. ----

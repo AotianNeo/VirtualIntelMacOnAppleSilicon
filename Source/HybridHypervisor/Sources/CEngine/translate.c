@@ -100,6 +100,7 @@ bool tr_precise_flags, tr_has_tzcnt, tr_hybrid, tr_no_bulk_rep;
 bool tr_fpcr_merges_scalar;
 bool tr_has_isa_dp, tr_has_isa_i8mm;
 bool tr_opt_hw_popcnt = true, tr_opt_inline_pic = true;
+bool tr_opt_dead_ymm_zero = true, tr_opt_sdot_gemm = true;
 static bool tr_no_isa_dp, tr_no_isa_i8mm;
 bool tr_profile_shift_helpers;
 bool tr_inline_shr8;
@@ -1916,6 +1917,7 @@ static bool t2_loop_op_forbidden(const Insn *in) {
 static int t2_find_clean_loop(const Insn *list, int count, const int *tgt_idx) {
     if (!t2_enabled() || count < 2)
         return -1;
+    int max_body = t2_max_body_insns();
     int best_head = -1, best_len = 9999;
     for (int i = 0; i < count; i++) {
         u8 op = list[i].op;
@@ -1925,7 +1927,7 @@ static int t2_find_clean_loop(const Insn *list, int count, const int *tgt_idx) {
         if (h < 0 || h > i)
             continue;
         int len = i - h + 1;
-        if (len < 2 || len > 96 || len >= best_len)
+        if (len < 2 || len > max_body || len >= best_len)
             continue;
         bool ok = true;
         for (int j = h; j <= i; j++) {
@@ -1974,6 +1976,8 @@ static u32 aot_build_mode_bits(int cpl, bool compat, bool is_t2) {
     if (__atomic_load_n(&tr_has_isa_i8mm, __ATOMIC_RELAXED)) m |= AOT_MODE_ISA_I8MM;
     if (tr_opt_hw_popcnt) m |= AOT_MODE_HW_POPCNT;
     if (tr_opt_inline_pic) m |= AOT_MODE_INLINE_PIC;
+    if (!tr_opt_dead_ymm_zero) m |= AOT_MODE_NO_DEAD_YMM_Z;
+    if (!tr_opt_sdot_gemm) m |= AOT_MODE_NO_SDOT_GEMM;
     return m;
 }
 
@@ -2412,6 +2416,7 @@ static void emit_cold_block(int key, u64 rip, u64 page, int cpl, bool single, u6
         t2_patch_off = 0U;
 
     u32 pcm_n = 0;
+    int pcmap_suppress_until = -1;
     for (int i = 0; i < count; i++) {
         if (code_cap && (u32)(tr_cc - start) + 1024U >= code_cap) {
             out->overflow = true;
@@ -2428,6 +2433,7 @@ static void emit_cold_block(int key, u64 rip, u64 page, int cpl, bool single, u6
             }
             tr_ad_page = ~0ULL;
             tr_zext8 = tr_zext16 = 0;
+            pcmap_suppress_until = -1;
             ext_ymm_cache_reset();
         }
         if (ext_ymm_cache_has_dirty() &&
@@ -2451,7 +2457,7 @@ static void emit_cold_block(int key, u64 rip, u64 page, int cpl, bool single, u6
         if (i)
             block_stats_add_words(sdelta, list[i - 1].op, (u32)(tr_cc - insn_arm[i - 1]));
         block_stats_add_insn(sdelta, in->op);
-        if (!ext_ymm_cache_has_dirty()) {
+        if (!ext_ymm_cache_has_dirty() && i > pcmap_suppress_until) {
             if (pcm_cap && pcm_n >= pcm_cap) {
                 out->overflow = true;
                 return;
@@ -2467,7 +2473,21 @@ static void emit_cold_block(int key, u64 rip, u64 page, int cpl, bool single, u6
 
         // P1-A multi-instruction peephole fusions (adjacent non-target pairs).
         bool fused = false;
-        if (tr_opt_peep && !single && i + 1 < count && !is_target[i + 1] && in->next == list[i + 1].rip) {
+        if (tr_opt_peep && !single && in->op == OP_EXT) {
+            int sxt_consumed = 0, sxt_dead_until = -1;
+            if (ext_try_emit_sxt_madd_dot(list, i, count, is_target, &sxt_consumed, &sxt_dead_until)) {
+                for (int k = 1; k < sxt_consumed; k++) {
+                    insn_arm[i + k] = insn_arm[i];
+                    block_stats_add_insn(sdelta, list[i + k].op);
+                }
+                if (sxt_dead_until > pcmap_suppress_until)
+                    pcmap_suppress_until = sxt_dead_until;
+                tr_zext8 = tr_zext16 = 0;
+                i += sxt_consumed - 1;
+                fused = true;
+            }
+        }
+        if (!fused && tr_opt_peep && !single && i + 1 < count && !is_target[i + 1] && in->next == list[i + 1].rip) {
             const Insn *nx = &list[i + 1];
             int madd_consumed = 0;
             // 0) Fused VPMADDUBSW+VPMADDWD(+VPADDD) / PMADDUBSW+PMADDWD(+PADDD) -> hardware USDOT/SDOT.
@@ -2755,7 +2775,18 @@ static void emit_cold_block(int key, u64 rip, u64 page, int cpl, bool single, u6
                     tr_zext8 = tr_zext16 = 0;
                     break;
                 case OP_EXT:
+                    if (!single && tr_opt_dead_ymm_zero && in->ext.op_cnt >= 2 &&
+                        in->ext.op_type[0] == EXT_OP_VEC && in->ext.op_bytes[0] == 16) {
+                        int dr = in->ext.op_reg[0];
+                        int dk = ext_ymm_hi_dead_until(list, i, count, is_target, dr);
+                        if (dk > i) {
+                            tr_dead_ymm_hi_mask = (u16)(1u << dr);
+                            if (dk > pcmap_suppress_until)
+                                pcmap_suppress_until = dk;
+                        }
+                    }
                     emit_ext(in, live_after[i]);
+                    tr_dead_ymm_hi_mask = 0;
                     tr_zext8 = tr_zext16 = 0;
                     break;
                 case OP_SYSCALL:
@@ -4091,6 +4122,7 @@ static TrResult do_translate(int key, int view, u64 cr3, int cpl, u64 rip, bool 
     if (t2_head_i == 0)
         t2_patch_word = (u32)(start - cc_base);
 
+    int pcmap_suppress_until = -1;
     for (int i = 0; i < count; i++) {
         const Insn *in = &list[i];
         bool prev_fell_through = i > 0 && !is_uncond_term_op(list[i - 1].op) && list[i - 1].next == in->rip;
@@ -4103,6 +4135,7 @@ static TrResult do_translate(int key, int view, u64 cr3, int cpl, u64 rip, bool 
             }
             tr_ad_page = ~0ULL;
             tr_zext8 = tr_zext16 = 0;
+            pcmap_suppress_until = -1;
             ext_ymm_cache_reset();
         }
         if (ext_ymm_cache_has_dirty() &&
@@ -4128,7 +4161,7 @@ static TrResult do_translate(int key, int view, u64 cr3, int cpl, u64 rip, bool 
         if (i)
             stats.op_words[list[i - 1].op & 127] += (u64)(tr_cc - insn_arm[i - 1]);
         stats.op_insns[in->op & 127]++;
-        if (!ext_ymm_cache_has_dirty()) {
+        if (!ext_ymm_cache_has_dirty() && i > pcmap_suppress_until) {
             pc_map[*pcm_cursor_p].arm_word = (u16)(tr_cc - start);
             pc_map[*pcm_cursor_p].rip_off = (u16)(in->rip - rip);
             (*pcm_cursor_p)++;
@@ -4141,7 +4174,22 @@ static TrResult do_translate(int key, int view, u64 cr3, int cpl, u64 rip, bool 
 
         // P1-A multi-instruction peephole fusions (adjacent non-target pairs).
         bool fused = false;
-        if (tr_opt_peep && !single && i + 1 < count && !is_target[i + 1] && in->next == list[i + 1].rip) {
+        if (tr_opt_peep && !single && in->op == OP_EXT) {
+            int sxt_consumed = 0, sxt_dead_until = -1;
+            if (ext_try_emit_sxt_madd_dot(list, i, count, is_target, &sxt_consumed, &sxt_dead_until)) {
+                for (int k = 1; k < sxt_consumed; k++) {
+                    insn_arm[i + k] = insn_arm[i];
+                    stats.op_insns[list[i + k].op & 127]++;
+                    stats.insns++;
+                }
+                if (sxt_dead_until > pcmap_suppress_until)
+                    pcmap_suppress_until = sxt_dead_until;
+                tr_zext8 = tr_zext16 = 0;
+                i += sxt_consumed - 1;
+                fused = true;
+            }
+        }
+        if (!fused && tr_opt_peep && !single && i + 1 < count && !is_target[i + 1] && in->next == list[i + 1].rip) {
             const Insn *nx = &list[i + 1];
             int madd_consumed = 0;
             // 0) Fused VPMADDUBSW+VPMADDWD(+VPADDD) / PMADDUBSW+PMADDWD(+PADDD) -> hardware USDOT/SDOT.
@@ -4439,7 +4487,18 @@ static TrResult do_translate(int key, int view, u64 cr3, int cpl, u64 rip, bool 
                     tr_zext8 = tr_zext16 = 0;
                     break;
                 case OP_EXT:
+                    if (!single && tr_opt_dead_ymm_zero && in->ext.op_cnt >= 2 &&
+                        in->ext.op_type[0] == EXT_OP_VEC && in->ext.op_bytes[0] == 16) {
+                        int dr = in->ext.op_reg[0];
+                        int dk = ext_ymm_hi_dead_until(list, i, count, is_target, dr);
+                        if (dk > i) {
+                            tr_dead_ymm_hi_mask = (u16)(1u << dr);
+                            if (dk > pcmap_suppress_until)
+                                pcmap_suppress_until = dk;
+                        }
+                    }
                     emit_ext(in, live_after[i]);
+                    tr_dead_ymm_hi_mask = 0;
                     tr_zext8 = tr_zext16 = 0;
                     break;
                 case OP_SYSCALL:
@@ -5271,6 +5330,10 @@ void tr_init(const TrConfig *config) {
     tr_opt_hw_popcnt = !(no_hw_popcnt && !strcmp(no_hw_popcnt, "1"));
     const char *no_inline_pic = getenv("LC_HVDBT_NO_INLINE_PIC");
     tr_opt_inline_pic = !(no_inline_pic && !strcmp(no_inline_pic, "1"));
+    const char *no_dead_ymm_z = getenv("LC_HVDBT_NO_DEAD_YMM_ZERO");
+    tr_opt_dead_ymm_zero = !(no_dead_ymm_z && !strcmp(no_dead_ymm_z, "1"));
+    const char *no_sdot_gemm = getenv("LC_HVDBT_NO_SDOT_GEMM");
+    tr_opt_sdot_gemm = !(no_sdot_gemm && !strcmp(no_sdot_gemm, "1"));
     no_uframe_share = getenv("LC_HVDBT_NO_USER_FRAME_SHARE") != NULL;
     x86_decode_init();
     memset(tr_frame_inval_gen, 0, sizeof tr_frame_inval_gen);

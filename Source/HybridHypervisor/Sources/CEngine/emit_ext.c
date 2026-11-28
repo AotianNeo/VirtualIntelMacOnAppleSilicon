@@ -85,8 +85,10 @@ static inline int ymm_resident(int reg) {
     return reg < 8 ? 16 + reg : -1;
 }
 
-#define YMM_CACHE_SLOTS 4
-static const u8 ymm_pool_vreg[YMM_CACHE_SLOTS] = {24, 25, 29, 31};
+#define YMM_CACHE_BASE_SLOTS 4
+#define YMM_CACHE_SLOTS ((int)T2_MAX_YMM_SLOTS)
+static _Thread_local u8 ymm_pool_vreg[YMM_CACHE_SLOTS];
+static _Thread_local int ymm_active_slots;
 typedef struct {
     int8_t xreg; // 8..15, or -1 if empty
     bool dirty;
@@ -97,12 +99,39 @@ static _Thread_local u32 ymm_cache_clk;
 static _Thread_local u16 ymm_zero_mask; // bit r (0..15): architectural ymm_hi[r] is known all-zero
 static _Thread_local u16 ymm_allones128_mask, ymm_allones256_mask; // bit r: reg known all-0xFFFF (from vpcmpeqw r,x,x)
 static _Thread_local u16 ymm_ones16_128_mask, ymm_ones16_256_mask; // bit r: reg known all-0x0001 i16 lanes
+static _Thread_local u16 ymm_bcast16_mask;       // bit r: xmm[r] holds 8 identical 16-bit elements (from vpbroadcastw)
+static _Thread_local u16 ymm_sxt8_128_mask;      // bit r: xmm[r] holds 8 sign-extended i8->i16 lanes (from vpmovsxbw)
+static _Thread_local u16 ymm_sxt8_256_mask;      // bit r: ymm[r] holds 16 sign-extended i8->i16 lanes (from vpmovsxbw)
+static _Thread_local u16 ymm_sxt8_bcast16_mask;  // bit r: ymm[r] holds 16 sign-extended i8->i16 lanes repeating [a0,a1] (ymm_hi == xmm)
+_Thread_local u16 tr_dead_ymm_hi_mask;           // bit r: next non-faulting insn(s) overwrite ymm_hi[r] before read/PcMap
 static _Thread_local int ymm_dirty_run_cnt;
-static _Thread_local u8 ymm_pinned_mask; // bit s (0..3): Preheader-pinned slot (never evicted/dropped inside loop)
-static _Thread_local u8 ymm_t2_resident_mask; // bit s (0..3): Tier-2 full RW resident slot (trap-synced via T2TrapMeta)
+static _Thread_local u8 ymm_pinned_mask; // bit s (0..7): Preheader-pinned slot (never evicted/dropped inside loop)
+static _Thread_local u8 ymm_t2_resident_mask; // bit s (0..7): Tier-2 full RW resident slot (trap-synced via T2TrapMeta)
 static _Thread_local int ymm_dirty_run_limit = 8;
 
+static inline void ymm_pool_ensure_init(void) {
+    if (__builtin_expect(ymm_active_slots <= 0, 0)) {
+        ymm_active_slots = YMM_CACHE_BASE_SLOTS;
+        ymm_pool_vreg[0] = 24;
+        ymm_pool_vreg[1] = 25;
+        ymm_pool_vreg[2] = 29;
+        ymm_pool_vreg[3] = 31;
+        for (int s = 0; s < YMM_CACHE_SLOTS; s++) {
+            ymm_cache[s].xreg = -1;
+            ymm_cache[s].dirty = false;
+            ymm_cache[s].age = 0;
+        }
+    }
+}
+
 void ext_ymm_cache_reset(void) {
+    ymm_active_slots = YMM_CACHE_BASE_SLOTS;
+    ymm_pool_vreg[0] = 24;
+    ymm_pool_vreg[1] = 25;
+    ymm_pool_vreg[2] = 29;
+    ymm_pool_vreg[3] = 31;
+    for (int s = YMM_CACHE_BASE_SLOTS; s < YMM_CACHE_SLOTS; s++)
+        ymm_pool_vreg[s] = 0;
     for (int s = 0; s < YMM_CACHE_SLOTS; s++) {
         ymm_cache[s].xreg = -1;
         ymm_cache[s].dirty = false;
@@ -111,6 +140,9 @@ void ext_ymm_cache_reset(void) {
     ymm_zero_mask = 0;
     ymm_allones128_mask = ymm_allones256_mask = 0;
     ymm_ones16_128_mask = ymm_ones16_256_mask = 0;
+    ymm_bcast16_mask = 0;
+    ymm_sxt8_128_mask = ymm_sxt8_256_mask = ymm_sxt8_bcast16_mask = 0;
+    tr_dead_ymm_hi_mask = 0;
     ymm_dirty_run_cnt = 0;
     ymm_pinned_mask = 0;
     ymm_t2_resident_mask = 0;
@@ -118,7 +150,8 @@ void ext_ymm_cache_reset(void) {
 }
 
 void ext_ymm_cache_reset_unpinned(void) {
-    for (int s = 0; s < YMM_CACHE_SLOTS; s++) {
+    ymm_pool_ensure_init();
+    for (int s = 0; s < ymm_active_slots; s++) {
         if (ymm_pinned_mask & (1u << s))
             continue;
         ymm_cache[s].xreg = -1;
@@ -128,7 +161,38 @@ void ext_ymm_cache_reset_unpinned(void) {
     ymm_zero_mask = 0;
     ymm_allones128_mask = ymm_allones256_mask = 0;
     ymm_ones16_128_mask = ymm_ones16_256_mask = 0;
+    ymm_bcast16_mask = 0;
+    ymm_sxt8_128_mask = ymm_sxt8_256_mask = ymm_sxt8_bcast16_mask = 0;
+    tr_dead_ymm_hi_mask = 0;
     ymm_dirty_run_cnt = 0;
+}
+
+void ext_ymm_cache_add_pool_vreg(u8 vreg) {
+    ymm_pool_ensure_init();
+    if (ymm_active_slots >= YMM_CACHE_SLOTS)
+        return;
+    for (int s = 0; s < ymm_active_slots; s++)
+        if (ymm_pool_vreg[s] == vreg)
+            return;
+    int slot = ymm_active_slots++;
+    ymm_pool_vreg[slot] = vreg;
+    ymm_cache[slot].xreg = -1;
+    ymm_cache[slot].dirty = false;
+    ymm_cache[slot].age = 0;
+}
+
+void ext_emit_t2_borrow_save(int idx, u8 vreg) {
+    if (idx < 0 || idx >= (int)T2_MAX_BORROW_XMM || vreg >= 16)
+        return;
+    u32 off = (u32)(offsetof(EngineCtx, t2_saved_xmm) + (size_t)idx * 16);
+    VSTR128_U12(vreg, CTX, off);
+}
+
+void ext_emit_t2_borrow_restore(int idx, u8 vreg) {
+    if (idx < 0 || idx >= (int)T2_MAX_BORROW_XMM || vreg >= 16)
+        return;
+    u32 off = (u32)(offsetof(EngineCtx, t2_saved_xmm) + (size_t)idx * 16);
+    VLDR128_U12(vreg, CTX, off);
 }
 
 void ext_ymm_set_dirty_limit(int limit) {
@@ -136,15 +200,16 @@ void ext_ymm_set_dirty_limit(int limit) {
 }
 
 void ext_ymm_cache_pin_ro(int xreg) {
+    ymm_pool_ensure_init();
     if (!tr_opt_ymm_cache || xreg < 8 || xreg > 15)
         return;
-    for (int s = 0; s < YMM_CACHE_SLOTS; s++) {
+    for (int s = 0; s < ymm_active_slots; s++) {
         if (ymm_cache[s].xreg == (int8_t)xreg) {
             ymm_pinned_mask |= (u8)(1u << s);
             return;
         }
     }
-    for (int s = 0; s < YMM_CACHE_SLOTS; s++) {
+    for (int s = 0; s < ymm_active_slots; s++) {
         if (!(ymm_pinned_mask & (1u << s)) && ymm_cache[s].xreg < 0) {
             int vreg = ymm_pool_vreg[s];
             VLDR128_U12(vreg, CTX, ymm_hi_off(xreg));
@@ -158,9 +223,10 @@ void ext_ymm_cache_pin_ro(int xreg) {
 }
 
 void ext_ymm_cache_pin_rw(int xreg) {
+    ymm_pool_ensure_init();
     if (!tr_opt_ymm_cache || xreg < 8 || xreg > 15)
         return;
-    for (int s = 0; s < YMM_CACHE_SLOTS; s++) {
+    for (int s = 0; s < ymm_active_slots; s++) {
         if (ymm_cache[s].xreg == (int8_t)xreg) {
             ymm_pinned_mask |= (u8)(1u << s);
             ymm_t2_resident_mask |= (u8)(1u << s);
@@ -168,7 +234,7 @@ void ext_ymm_cache_pin_rw(int xreg) {
             return;
         }
     }
-    for (int s = 0; s < YMM_CACHE_SLOTS; s++) {
+    for (int s = 0; s < ymm_active_slots; s++) {
         if (!(ymm_pinned_mask & (1u << s)) && ymm_cache[s].xreg < 0) {
             int vreg = ymm_pool_vreg[s];
             // Always preload entry value so a #PF/trap before the first write in Iter 0 reconstructs exact state.
@@ -183,28 +249,35 @@ void ext_ymm_cache_pin_rw(int xreg) {
     }
 }
 
-void ext_ymm_cache_get_resident_map(u8 out_regs[4]) {
-    for (int s = 0; s < YMM_CACHE_SLOTS; s++) {
-        out_regs[s] = ((ymm_t2_resident_mask & (1u << s)) && ymm_cache[s].xreg >= 8)
-                          ? (u8)ymm_cache[s].xreg
-                          : 0;
+void ext_ymm_cache_get_resident_map(u8 out_regs[T2_MAX_YMM_SLOTS], u8 out_vregs[T2_MAX_YMM_SLOTS]) {
+    ymm_pool_ensure_init();
+    for (int s = 0; s < (int)T2_MAX_YMM_SLOTS; s++) {
+        if (s < ymm_active_slots && (ymm_t2_resident_mask & (1u << s)) && ymm_cache[s].xreg >= 8) {
+            out_regs[s] = (u8)ymm_cache[s].xreg;
+            out_vregs[s] = ymm_pool_vreg[s];
+        } else {
+            out_regs[s] = 0;
+            out_vregs[s] = 0;
+        }
     }
 }
 
 void ext_ymm_emit_resident_flush(u8 wr_mask) {
-    for (int s = 0; s < YMM_CACHE_SLOTS; s++) {
+    ymm_pool_ensure_init();
+    for (int s = 0; s < ymm_active_slots; s++) {
         if ((ymm_t2_resident_mask & (1u << s)) && (wr_mask & (1u << s)) && ymm_cache[s].xreg >= 8)
             VSTR128_U12(ymm_pool_vreg[s], CTX, ymm_hi_off(ymm_cache[s].xreg));
     }
 }
 
 void ext_ymm_cache_preload_clean(int xreg) {
+    ymm_pool_ensure_init();
     if (!tr_opt_ymm_cache || xreg < 8 || xreg > 15)
         return;
-    for (int s = 0; s < YMM_CACHE_SLOTS; s++)
+    for (int s = 0; s < ymm_active_slots; s++)
         if (ymm_cache[s].xreg == (int8_t)xreg)
             return;
-    for (int s = 0; s < YMM_CACHE_SLOTS; s++) {
+    for (int s = 0; s < ymm_active_slots; s++) {
         if (!(ymm_pinned_mask & (1u << s)) && ymm_cache[s].xreg < 0) {
             int vreg = ymm_pool_vreg[s];
             VLDR128_U12(vreg, CTX, ymm_hi_off(xreg));
@@ -217,7 +290,7 @@ void ext_ymm_cache_preload_clean(int xreg) {
 }
 
 bool ext_ymm_cache_has_dirty(void) {
-    for (int s = 0; s < YMM_CACHE_SLOTS; s++)
+    for (int s = 0; s < ymm_active_slots; s++)
         if (!(ymm_t2_resident_mask & (1u << s)) && ymm_cache[s].xreg >= 8 && ymm_cache[s].dirty)
             return true;
     return false;
@@ -227,9 +300,9 @@ int ext_ymm_cache_dirty_run(void) {
     return ymm_dirty_run_cnt;
 }
 
-int ext_ymm_cache_snapshot_dirty(u8 vregs[4], u8 xregs[4]) {
+int ext_ymm_cache_snapshot_dirty(u8 vregs[T2_MAX_YMM_SLOTS], u8 xregs[T2_MAX_YMM_SLOTS]) {
     int n = 0;
-    for (int s = 0; s < YMM_CACHE_SLOTS; s++) {
+    for (int s = 0; s < ymm_active_slots; s++) {
         if (!(ymm_t2_resident_mask & (1u << s)) && ymm_cache[s].xreg >= 8 && ymm_cache[s].dirty) {
             vregs[n] = ymm_pool_vreg[s];
             xregs[n] = (u8)ymm_cache[s].xreg;
@@ -239,13 +312,13 @@ int ext_ymm_cache_snapshot_dirty(u8 vregs[4], u8 xregs[4]) {
     return n;
 }
 
-void ext_ymm_emit_flush_list(int cnt, const u8 vregs[4], const u8 xregs[4]) {
+void ext_ymm_emit_flush_list(int cnt, const u8 vregs[T2_MAX_YMM_SLOTS], const u8 xregs[T2_MAX_YMM_SLOTS]) {
     for (int i = 0; i < cnt; i++)
         VSTR128_U12(vregs[i], CTX, ymm_hi_off(xregs[i]));
 }
 
 void ext_ymm_cache_flush_dirty(void) {
-    for (int s = 0; s < YMM_CACHE_SLOTS; s++) {
+    for (int s = 0; s < ymm_active_slots; s++) {
         if (!(ymm_t2_resident_mask & (1u << s)) && ymm_cache[s].xreg >= 8 && ymm_cache[s].dirty) {
             VSTR128_U12(ymm_pool_vreg[s], CTX, ymm_hi_off(ymm_cache[s].xreg));
             ymm_cache[s].dirty = false;
@@ -255,7 +328,7 @@ void ext_ymm_cache_flush_dirty(void) {
 }
 
 void ext_ymm_cache_flush_and_drop(void) {
-    for (int s = 0; s < YMM_CACHE_SLOTS; s++) {
+    for (int s = 0; s < ymm_active_slots; s++) {
         if (ymm_cache[s].xreg >= 8 && (ymm_cache[s].dirty || (ymm_t2_resident_mask & (1u << s))))
             VSTR128_U12(ymm_pool_vreg[s], CTX, ymm_hi_off(ymm_cache[s].xreg));
         ymm_cache[s].xreg = -1;
@@ -263,13 +336,16 @@ void ext_ymm_cache_flush_and_drop(void) {
     }
     ymm_allones128_mask = ymm_allones256_mask = 0;
     ymm_ones16_128_mask = ymm_ones16_256_mask = 0;
+    ymm_bcast16_mask = 0;
+    ymm_sxt8_128_mask = ymm_sxt8_256_mask = ymm_sxt8_bcast16_mask = 0;
+    tr_dead_ymm_hi_mask = 0;
     ymm_dirty_run_cnt = 0;
     ymm_pinned_mask = 0;
     ymm_t2_resident_mask = 0;
 }
 
 static void ymm_cache_evict_vreg(int vreg) {
-    for (int s = 0; s < YMM_CACHE_SLOTS; s++) {
+    for (int s = 0; s < ymm_active_slots; s++) {
         if (ymm_pool_vreg[s] == (u8)vreg) {
             if (ymm_cache[s].xreg >= 8 && (ymm_cache[s].dirty || (ymm_t2_resident_mask & (1u << s))))
                 VSTR128_U12(vreg, CTX, ymm_hi_off(ymm_cache[s].xreg));
@@ -283,7 +359,7 @@ static void ymm_cache_evict_vreg(int vreg) {
 }
 
 static void ymm_cache_drop_xreg(int reg) {
-    for (int s = 0; s < YMM_CACHE_SLOTS; s++) {
+    for (int s = 0; s < ymm_active_slots; s++) {
         if (ymm_cache[s].xreg == (int8_t)reg) {
             if (ymm_t2_resident_mask & (1u << s))
                 return;
@@ -296,7 +372,7 @@ static void ymm_cache_drop_xreg(int reg) {
 }
 
 // Acquire a physical NEON register holding ymm_hi[reg] (0..15).
-// For reg < 8 returns v16+reg. For reg >= 8 uses the 4-slot dynamic pool when tr_opt_ymm_cache is enabled.
+// For reg < 8 returns v16+reg. For reg >= 8 uses the dynamic pool (4 slots in T1, up to 8 in T2).
 static int ymm_cache_get(int reg, bool load_if_miss, bool will_write, u8 *pin_mask) {
     int home = ymm_resident(reg);
     if (home >= 0) {
@@ -306,7 +382,8 @@ static int ymm_cache_get(int reg, bool load_if_miss, bool will_write, u8 *pin_ma
     }
     if (!tr_opt_ymm_cache)
         return -1;
-    for (int s = 0; s < YMM_CACHE_SLOTS; s++) {
+    ymm_pool_ensure_init();
+    for (int s = 0; s < ymm_active_slots; s++) {
         if (ymm_cache[s].xreg == (int8_t)reg) {
             ymm_cache[s].age = ++ymm_cache_clk;
             if (will_write) {
@@ -322,7 +399,7 @@ static int ymm_cache_get(int reg, bool load_if_miss, bool will_write, u8 *pin_ma
         }
     }
     int pick = -1;
-    for (int s = 0; s < YMM_CACHE_SLOTS; s++) {
+    for (int s = 0; s < ymm_active_slots; s++) {
         if (ymm_pinned_mask & (1u << s))
             continue;
         if (pin_mask && (*pin_mask & (1u << s)))
@@ -358,8 +435,15 @@ static int ymm_cache_get(int reg, bool load_if_miss, bool will_write, u8 *pin_ma
 }
 
 static inline void ymm_zero_hi(int reg) {
+    if (__builtin_expect((tr_dead_ymm_hi_mask & (1u << reg)) != 0, 0)) {
+        // Subsequent non-faulting instruction(s) inside this PcMap-atomic span overwrite ymm_hi[reg] completely.
+        ymm_zero_mask &= (u16)~(1u << reg);
+        if (reg >= 8)
+            ymm_cache_drop_xreg(reg);
+        return;
+    }
     if (reg >= 8 && ymm_t2_resident_mask) {
-        for (int s = 0; s < YMM_CACHE_SLOTS; s++) {
+        for (int s = 0; s < ymm_active_slots; s++) {
             if ((ymm_t2_resident_mask & (1u << s)) && ymm_cache[s].xreg == (int8_t)reg) {
                 if (!(tr_opt_ymm_cache && (ymm_zero_mask & (1u << reg)))) {
                     int vreg = ymm_pool_vreg[s];
@@ -399,7 +483,7 @@ static inline void ymm_load_hi(int vtmp, int reg) {
         return;
     }
     if (reg >= 8 && ymm_t2_resident_mask) {
-        for (int s = 0; s < YMM_CACHE_SLOTS; s++) {
+        for (int s = 0; s < ymm_active_slots; s++) {
             if ((ymm_t2_resident_mask & (1u << s)) && ymm_cache[s].xreg == (int8_t)reg) {
                 int vreg = ymm_pool_vreg[s];
                 if (vtmp != vreg)
@@ -424,7 +508,7 @@ static inline void ymm_store_hi(int vtmp, int reg) {
         return;
     }
     if (reg >= 8 && ymm_t2_resident_mask) {
-        for (int s = 0; s < YMM_CACHE_SLOTS; s++) {
+        for (int s = 0; s < ymm_active_slots; s++) {
             if ((ymm_t2_resident_mask & (1u << s)) && ymm_cache[s].xreg == (int8_t)reg) {
                 int vreg = ymm_pool_vreg[s];
                 if (vtmp != vreg)
@@ -2912,6 +2996,89 @@ bool ext_insn_keeps_ymm_cache(const Insn *in) {
     }
 }
 
+bool ext_insn_v26_free(const Insn *in) {
+    if (in->op != OP_EXT || !ext_insn_keeps_ymm_cache(in))
+        return false;
+    const ExtDecoded *ex = &in->ext;
+    ZydisMnemonic mnem = (ZydisMnemonic)ex->mnem;
+    int fma_ord = 0, fma_kind = 0;
+    bool fma_sc = false, fma_dbl = false;
+    if (is_fma_mnemonic(mnem, &fma_ord, &fma_kind, &fma_sc, &fma_dbl))
+        return !in->memop || ex->op_bytes[0] != 32;
+    if (is_lanewise_vex(mnem))
+        return !in->memop || ex->op_bytes[0] != 32;
+    switch (mnem) {
+        case ZYDIS_MNEMONIC_ANDN: case ZYDIS_MNEMONIC_BEXTR: case ZYDIS_MNEMONIC_BLSI:
+        case ZYDIS_MNEMONIC_BLSMSK: case ZYDIS_MNEMONIC_BLSR: case ZYDIS_MNEMONIC_BZHI:
+        case ZYDIS_MNEMONIC_MULX: case ZYDIS_MNEMONIC_RORX: case ZYDIS_MNEMONIC_SARX:
+        case ZYDIS_MNEMONIC_SHLX: case ZYDIS_MNEMONIC_SHRX: case ZYDIS_MNEMONIC_PDEP:
+        case ZYDIS_MNEMONIC_PEXT: case ZYDIS_MNEMONIC_ADCX: case ZYDIS_MNEMONIC_ADOX:
+        case ZYDIS_MNEMONIC_VMOVAPS: case ZYDIS_MNEMONIC_VMOVAPD:
+        case ZYDIS_MNEMONIC_VMOVUPS: case ZYDIS_MNEMONIC_VMOVUPD:
+        case ZYDIS_MNEMONIC_VMOVDQA: case ZYDIS_MNEMONIC_VMOVDQU:
+        case ZYDIS_MNEMONIC_VMOVNTDQ: case ZYDIS_MNEMONIC_VMOVNTDQA:
+        case ZYDIS_MNEMONIC_VMOVNTPS: case ZYDIS_MNEMONIC_VMOVNTPD:
+        case ZYDIS_MNEMONIC_VLDDQU:
+        case ZYDIS_MNEMONIC_VMOVSS: case ZYDIS_MNEMONIC_VMOVSD:
+        case ZYDIS_MNEMONIC_VMOVD: case ZYDIS_MNEMONIC_VMOVQ:
+        case ZYDIS_MNEMONIC_VMOVLPS: case ZYDIS_MNEMONIC_VMOVLPD:
+        case ZYDIS_MNEMONIC_VMOVHPS: case ZYDIS_MNEMONIC_VMOVHPD:
+        case ZYDIS_MNEMONIC_VMOVLHPS: case ZYDIS_MNEMONIC_VMOVHLPS:
+        case ZYDIS_MNEMONIC_VADDSS: case ZYDIS_MNEMONIC_VADDSD:
+        case ZYDIS_MNEMONIC_VSUBSS: case ZYDIS_MNEMONIC_VSUBSD:
+        case ZYDIS_MNEMONIC_VMULSS: case ZYDIS_MNEMONIC_VMULSD:
+        case ZYDIS_MNEMONIC_VDIVSS: case ZYDIS_MNEMONIC_VDIVSD:
+        case ZYDIS_MNEMONIC_VMINSS: case ZYDIS_MNEMONIC_VMINSD:
+        case ZYDIS_MNEMONIC_VMAXSS: case ZYDIS_MNEMONIC_VMAXSD:
+        case ZYDIS_MNEMONIC_VSQRTSS: case ZYDIS_MNEMONIC_VSQRTSD:
+        case ZYDIS_MNEMONIC_VRSQRTSS: case ZYDIS_MNEMONIC_VRCPSS:
+        case ZYDIS_MNEMONIC_VCVTSI2SS: case ZYDIS_MNEMONIC_VCVTSI2SD:
+        case ZYDIS_MNEMONIC_VCVTSS2SI: case ZYDIS_MNEMONIC_VCVTTSS2SI:
+        case ZYDIS_MNEMONIC_VCVTSD2SI: case ZYDIS_MNEMONIC_VCVTTSD2SI:
+        case ZYDIS_MNEMONIC_VCVTSS2SD: case ZYDIS_MNEMONIC_VCVTSD2SS:
+        case ZYDIS_MNEMONIC_VUCOMISS: case ZYDIS_MNEMONIC_VUCOMISD:
+        case ZYDIS_MNEMONIC_VCOMISS: case ZYDIS_MNEMONIC_VCOMISD:
+        case ZYDIS_MNEMONIC_VBROADCASTF128: case ZYDIS_MNEMONIC_VBROADCASTI128:
+        case ZYDIS_MNEMONIC_VBROADCASTSS: case ZYDIS_MNEMONIC_VBROADCASTSD:
+        case ZYDIS_MNEMONIC_VPBROADCASTB: case ZYDIS_MNEMONIC_VPBROADCASTW:
+        case ZYDIS_MNEMONIC_VPBROADCASTD: case ZYDIS_MNEMONIC_VPBROADCASTQ:
+        case ZYDIS_MNEMONIC_VPEXTRB: case ZYDIS_MNEMONIC_VPEXTRW:
+        case ZYDIS_MNEMONIC_VPEXTRD: case ZYDIS_MNEMONIC_VPEXTRQ:
+        case ZYDIS_MNEMONIC_VPINSRB: case ZYDIS_MNEMONIC_VPINSRW:
+        case ZYDIS_MNEMONIC_VPINSRD: case ZYDIS_MNEMONIC_VPINSRQ:
+        case ZYDIS_MNEMONIC_VINSERTPS: case ZYDIS_MNEMONIC_VEXTRACTPS:
+        case ZYDIS_MNEMONIC_VROUNDSS: case ZYDIS_MNEMONIC_VROUNDSD:
+        case ZYDIS_MNEMONIC_VPMOVSXBW: case ZYDIS_MNEMONIC_VPMOVSXBD: case ZYDIS_MNEMONIC_VPMOVSXBQ:
+        case ZYDIS_MNEMONIC_VPMOVSXWD: case ZYDIS_MNEMONIC_VPMOVSXWQ: case ZYDIS_MNEMONIC_VPMOVSXDQ:
+        case ZYDIS_MNEMONIC_VPMOVZXBW: case ZYDIS_MNEMONIC_VPMOVZXBD: case ZYDIS_MNEMONIC_VPMOVZXBQ:
+        case ZYDIS_MNEMONIC_VPMOVZXWD: case ZYDIS_MNEMONIC_VPMOVZXWQ: case ZYDIS_MNEMONIC_VPMOVZXDQ:
+        case ZYDIS_MNEMONIC_VPMOVMSKB: case ZYDIS_MNEMONIC_VMOVMSKPS: case ZYDIS_MNEMONIC_VMOVMSKPD:
+            return true;
+        case ZYDIS_MNEMONIC_VPTEST:
+        case ZYDIS_MNEMONIC_VCVTDQ2PS: case ZYDIS_MNEMONIC_VCVTPS2DQ: case ZYDIS_MNEMONIC_VCVTTPS2DQ:
+            return !in->memop || ex->op_bytes[0] != 32;
+        default:
+            return false;
+    }
+}
+
+u16 ext_insn_touched_vecs(const Insn *in) {
+    if (in->op == OP_SSE || in->op == OP_X87 || in->op == OP_FXSAVE || in->op == OP_FXRSTOR)
+        return 0xFFFFu;
+    if (in->op != OP_EXT)
+        return 0;
+    const ExtDecoded *ex = &in->ext;
+    ZydisMnemonic mnem = (ZydisMnemonic)ex->mnem;
+    if (mnem == ZYDIS_MNEMONIC_VZEROUPPER || mnem == ZYDIS_MNEMONIC_VZEROALL)
+        return 0xFFFFu;
+    u16 m = 0;
+    for (u8 i = 0; i < ex->op_cnt; i++) {
+        if (ex->op_type[i] == EXT_OP_VEC)
+            m |= (u16)(1u << ex->op_reg[i]);
+    }
+    return m;
+}
+
 void ext_insn_ymm_rw(const Insn *in, u16 *out_read_256, u16 *out_write_any) {
     u16 rd = 0, wr = 0;
     if (in->op != OP_EXT) {
@@ -3029,10 +3196,18 @@ static void ext_track_ones_mask(const Insn *in) {
     ext_insn_ymm_rw(in, &rd256, &wr_any);
     u16 prev_all128 = ymm_allones128_mask;
     u16 prev_all256 = ymm_allones256_mask;
+    u16 prev_bcast16 = ymm_bcast16_mask;
+    u16 prev_sxt8_128 = ymm_sxt8_128_mask;
+    u16 prev_sxt8_256 = ymm_sxt8_256_mask;
+    u16 prev_sxt8_b16 = ymm_sxt8_bcast16_mask;
     ymm_allones128_mask &= (u16)~wr_any;
     ymm_allones256_mask &= (u16)~wr_any;
     ymm_ones16_128_mask &= (u16)~wr_any;
     ymm_ones16_256_mask &= (u16)~wr_any;
+    ymm_bcast16_mask &= (u16)~wr_any;
+    ymm_sxt8_128_mask &= (u16)~wr_any;
+    ymm_sxt8_256_mask &= (u16)~wr_any;
+    ymm_sxt8_bcast16_mask &= (u16)~wr_any;
     const ExtDecoded *ex = &in->ext;
     ZydisMnemonic mnem = (ZydisMnemonic)ex->mnem;
     if (mnem == ZYDIS_MNEMONIC_VPCMPEQW && ex->op_cnt == 3 &&
@@ -3052,6 +3227,33 @@ static void ext_track_ones_mask(const Insn *in) {
             ymm_ones16_256_mask |= dbit;
         } else if (ex->op_bytes[0] == 16 && (prev_all128 & nbit)) {
             ymm_ones16_128_mask |= dbit;
+        }
+    } else if (mnem == ZYDIS_MNEMONIC_VPBROADCASTW && ex->op_cnt >= 2 &&
+               ex->op_type[0] == EXT_OP_VEC) {
+        ymm_bcast16_mask |= (u16)(1u << ex->op_reg[0]);
+    } else if (mnem == ZYDIS_MNEMONIC_VPMOVSXBW && ex->op_cnt >= 2 &&
+               ex->op_type[0] == EXT_OP_VEC) {
+        u16 dbit = (u16)(1u << ex->op_reg[0]);
+        ymm_sxt8_128_mask |= dbit;
+        if (ex->op_bytes[0] == 32) {
+            ymm_sxt8_256_mask |= dbit;
+            if (ex->op_type[1] == EXT_OP_VEC && (prev_bcast16 & (1u << ex->op_reg[1])))
+                ymm_sxt8_bcast16_mask |= dbit;
+        }
+    } else if ((mnem == ZYDIS_MNEMONIC_VMOVDQA || mnem == ZYDIS_MNEMONIC_VMOVDQU ||
+                mnem == ZYDIS_MNEMONIC_VMOVAPS || mnem == ZYDIS_MNEMONIC_VMOVUPS) &&
+               ex->op_cnt >= 2 && ex->op_type[0] == EXT_OP_VEC && ex->op_type[1] == EXT_OP_VEC) {
+        u16 dbit = (u16)(1u << ex->op_reg[0]);
+        u16 sbit = (u16)(1u << ex->op_reg[1]);
+        if (prev_bcast16 & sbit)
+            ymm_bcast16_mask |= dbit;
+        if (prev_sxt8_128 & sbit)
+            ymm_sxt8_128_mask |= dbit;
+        if (ex->op_bytes[0] == 32) {
+            if (prev_sxt8_256 & sbit)
+                ymm_sxt8_256_mask |= dbit;
+            if (prev_sxt8_b16 & sbit)
+                ymm_sxt8_bcast16_mask |= dbit;
         }
     }
 }
@@ -3754,10 +3956,11 @@ void emit_ext(const Insn *in, int live) {
                         u8 pin = 0;
                         int dh = ymm_cache_get(d, false, true, &pin);
                         if (tr_t2_mode) {
-                            // Cross-page #PF exactness: load into scratch pair before committing architectural d and resident dh.
-                            ext_load256_pair(in, V_MEM, V_S2);
+                            // Cross-page #PF exactness: load into scratch pair (V_MEM, T0) before committing d and dh;
+                            // uses T0 (v27) rather than V_S2 (v26) so v26 remains free for the Tier-2 YMM8..15 pool.
+                            ext_load256_pair(in, V_MEM, 27);
                             vmov128(d, V_MEM);
-                            vmov128(dh, V_S2);
+                            vmov128(dh, 27);
                         } else {
                             ext_load256_pair(in, d, dh);
                         }
@@ -5443,7 +5646,13 @@ static bool ext_vec_dead_after(const Insn *list, int after_idx, int count, const
              m == ZYDIS_MNEMONIC_VPBROADCASTW || m == ZYDIS_MNEMONIC_VPBROADCASTD ||
              m == ZYDIS_MNEMONIC_VPBROADCASTQ || m == ZYDIS_MNEMONIC_VBROADCASTSS ||
              m == ZYDIS_MNEMONIC_VBROADCASTSD || m == ZYDIS_MNEMONIC_VBROADCASTI128 ||
-             m == ZYDIS_MNEMONIC_VBROADCASTF128)) {
+             m == ZYDIS_MNEMONIC_VBROADCASTF128 ||
+             m == ZYDIS_MNEMONIC_VPMOVSXBW || m == ZYDIS_MNEMONIC_VPMOVSXBD ||
+             m == ZYDIS_MNEMONIC_VPMOVSXBQ || m == ZYDIS_MNEMONIC_VPMOVSXWD ||
+             m == ZYDIS_MNEMONIC_VPMOVSXWQ || m == ZYDIS_MNEMONIC_VPMOVSXDQ ||
+             m == ZYDIS_MNEMONIC_VPMOVZXBW || m == ZYDIS_MNEMONIC_VPMOVZXBD ||
+             m == ZYDIS_MNEMONIC_VPMOVZXBQ || m == ZYDIS_MNEMONIC_VPMOVZXWD ||
+             m == ZYDIS_MNEMONIC_VPMOVZXWQ || m == ZYDIS_MNEMONIC_VPMOVZXDQ)) {
             (void)bit;
             return true;
         }
@@ -5452,9 +5661,10 @@ static bool ext_vec_dead_after(const Insn *list, int after_idx, int count, const
 }
 
 static bool ymm_cache_can_hold_regs(u16 hi_mask) {
+    ymm_pool_ensure_init();
     u8 pinned_other = 0;
     u16 already_pinned = 0;
-    for (int s = 0; s < YMM_CACHE_SLOTS; s++) {
+    for (int s = 0; s < ymm_active_slots; s++) {
         if (ymm_pinned_mask & (1u << s)) {
             if (ymm_cache[s].xreg >= 8 && (hi_mask & (1u << ymm_cache[s].xreg)))
                 already_pinned |= (u16)(1u << ymm_cache[s].xreg);
@@ -5463,13 +5673,14 @@ static bool ymm_cache_can_hold_regs(u16 hi_mask) {
         }
     }
     int need = __builtin_popcount((unsigned)(hi_mask & ~already_pinned));
-    return need <= (YMM_CACHE_SLOTS - (int)pinned_other);
+    return need <= (ymm_active_slots - (int)pinned_other);
 }
 
 static bool ymm_reg_is_pinned(int xreg) {
     if (xreg < 8)
         return false;
-    for (int s = 0; s < YMM_CACHE_SLOTS; s++)
+    ymm_pool_ensure_init();
+    for (int s = 0; s < ymm_active_slots; s++)
         if ((ymm_pinned_mask & (1u << s)) && ymm_cache[s].xreg == (int8_t)xreg)
             return true;
     return false;
@@ -5558,6 +5769,10 @@ bool ext_try_emit_madd_dot(const Insn *list, int idx, int count, const bool *is_
         ymm_allones256_mask &= (u16)~clr;
         ymm_ones16_128_mask &= (u16)~clr;
         ymm_ones16_256_mask &= (u16)~clr;
+        ymm_bcast16_mask &= (u16)~clr;
+        ymm_sxt8_128_mask &= (u16)~clr;
+        ymm_sxt8_256_mask &= (u16)~clr;
+        ymm_sxt8_bcast16_mask &= (u16)~clr;
         *out_consumed = consumed;
         return true;
     }
@@ -5612,6 +5827,314 @@ bool ext_try_emit_madd_dot(const Insn *list, int idx, int count, const bool *is_
     ymm_allones256_mask &= (u16)~clr;
     ymm_ones16_128_mask &= (u16)~clr;
     ymm_ones16_256_mask &= (u16)~clr;
+    ymm_bcast16_mask &= (u16)~clr;
+    ymm_sxt8_128_mask &= (u16)~clr;
+    ymm_sxt8_256_mask &= (u16)~clr;
+    ymm_sxt8_bcast16_mask &= (u16)~clr;
     *out_consumed = consumed;
+    return true;
+}
+
+// ---- Dead ymm_hi Zero-Store Elimination (100% #PF & IRQ exact via PcMap span suppression) ----
+static bool ext_insn_full_overwrites_vec(const Insn *nk, int r, bool check_low_reads) {
+    if (nk->op != OP_EXT || nk->vsib)
+        return false;
+    const ExtDecoded *ex = &nk->ext;
+    ZydisMnemonic m = (ZydisMnemonic)ex->mnem;
+    if (m == ZYDIS_MNEMONIC_VZEROALL)
+        return true;
+    if (!check_low_reads && m == ZYDIS_MNEMONIC_VZEROUPPER)
+        return true;
+    int fma_o = 0, fma_k = 0;
+    bool fma_s = false, fma_d = false;
+    bool op0_reads = is_fma_mnemonic(m, &fma_o, &fma_k, &fma_s, &fma_d) ||
+                     m == ZYDIS_MNEMONIC_VPTEST || m == ZYDIS_MNEMONIC_VTESTPS ||
+                     m == ZYDIS_MNEMONIC_VTESTPD || m == ZYDIS_MNEMONIC_VUCOMISS ||
+                     m == ZYDIS_MNEMONIC_VUCOMISD || m == ZYDIS_MNEMONIC_VCOMISS ||
+                     m == ZYDIS_MNEMONIC_VCOMISD || m == ZYDIS_MNEMONIC_VPCMPISTRI;
+    if (op0_reads || ex->op_cnt < 2 || ex->op_type[0] != EXT_OP_VEC || ex->op_reg[0] != (u8)r)
+        return false;
+    if (check_low_reads) {
+        for (u8 j = 1; j < ex->op_cnt; j++)
+            if (ex->op_type[j] == EXT_OP_VEC && ex->op_reg[j] == (u8)r)
+                return false;
+    } else {
+        u16 rd256 = 0, wr_any = 0;
+        ext_insn_ymm_rw(nk, &rd256, &wr_any);
+        if (rd256 & (1u << r))
+            return false;
+    }
+    return is_lanewise_vex(m) ||
+           m == ZYDIS_MNEMONIC_VMOVDQU || m == ZYDIS_MNEMONIC_VMOVDQA ||
+           m == ZYDIS_MNEMONIC_VMOVUPS || m == ZYDIS_MNEMONIC_VMOVAPS ||
+           m == ZYDIS_MNEMONIC_VMOVUPD || m == ZYDIS_MNEMONIC_VMOVAPD ||
+           m == ZYDIS_MNEMONIC_VLDDQU || m == ZYDIS_MNEMONIC_VPBROADCASTB ||
+           m == ZYDIS_MNEMONIC_VPBROADCASTW || m == ZYDIS_MNEMONIC_VPBROADCASTD ||
+           m == ZYDIS_MNEMONIC_VPBROADCASTQ || m == ZYDIS_MNEMONIC_VBROADCASTSS ||
+           m == ZYDIS_MNEMONIC_VBROADCASTSD || m == ZYDIS_MNEMONIC_VBROADCASTI128 ||
+           m == ZYDIS_MNEMONIC_VBROADCASTF128 ||
+           m == ZYDIS_MNEMONIC_VPMOVSXBW || m == ZYDIS_MNEMONIC_VPMOVSXBD ||
+           m == ZYDIS_MNEMONIC_VPMOVSXBQ || m == ZYDIS_MNEMONIC_VPMOVSXWD ||
+           m == ZYDIS_MNEMONIC_VPMOVSXWQ || m == ZYDIS_MNEMONIC_VPMOVSXDQ ||
+           m == ZYDIS_MNEMONIC_VPMOVZXBW || m == ZYDIS_MNEMONIC_VPMOVZXBD ||
+           m == ZYDIS_MNEMONIC_VPMOVZXBQ || m == ZYDIS_MNEMONIC_VPMOVZXWD ||
+           m == ZYDIS_MNEMONIC_VPMOVZXWQ || m == ZYDIS_MNEMONIC_VPMOVZXDQ ||
+           m == ZYDIS_MNEMONIC_VCVTDQ2PS || m == ZYDIS_MNEMONIC_VCVTPS2DQ ||
+           m == ZYDIS_MNEMONIC_VCVTTPS2DQ || m == ZYDIS_MNEMONIC_VCVTPS2PD ||
+           m == ZYDIS_MNEMONIC_VCVTDQ2PD;
+}
+
+static inline bool ext_insn_cannot_fault_or_branch(const Insn *nk) {
+    if (nk->memop || nk->op == OP_PUSH || nk->op == OP_POP || nk->op == OP_DIV ||
+        tr_is_monitor_or_stop_op(nk->op) || insn_is_terminator(nk))
+        return false;
+    if (nk->op == OP_SSE || nk->op == OP_X87 || nk->op == OP_FXSAVE || nk->op == OP_FXRSTOR ||
+        nk->op == OP_JCC || nk->op == OP_JRCXZ || nk->op == OP_JMP || nk->op == OP_JMPI ||
+        nk->op == OP_CALL || nk->op == OP_CALLI || nk->op == OP_RET || nk->op == OP_STRING)
+        return false;
+    return true;
+}
+
+// Returns index k > idx of a non-faulting straight-line instruction that completely overwrites
+// ymm_hi[reg] without any intervening read of ymm_hi[reg], faultable op, or branch; else -1.
+// Caller suppresses PcMap across (idx .. k] so neither #PF nor async IRQ can observe stale ymm_hi[reg].
+int ext_ymm_hi_dead_until(const Insn *list, int idx, int count, const bool *is_target, int reg) {
+    int limit = idx + 7;
+    if (limit > count)
+        limit = count;
+    for (int k = idx + 1; k < limit; k++) {
+        if (is_target && is_target[k])
+            return -1;
+        if (list[k - 1].next != list[k].rip)
+            return -1;
+        const Insn *nk = &list[k];
+        if (!ext_insn_cannot_fault_or_branch(nk))
+            return -1;
+        if (nk->op != OP_EXT)
+            continue;
+        u16 rd256 = 0, wr_any = 0;
+        ext_insn_ymm_rw(nk, &rd256, &wr_any);
+        if (rd256 & (1u << reg))
+            return -1;
+        if (ext_insn_full_overwrites_vec(nk, reg, false))
+            return k;
+    }
+    return -1;
+}
+
+// Non-faulting straight-line full-register deadness proof (returns overwriting insn index k, or -1).
+// Safe even for Tier-2 resident YMM registers when caller suppresses PcMap through index k.
+static int ext_vec_dead_after_nofault(const Insn *list, int after_idx, int count, const bool *is_target, int r) {
+    int limit = after_idx + 17;
+    if (limit > count)
+        limit = count;
+    for (int k = after_idx + 1; k < limit; k++) {
+        if (is_target && is_target[k])
+            return -1;
+        if (list[k - 1].next != list[k].rip)
+            return -1;
+        const Insn *nk = &list[k];
+        if (!ext_insn_cannot_fault_or_branch(nk))
+            return -1;
+        if (nk->op != OP_EXT)
+            continue;
+        const ExtDecoded *ex = &nk->ext;
+        ZydisMnemonic m = (ZydisMnemonic)ex->mnem;
+        if (nk->vsib)
+            return -1;
+        int fma_o = 0, fma_k = 0;
+        bool fma_s = false, fma_d = false;
+        bool op0_reads = is_fma_mnemonic(m, &fma_o, &fma_k, &fma_s, &fma_d) ||
+                         m == ZYDIS_MNEMONIC_VPTEST || m == ZYDIS_MNEMONIC_VTESTPS ||
+                         m == ZYDIS_MNEMONIC_VTESTPD || m == ZYDIS_MNEMONIC_VUCOMISS ||
+                         m == ZYDIS_MNEMONIC_VUCOMISD || m == ZYDIS_MNEMONIC_VCOMISS ||
+                         m == ZYDIS_MNEMONIC_VCOMISD || m == ZYDIS_MNEMONIC_VPCMPISTRI;
+        for (u8 j = 0; j < ex->op_cnt; j++) {
+            if (ex->op_type[j] != EXT_OP_VEC)
+                continue;
+            if ((j > 0 || op0_reads) && ex->op_reg[j] == (u8)r)
+                return -1;
+        }
+        if (ext_insn_full_overwrites_vec(nk, r, true))
+            return k;
+    }
+    return -1;
+}
+
+// ---- Universal M1-M5 Hardware SDOT Fusion for VPMOVSXBW + VPMADDWD (+ optional VPADDD) ----
+// When both inputs n, s of VPMADDWD came from VPMOVSXBW (each i16 lane is a sign-extended i8 [x, sx]),
+// `BIC T0.8H, #0xFF, LSL #8` zeros the sign bytes of s so T0 = [y0, 0, y1, 0, ...].
+// Then `SDOT d.4S, n.16B, T0.16B` computes exact wrapping i32:
+//   d.s[k] += (i8)x[2k]*(i8)y[2k] + sx[2k]*0 + (i8)x[2k+1]*(i8)y[2k+1] + sx[2k+1]*0
+//           = d.s[k] + x[2k]*y[2k] + x[2k+1]*y[2k+1]
+// 100% bit-exact for ALL 256^4 signed int8 combinations (including -128*-128 + -128*-128 = +32768)!
+// Uses ONLY T0 (v27) and T1 (v28) — never clobbers T2 (v29), V_S2 (v26), V_MEM (v30), or NZCV.
+static void ext_emit_sxt_sdot_lane(int dst, int n, int s_masked_t0, bool accum) {
+    enum { T1 = 28 };
+    if (accum) {
+        RRR(0x4E809400u, dst, n, s_masked_t0); // sdot dst.4s, n.16b, T0.16b
+    } else if (dst != n) {
+        VEORQ(dst, dst, dst);
+        RRR(0x4E809400u, dst, n, s_masked_t0);
+    } else {
+        VEORQ(T1, T1, T1);
+        RRR(0x4E809400u, T1, n, s_masked_t0);
+        vmov128(dst, T1);
+    }
+}
+
+bool ext_try_emit_sxt_madd_dot(const Insn *list, int idx, int count, const bool *is_target,
+                               int *out_consumed, int *out_dead_until) {
+    *out_dead_until = -1;
+    if (!tr_has_isa_dp || !tr_opt_sdot_gemm)
+        return false;
+    const Insn *in0 = &list[idx];
+    if (in0->op != OP_EXT || in0->memop)
+        return false;
+    const ExtDecoded *e0 = &in0->ext;
+    if ((ZydisMnemonic)e0->mnem != ZYDIS_MNEMONIC_VPMADDWD || e0->op_cnt != 3)
+        return false;
+    u8 vbytes = e0->op_bytes[0];
+    if (vbytes != 16 && vbytes != 32)
+        return false;
+    if (e0->op_type[0] != EXT_OP_VEC || e0->op_type[1] != EXT_OP_VEC || e0->op_type[2] != EXT_OP_VEC)
+        return false;
+
+    int tmp = e0->op_reg[0];
+    int n_reg = e0->op_reg[1];
+    int s_reg = e0->op_reg[2];
+    u16 sxt_mask = (vbytes == 32) ? ymm_sxt8_256_mask : ymm_sxt8_128_mask;
+    if (!(sxt_mask & (1u << n_reg)) || !(sxt_mask & (1u << s_reg)))
+        return false;
+
+    // Optional fusion with immediately following VPADDD acc, acc, tmp (when tmp is provably dead without fault).
+    bool accum = false;
+    int dst_reg = tmp;
+    int consumed = 1;
+    int dead_until = -1;
+    if (!tr_precise_flags && idx + 1 < count && !(is_target && is_target[idx + 1]) &&
+        in0->next == list[idx + 1].rip) {
+        const Insn *in1 = &list[idx + 1];
+        const ExtDecoded *e1 = &in1->ext;
+        if (in1->op == OP_EXT && (ZydisMnemonic)e1->mnem == ZYDIS_MNEMONIC_VPADDD &&
+            !in1->memop && e1->op_cnt == 3 && e1->op_bytes[0] == vbytes &&
+            e1->op_type[0] == EXT_OP_VEC && e1->op_type[1] == EXT_OP_VEC && e1->op_type[2] == EXT_OP_VEC) {
+            int acc = -1;
+            if (e1->op_reg[1] == (u8)tmp && e1->op_reg[2] != (u8)tmp && e1->op_reg[0] == e1->op_reg[2])
+                acc = e1->op_reg[2];
+            else if (e1->op_reg[2] == (u8)tmp && e1->op_reg[1] != (u8)tmp && e1->op_reg[0] == e1->op_reg[1])
+                acc = e1->op_reg[1];
+            if (acc >= 0) {
+                int dk = ext_vec_dead_after_nofault(list, idx + 1, count, is_target, tmp);
+                if (dk >= 0) {
+                    accum = true;
+                    dst_reg = acc;
+                    consumed = 2;
+                    dead_until = dk;
+                }
+            }
+        }
+    }
+
+    enum { T0 = 27 };
+    if (vbytes == 16) {
+        vmov128(T0, s_reg);
+        E(0x6F07B7E0u | (u32)T0); // bic T0.8h, #0xff, lsl #8
+        ext_emit_sxt_sdot_lane(dst_reg, n_reg, T0, accum);
+        ymm_zero_hi(dst_reg);
+        u16 clr = (u16)((1u << dst_reg) | (1u << tmp));
+        ymm_allones128_mask &= (u16)~clr;
+        ymm_allones256_mask &= (u16)~clr;
+        ymm_ones16_128_mask &= (u16)~clr;
+        ymm_ones16_256_mask &= (u16)~clr;
+        ymm_bcast16_mask &= (u16)~clr;
+        ymm_sxt8_128_mask &= (u16)~clr;
+        ymm_sxt8_256_mask &= (u16)~clr;
+        ymm_sxt8_bcast16_mask &= (u16)~clr;
+        *out_consumed = consumed;
+        *out_dead_until = dead_until;
+        return true;
+    }
+
+    // 256-bit YMM path: if either operand came from vpbroadcastw + vpmovsxbw (ymm_hi == xmm),
+    // place it in s_reg so we only emit ONE `bic` for both halves and NEVER touch s_hi!
+    bool s_bcast = (ymm_sxt8_bcast16_mask & (1u << s_reg)) != 0;
+    bool n_bcast = (ymm_sxt8_bcast16_mask & (1u << n_reg)) != 0;
+    if (n_bcast && !s_bcast) {
+        int sw = n_reg;
+        n_reg = s_reg;
+        s_reg = sw;
+        s_bcast = true;
+    }
+
+    u16 hi_need = 0;
+    if (n_reg >= 8) hi_need |= (u16)(1u << n_reg);
+    if (!s_bcast && s_reg >= 8) hi_need |= (u16)(1u << s_reg);
+    if (dst_reg >= 8) hi_need |= (u16)(1u << dst_reg);
+    if (tr_opt_ymm_cache && !ymm_cache_can_hold_regs(hi_need))
+        return false;
+
+    if (tr_opt_ymm_cache) {
+        if (accum && tmp != dst_reg && tmp >= 8)
+            ymm_cache_drop_xreg(tmp);
+        u8 pin = 0;
+        int n_hi = ymm_cache_get(n_reg, true, false, &pin);
+        int s_hi = s_bcast ? -1 : ymm_cache_get(s_reg, true, false, &pin);
+        int dst_hi = ymm_cache_get(dst_reg, accum, true, &pin);
+        if (s_bcast) {
+            vmov128(T0, s_reg);
+            E(0x6F07B7E0u | (u32)T0); // bic T0.8h, #0xff, lsl #8
+            ext_emit_sxt_sdot_lane(dst_hi, n_hi, T0, accum);
+            ext_emit_sxt_sdot_lane(dst_reg, n_reg, T0, accum);
+        } else {
+            vmov128(T0, s_hi);
+            E(0x6F07B7E0u | (u32)T0);
+            ext_emit_sxt_sdot_lane(dst_hi, n_hi, T0, accum);
+            vmov128(T0, s_reg);
+            E(0x6F07B7E0u | (u32)T0);
+            ext_emit_sxt_sdot_lane(dst_reg, n_reg, T0, accum);
+        }
+        if (dst_reg >= 8)
+            ymm_dirty_run_cnt++;
+    } else {
+        int n_home = ymm_resident(n_reg);
+        int n_hi = n_home >= 0 ? n_home : (ymm_load_hi(V_S0, n_reg), V_S0);
+        int s_hi = -1;
+        if (!s_bcast) {
+            int s_home = ymm_resident(s_reg);
+            s_hi = s_home >= 0 ? s_home : (ymm_load_hi(V_S1, s_reg), V_S1);
+        }
+        int dst_home = ymm_resident(dst_reg);
+        int dst_hi = dst_home >= 0 ? dst_home : (accum ? (ymm_load_hi(31, dst_reg), 31) : 31);
+        if (s_bcast) {
+            vmov128(T0, s_reg);
+            E(0x6F07B7E0u | (u32)T0);
+            ext_emit_sxt_sdot_lane(dst_hi, n_hi, T0, accum);
+            ext_emit_sxt_sdot_lane(dst_reg, n_reg, T0, accum);
+        } else {
+            vmov128(T0, s_hi);
+            E(0x6F07B7E0u | (u32)T0);
+            ext_emit_sxt_sdot_lane(dst_hi, n_hi, T0, accum);
+            vmov128(T0, s_reg);
+            E(0x6F07B7E0u | (u32)T0);
+            ext_emit_sxt_sdot_lane(dst_reg, n_reg, T0, accum);
+        }
+        if (dst_home < 0)
+            ymm_store_hi(dst_hi, dst_reg);
+        else
+            ymm_zero_mask &= (u16)~(1u << dst_reg);
+    }
+
+    u16 clr = (u16)((1u << dst_reg) | (1u << tmp));
+    ymm_allones128_mask &= (u16)~clr;
+    ymm_allones256_mask &= (u16)~clr;
+    ymm_ones16_128_mask &= (u16)~clr;
+    ymm_ones16_256_mask &= (u16)~clr;
+    ymm_bcast16_mask &= (u16)~clr;
+    ymm_sxt8_128_mask &= (u16)~clr;
+    ymm_sxt8_256_mask &= (u16)~clr;
+    ymm_sxt8_bcast16_mask &= (u16)~clr;
+    *out_consumed = consumed;
+    *out_dead_until = dead_until;
     return true;
 }

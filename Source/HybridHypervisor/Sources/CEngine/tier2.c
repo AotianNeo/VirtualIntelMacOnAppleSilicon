@@ -21,15 +21,17 @@
 
 #define T2_MAX_LOOPS_PER_BUCKET 8192U
 #define T2_BUCKETS 5U // 0..3: p0 ring slots 0..3, 4: p1 private
-#define T2_MAX_BODY_INSNS 96
-#define T2_MAX_UNROLL_INSNS 192
-#define T2_MAX_CODE_WORDS 8192
+#define T2_MAX_BODY_INSNS 256
+#define T2_MAX_UNROLL_INSNS 256
+#define T2_MAX_CODE_WORDS 12288
 #define T2_MAX_PCMAP 1536
 #define T2_MAX_PEND 256
-#define T2_MAX_FWD 256
+#define T2_MAX_FWD 512
 #define T2_MAX_BAIL 16
-#define T2_WINDOW_MS 400ULL
+#define T2_WINDOW_MS 2000ULL
+#define T2_OLD_WINDOW_MS 400ULL
 #define T2_POLL_US 15000U
+#define T2_OLD_POLL_US 15000U
 
 enum { T2_IDLE = 0, T2_COMPILING = 1, T2_PROMOTED = 2, T2_REJECTED = 3, T2_DEAD = 4 };
 
@@ -61,8 +63,8 @@ typedef struct {
     u32 kind;
     int form;
     u8 dirty_cnt;
-    u8 dirty_vreg[4];
-    u8 dirty_xreg[4];
+    u8 dirty_vreg[T2_MAX_YMM_SLOTS];
+    u8 dirty_xreg[T2_MAX_YMM_SLOTS];
 } T2Pend;
 
 static void t2_add_pend(T2Pend *pend, int *pend_cnt, u32 *site, u64 target, int form, bool has_t2_dirty) {
@@ -104,7 +106,10 @@ static bool t2_log_enabled;
 static bool t2_no_mem_ymm;
 static bool t2_no_stk_promo;
 static bool t2_no_unroll4;
-static u32 t2_hit_thresh = 6;
+static bool t2_max96;
+static bool t2_old_promo;
+static bool t2_no_wide_pool;
+static u32 t2_hit_thresh = 3;
 static pthread_t t2_thread;
 static bool t2_thread_started;
 static volatile bool t2_thread_stop;
@@ -120,6 +125,8 @@ static u64 t2_stat_unrolled;
 static u64 t2_stat_unrolled4;
 static u64 t2_stat_ro_ymm_loops;
 static u64 t2_stat_res_ymm_loops;
+static u64 t2_stat_wide_ymm_loops;
+static u64 t2_stat_large_loops;
 static u64 t2_stat_stk_promo_loops;
 static u64 t2_stat_licm_ad_loops;
 
@@ -193,11 +200,14 @@ static void t2_clear_bucket(u32 b) {
 
 bool t2_enabled(void) { return t2_is_enabled; }
 bool t2_eager_mode(void) { return t2_is_enabled && t2_is_eager; }
+int t2_max_body_insns(void) { return t2_max96 ? 96 : T2_MAX_BODY_INSNS; }
 u32 t2_ablation_bits(void) {
     u32 b = 0;
     if (t2_no_mem_ymm) b |= AOT_MODE_T2_NO_MEM_YMM;
     if (t2_no_stk_promo) b |= AOT_MODE_T2_NO_STK_PROMO;
     if (t2_no_unroll4) b |= AOT_MODE_T2_NO_UNROLL4;
+    if (t2_max96) b |= AOT_MODE_T2_MAX96;
+    if (t2_no_wide_pool) b |= AOT_MODE_T2_NO_WIDE_POOL;
     return b;
 }
 
@@ -603,16 +613,17 @@ static inline bool t2_overlaps(const Insn *list, int cnt, u64 s, u64 e) {
 
 // Decode a clean single-entry loop body starting at head_rip inside the immutable byte snapshot.
 static int t2_decode_loop_body(const T2LoopDesc *d, Insn *body) {
+    int max_body = t2_max_body_insns();
     u64 page = d->head_rip & ~0xfffULL;
     u64 win_lo = page + d->min_off;
     u64 win_hi = win_lo + d->span_bytes;
     int count = 0;
 
-    u64 q[16];
+    u64 q[64];
     int qh = 0, qt = 0;
     q[qt++] = d->head_rip;
 
-    while (qh < qt && count < T2_MAX_BODY_INSNS) {
+    while (qh < qt && count < max_body) {
         u64 spc = q[qh++];
         if (spc < d->head_rip || spc < win_lo || spc >= win_hi)
             continue;
@@ -625,7 +636,7 @@ static int t2_decode_loop_body(const T2LoopDesc *d, Insn *body) {
         Insn tmp[T2_MAX_BODY_INSNS];
         int tc = 0;
         bool ok = true;
-        while (count + tc < T2_MAX_BODY_INSNS) {
+        while (count + tc < max_body) {
             bool hit = false;
             for (int i = 0; i < count; i++)
                 if (body[i].rip == spc) { hit = true; break; }
@@ -670,7 +681,7 @@ static int t2_decode_loop_body(const T2LoopDesc *d, Insn *body) {
             bool dup = false;
             for (int k = 0; k < qt; k++)
                 if (q[k] == t) { dup = true; break; }
-            if (!dup && qt < 16)
+            if (!dup && qt < 64)
                 q[qt++] = t;
         }
     }
@@ -770,9 +781,12 @@ static bool t2_compile_and_publish(const T2LoopDesc *d) {
 
     // ---- Pass 1: Loop Analysis (memop, memop-safe YMM8..15 residency, LICM tr_ad_page, 4x/2x unroll) ----
     bool has_memop = false;
+    bool ext_has_memop = false;
     bool all_ymm_safe = true;
+    bool all_v26_free = true;
     bool has_4vec_blend = false;
     bool all_preserve_ad = true;
+    u16 touched_vecs = 0;
     u64 licm_ad_page = ~0ULL;
     int licm_ad_pages = 0;
     u16 ymm_rd256 = 0, ymm_wr_any = 0;
@@ -785,13 +799,19 @@ static bool t2_compile_and_publish(const T2LoopDesc *d) {
 
     for (int i = 0; i < bcnt; i++) {
         const Insn *in = &body[i];
+        touched_vecs |= ext_insn_touched_vecs(in);
         if (in->memop || in->op == OP_PUSH || in->op == OP_POP)
             has_memop = true;
         if (in->op == OP_SSE || in->op == OP_LDMXCSR || in->op == OP_STMXCSR) {
             all_ymm_safe = false;
+            all_v26_free = false;
         } else if (in->op == OP_EXT) {
             if (!ext_insn_keeps_ymm_cache(in))
                 all_ymm_safe = false;
+            if (!ext_insn_v26_free(in))
+                all_v26_free = false;
+            if (in->memop)
+                ext_has_memop = true;
             u16 r256 = 0, wany = 0;
             ext_insn_ymm_rw(in, &r256, &wany);
             ymm_rd256 |= r256;
@@ -828,10 +848,14 @@ static bool t2_compile_and_publish(const T2LoopDesc *d) {
     if (!all_preserve_ad || licm_ad_pages != 1)
         licm_ad_page = ~0ULL;
 
-    // Select memop-safe full RW resident YMM8..15 slots ({v24,v25,v29,v31}) backed by T2TrapMeta trap sync.
-    // Invariant: res_ymm_cnt + max_unres_per_insn <= 4 so ymm_cache_get() can NEVER overflow.
-    u8 res_ymm_regs[4], ro_pin_regs[4], rw_preload_regs[4];
+    // Select memop-safe full RW resident YMM8..15 slots (up to 8 slots across {v24,v25,v29,v31} + v26 + v30 +
+    // up to 2 borrowed unused guest XMM registers) backed by T2TrapMeta trap sync.
+    // Invariant: res_ymm_cnt + max_unres_per_insn <= pool_slots so ymm_cache_get() can NEVER overflow.
+    u8 res_ymm_regs[T2_MAX_YMM_SLOTS], ro_pin_regs[4], rw_preload_regs[4];
+    u8 extra_vregs[T2_MAX_YMM_SLOTS - 4];
+    u8 borrow_vregs[T2_MAX_BORROW_XMM];
     int res_ymm_cnt = 0, ro_pin_cnt = 0, rw_preload_cnt = 0;
+    int extra_cnt = 0, borrow_cnt = 0;
     u8 res_ymm_wr_mask = 0;
     bool all_hi_fit_pool = false;
     if (tr_opt_ymm_cache && all_ymm_safe && !tr_precise_flags) {
@@ -840,6 +864,20 @@ static bool t2_compile_and_publish(const T2LoopDesc *d) {
         all_hi_fit_pool = (total_hi > 0 && total_hi <= 4);
 
         if (!t2_no_mem_ymm && total_hi > 0) {
+            if (!t2_no_wide_pool && total_hi > 4) {
+                if (all_v26_free)
+                    extra_vregs[extra_cnt++] = 26;
+                if (!ext_has_memop && total_hi > 4 + extra_cnt)
+                    extra_vregs[extra_cnt++] = 30;
+                for (int r = 15; r >= 0 && borrow_cnt < (int)T2_MAX_BORROW_XMM &&
+                                 4 + extra_cnt < (int)T2_MAX_YMM_SLOTS && 4 + extra_cnt < total_hi; r--) {
+                    if (!(touched_vecs & (1u << r))) {
+                        extra_vregs[extra_cnt++] = (u8)r;
+                        borrow_vregs[borrow_cnt++] = (u8)r;
+                    }
+                }
+            }
+            int pool_slots = 4 + extra_cnt;
             // Rank candidate ymm8..15 descending by access weight (tie-break: written regs first).
             u8 cands[8];
             int ncands = 0;
@@ -860,7 +898,8 @@ static bool t2_compile_and_publish(const T2LoopDesc *d) {
                 cands[ncands++] = (u8)best;
                 rem &= (u16)~(1u << best);
             }
-            int try_max = ncands < 4 ? ncands : 4;
+            int try_max = ncands < pool_slots ? ncands : pool_slots;
+            int chosen_need = 0;
             for (int k = try_max; k >= 1; k--) {
                 u16 rmask = 0;
                 for (int j = 0; j < k; j++)
@@ -871,8 +910,9 @@ static bool t2_compile_and_publish(const T2LoopDesc *d) {
                     if (un > max_unres)
                         max_unres = un;
                 }
-                if (k + max_unres <= 4) {
+                if (k + max_unres <= pool_slots) {
                     res_ymm_cnt = k;
+                    chosen_need = k + max_unres;
                     for (int j = 0; j < k; j++) {
                         res_ymm_regs[j] = cands[j];
                         if (ymm_wr_any & (1u << cands[j]))
@@ -880,6 +920,15 @@ static bool t2_compile_and_publish(const T2LoopDesc *d) {
                     }
                     break;
                 }
+            }
+            // Trim any unused borrowed XMM registers so Preheader/exit emit zero unnecessary saves/restores.
+            while (borrow_cnt > 0 && chosen_need <= 4 + extra_cnt - 1) {
+                extra_cnt--;
+                borrow_cnt--;
+            }
+            if (res_ymm_cnt == 0) {
+                extra_cnt = 0;
+                borrow_cnt = 0;
             }
         } else {
             // Legacy Round-1 fallback (when LC_HVDBT_T2_NO_MEM_YMM=1): RO pins + mem-free RW preload.
@@ -1335,14 +1384,32 @@ static bool t2_compile_and_publish(const T2LoopDesc *d) {
         }
     }
 
-    // Only promote if at least one Tier-2 optimization genuinely improves this loop.
+    // Only promote if at least one Tier-2 optimization genuinely improves this loop over Tier-1.
+    // For large non-unrolled loops (bcnt > 64, copies == 1), require substantive YMM/stack/LICM wins
+    // (avoid promoting 100+ insn integer loops like GB7's calibration add-chain for a 1-insn flag save).
+    bool flag_elim_saved = false;
+    if (copies <= 1 && bcnt <= 64) {
+        u8 t1_live = F_ARITH;
+        for (int i = bcnt - 1; i >= 0; i--) {
+            u8 op = body[i].op;
+            if (op == OP_JMP || op == OP_JCC || op == OP_JRCXZ)
+                t1_live = F_ARITH;
+            if (body[i].writes != 0 &&
+                (op == OP_ALU || op == OP_INCDEC || op == OP_NEG || op == OP_SHIFT) &&
+                (live_after[i] & body[i].writes) != (t1_live & body[i].writes)) {
+                flag_elim_saved = true;
+                break;
+            }
+            t1_live = (u8)((t1_live & ~body[i].writes) | tr_insn_reads(&body[i]));
+        }
+    }
     if (copies <= 1 && res_ymm_cnt == 0 && ro_pin_cnt == 0 && stk_cnt == 0 &&
-        licm_ad_page == ~0ULL && !dirty_ymm_boost) {
+        licm_ad_page == ~0ULL && !dirty_ymm_boost && !flag_elim_saved) {
         tr_t2_mode = false;
         return false;
     }
 
-    bool has_t2_dirty = (res_ymm_wr_mask != 0) || (stk_dirty_mask != 0);
+    bool has_t2_dirty = (res_ymm_wr_mask != 0) || (stk_dirty_mask != 0) || (borrow_cnt > 0);
 
     // ---- Pass 4: Emit Preheader + Optimized Loop Body into Thread-Local Buffer ----
     u32 local_buf[T2_MAX_CODE_WORDS];
@@ -1375,10 +1442,14 @@ static bool t2_compile_and_publish(const T2LoopDesc *d) {
     local_pcm[pcm_cnt++] = (PcMap){0, 0};
 
     // Preheader (non-flag-setting instructions only: preserves NZCV/R_PF/R_AF from Tier-1 OSR entry!).
-    // 1. Preheader-only alias guards (before modifying any resident YMM/stack state -> zero-flush direct B to T1_body!).
+    // 1. Preheader-only alias guards (before modifying any resident YMM/borrowed XMM/stack state -> zero-flush direct B to T1_body!).
     for (int g = 0; g < pre_guard_cnt; g++)
         pre_bail_sites[pre_bail_cnt++] = t2_emit_alias_guard(pre_guards[g], stk_base);
-    // 2. Pin memop-safe resident YMM8..15 (or legacy RO pins + mem-free preloads).
+    // 2. Save borrowed unused guest XMM regs, expand YMM8..15 pool, and pin resident/RO slots.
+    for (int j = 0; j < borrow_cnt; j++)
+        ext_emit_t2_borrow_save(j, borrow_vregs[j]);
+    for (int j = 0; j < extra_cnt; j++)
+        ext_ymm_cache_add_pool_vreg(extra_vregs[j]);
     for (int k = 0; k < res_ymm_cnt; k++)
         ext_ymm_cache_pin_rw(res_ymm_regs[k]);
     for (int k = 0; k < ro_pin_cnt; k++)
@@ -1409,6 +1480,7 @@ static bool t2_compile_and_publish(const T2LoopDesc *d) {
         body_bail_sites[body_bail_cnt++] = t2_emit_alias_guard(iter_guards[g], stk_base);
 
     int dirty_limit = dirty_ymm_boost ? 24 : 8;
+    int pcmap_suppress_until = -1;
 
     for (int i = 0; i < ucnt; i++) {
         if ((u32)(tr_cc - local_buf) >= T2_MAX_CODE_WORDS - 512) {
@@ -1432,6 +1504,7 @@ static bool t2_compile_and_publish(const T2LoopDesc *d) {
             if (licm_ad_page == ~0ULL)
                 tr_ad_page = ~0ULL;
             tr_zext8 = tr_zext16 = 0;
+            pcmap_suppress_until = -1;
             ext_ymm_cache_reset_unpinned();
         }
         // Non-resident dynamic YMM slots still flush cleanly before memop/target/dirty_limit;
@@ -1452,7 +1525,7 @@ static bool t2_compile_and_publish(const T2LoopDesc *d) {
             sse_aes_flush_all();
 
         insn_arm[i] = tr_cc;
-        if (!ext_ymm_cache_has_dirty() && pcm_cnt < T2_MAX_PCMAP) {
+        if (!ext_ymm_cache_has_dirty() && i > pcmap_suppress_until && pcm_cnt < T2_MAX_PCMAP) {
             // Note: for i == 0 with iter_guard_cnt > 0, keep PcMap at loop_hdr_arm (before the guard)
             // so the per-iteration guard executes atomically with insn 0.
             if (!(i == 0 && iter_guard_cnt > 0)) {
@@ -1465,7 +1538,19 @@ static bool t2_compile_and_publish(const T2LoopDesc *d) {
 
         // Peephole fusions across adjacent non-target instructions (same core fusions as Tier-1).
         bool fused = false;
-        bool next_same_seq = (i + 1 < ucnt) && !u_is_target[i + 1] && !u_skip_nop[i + 1] &&
+        if (tr_opt_peep && in->op == OP_EXT) {
+            int sxt_consumed = 0, sxt_dead_until = -1;
+            if (ext_try_emit_sxt_madd_dot(ulist, i, ucnt, u_is_target, &sxt_consumed, &sxt_dead_until)) {
+                for (int k = 1; k < sxt_consumed; k++)
+                    insn_arm[i + k] = insn_arm[i];
+                if (sxt_dead_until > pcmap_suppress_until)
+                    pcmap_suppress_until = sxt_dead_until;
+                tr_zext8 = tr_zext16 = 0;
+                i += sxt_consumed - 1;
+                fused = true;
+            }
+        }
+        bool next_same_seq = !fused && (i + 1 < ucnt) && !u_is_target[i + 1] && !u_skip_nop[i + 1] &&
                              (u_fall[i] == i + 1) && (in->next == ulist[i + 1].rip);
         if (tr_opt_peep && next_same_seq) {
             const Insn *nx = &ulist[i + 1];
@@ -1722,7 +1807,18 @@ static bool t2_compile_and_publish(const T2LoopDesc *d) {
                 emit_sse(in, live_after[i]);
                 tr_update_zext(in);
             } else if (in->op == OP_EXT) {
+                if (tr_opt_dead_ymm_zero && in->ext.op_cnt >= 2 &&
+                    in->ext.op_type[0] == EXT_OP_VEC && in->ext.op_bytes[0] == 16) {
+                    int dr = in->ext.op_reg[0];
+                    int dk = ext_ymm_hi_dead_until(ulist, i, ucnt, u_is_target, dr);
+                    if (dk > i) {
+                        tr_dead_ymm_hi_mask = (u16)(1u << dr);
+                        if (dk > pcmap_suppress_until)
+                            pcmap_suppress_until = dk;
+                    }
+                }
                 emit_ext(in, live_after[i]);
+                tr_dead_ymm_hi_mask = 0;
                 tr_update_zext(in);
             } else {
                 int sk = t2_match_stk_slot(in, stk_base, stk_slots, stk_cnt);
@@ -1783,6 +1879,8 @@ static bool t2_compile_and_publish(const T2LoopDesc *d) {
         } else if (last_f == -1) {
             if (res_ymm_wr_mask)
                 ext_ymm_emit_resident_flush(res_ymm_wr_mask);
+            for (int j = 0; j < borrow_cnt; j++)
+                ext_emit_t2_borrow_restore(j, borrow_vregs[j]);
             for (int sk = 0; sk < stk_cnt; sk++)
                 if (stk_slots[sk].writes)
                     t2_emit_stk_ldst(false, stk_slots[sk].sz, stk_slots[sk].phys, stk_base, stk_slots[sk].disp);
@@ -1791,7 +1889,7 @@ static bool t2_compile_and_publish(const T2LoopDesc *d) {
         }
     }
 
-    // Emit side-exit stubs (with exact dirty YMM8..15 + dirty promoted stack-slot flush trampolines).
+    // Emit side-exit stubs (with exact dirty YMM8..15 + borrowed XMM restore + dirty promoted stack-slot flush trampolines).
     for (int k = 0; k < pend_cnt; k++) {
         if ((u32)(tr_cc - local_buf) >= T2_MAX_CODE_WORDS - 32) {
             overflow = true;
@@ -1803,6 +1901,8 @@ static bool t2_compile_and_publish(const T2LoopDesc *d) {
                 ext_ymm_emit_flush_list(pend[k].dirty_cnt, pend[k].dirty_vreg, pend[k].dirty_xreg);
             if (res_ymm_wr_mask)
                 ext_ymm_emit_resident_flush(res_ymm_wr_mask);
+            for (int j = 0; j < borrow_cnt; j++)
+                ext_emit_t2_borrow_restore(j, borrow_vregs[j]);
             for (int sk = 0; sk < stk_cnt; sk++)
                 if (stk_slots[sk].writes)
                     t2_emit_stk_ldst(false, stk_slots[sk].sz, stk_slots[sk].phys, stk_base, stk_slots[sk].disp);
@@ -1832,6 +1932,8 @@ static bool t2_compile_and_publish(const T2LoopDesc *d) {
             t2_fix(body_bail_sites[g], 0, stub);
         if (res_ymm_wr_mask)
             ext_ymm_emit_resident_flush(res_ymm_wr_mask);
+        for (int j = 0; j < borrow_cnt; j++)
+            ext_emit_t2_borrow_restore(j, borrow_vregs[j]);
         for (int sk = 0; sk < stk_cnt; sk++)
             if (stk_slots[sk].writes)
                 t2_emit_stk_ldst(false, stk_slots[sk].sz, stk_slots[sk].phys, stk_base, stk_slots[sk].disp);
@@ -1844,7 +1946,7 @@ static bool t2_compile_and_publish(const T2LoopDesc *d) {
     if (has_t2_dirty) {
         tmeta.body_start_word = body_start_word;
         tmeta.body_end_word = body_end_word;
-        ext_ymm_cache_get_resident_map(tmeta.ymm_reg);
+        ext_ymm_cache_get_resident_map(tmeta.ymm_reg, tmeta.ymm_vreg);
         tmeta.ymm_wr_mask = res_ymm_wr_mask;
         tmeta.stk_cnt = (u8)stk_cnt;
         tmeta.stk_base = stk_base;
@@ -1854,6 +1956,9 @@ static bool t2_compile_and_publish(const T2LoopDesc *d) {
             tmeta.stk_phys[sk] = stk_slots[sk].phys;
             tmeta.stk_disp[sk] = stk_slots[sk].disp;
         }
+        tmeta.borrow_cnt = (u8)borrow_cnt;
+        for (int j = 0; j < borrow_cnt; j++)
+            tmeta.borrow_vreg[j] = borrow_vregs[j];
         tmeta.flags = T2_META_FLAG_ACTIVE;
     }
 
@@ -1883,14 +1988,16 @@ static bool t2_compile_and_publish(const T2LoopDesc *d) {
         if (copies == 4) __atomic_add_fetch(&t2_stat_unrolled4, 1, __ATOMIC_RELAXED);
         else if (copies == 2) __atomic_add_fetch(&t2_stat_unrolled, 1, __ATOMIC_RELAXED);
         if (res_ymm_cnt > 0) __atomic_add_fetch(&t2_stat_res_ymm_loops, 1, __ATOMIC_RELAXED);
+        if (extra_cnt > 0) __atomic_add_fetch(&t2_stat_wide_ymm_loops, 1, __ATOMIC_RELAXED);
+        if (bcnt > 96) __atomic_add_fetch(&t2_stat_large_loops, 1, __ATOMIC_RELAXED);
         if (ro_pin_cnt > 0) __atomic_add_fetch(&t2_stat_ro_ymm_loops, 1, __ATOMIC_RELAXED);
         if (stk_cnt > 0) __atomic_add_fetch(&t2_stat_stk_promo_loops, 1, __ATOMIC_RELAXED);
         if (licm_ad_page != ~0ULL) __atomic_add_fetch(&t2_stat_licm_ad_loops, 1, __ATOMIC_RELAXED);
         if (t2_log_enabled) {
-            fprintf(stderr, "[hvdbt-t2] promoted rip=%llx part=%u slot=%u body=%d unroll=%d res_ymm=%d(wr=%x) stk=%d(wr=%x,pg=%d,ig=%d) licm_ad=%d words=%u\n",
+            fprintf(stderr, "[hvdbt-t2] promoted rip=%llx part=%u slot=%u body=%d unroll=%d res_ymm=%d(pool=%d,borrow=%d,wr=%x) stk=%d(wr=%x,pg=%d,ig=%d) licm_ad=%d words=%u\n",
                     (unsigned long long)d->head_rip, d->part, d->p0_slot, bcnt, copies,
-                    res_ymm_cnt, res_ymm_wr_mask, stk_cnt, stk_dirty_mask, pre_guard_cnt, iter_guard_cnt,
-                    licm_ad_page != ~0ULL ? 1 : 0, code_words);
+                    res_ymm_cnt, 4 + extra_cnt, borrow_cnt, res_ymm_wr_mask, stk_cnt, stk_dirty_mask,
+                    pre_guard_cnt, iter_guard_cnt, licm_ad_page != ~0ULL ? 1 : 0, code_words);
         }
     } else {
         tr_aot_cap.active = false;
@@ -1931,7 +2038,9 @@ static T2LoopDesc *t2_find_by_word_locked(u32 word) {
 static void *t2_worker_main(void *arg) {
     (void)arg;
     pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0);
-    struct timespec ts = {0, (long)T2_POLL_US * 1000L};
+    struct timespec ts = {0, (long)(t2_old_promo ? T2_OLD_POLL_US : T2_POLL_US) * 1000L};
+    const u64 win_ms = t2_old_promo ? T2_OLD_WINDOW_MS : T2_WINDOW_MS;
+    const int batch_max = t2_old_promo ? 4 : 8;
 
     while (!__atomic_load_n(&t2_thread_stop, __ATOMIC_ACQUIRE)) {
         nanosleep(&ts, NULL);
@@ -1942,7 +2051,7 @@ static void *t2_worker_main(void *arg) {
         if (vc > MAX_VCPUS) vc = MAX_VCPUS;
 
         u64 now = t2_now_ms();
-        T2LoopDesc batch[4];
+        T2LoopDesc batch[16];
         int batch_n = 0;
 
         pthread_mutex_lock(&t2_meta_lock);
@@ -1968,13 +2077,14 @@ static void *t2_worker_main(void *arg) {
                 T2LoopDesc *ld = t2_find_by_word_locked(word);
                 if (!ld || ld->state != T2_IDLE)
                     continue;
-                if (now - ld->win_start_ms > T2_WINDOW_MS) {
+                if (now - ld->win_start_ms > win_ms) {
                     ld->win_start_ms = now;
-                    ld->hits = 1;
+                    // Smooth half-life decay prevents low-frequency IRQ sampling from wiping warm loops back to 1.
+                    ld->hits = t2_old_promo ? 1U : ((ld->hits >> 1) + 1U);
                 } else {
                     ld->hits++;
                 }
-                if (ld->hits >= t2_hit_thresh && ld->attempts < 2 && batch_n < 4) {
+                if (ld->hits >= t2_hit_thresh && ld->attempts < 2 && batch_n < batch_max) {
                     ld->state = T2_COMPILING;
                     ld->attempts++;
                     batch[batch_n++] = *ld;
@@ -2005,14 +2115,16 @@ static void t2_print_summary(void) {
     u64 unr = __atomic_load_n(&t2_stat_unrolled, __ATOMIC_RELAXED);
     u64 un4 = __atomic_load_n(&t2_stat_unrolled4, __ATOMIC_RELAXED);
     u64 res = __atomic_load_n(&t2_stat_res_ymm_loops, __ATOMIC_RELAXED);
+    u64 wid = __atomic_load_n(&t2_stat_wide_ymm_loops, __ATOMIC_RELAXED);
+    u64 lrg = __atomic_load_n(&t2_stat_large_loops, __ATOMIC_RELAXED);
     u64 ro  = __atomic_load_n(&t2_stat_ro_ymm_loops, __ATOMIC_RELAXED);
     u64 stk = __atomic_load_n(&t2_stat_stk_promo_loops, __ATOMIC_RELAXED);
     u64 ad  = __atomic_load_n(&t2_stat_licm_ad_loops, __ATOMIC_RELAXED);
-    fprintf(stderr, "[hvdbt-t2-summary] reg=%llu samples=%llu compiled=%llu promoted=%llu unroll2=%llu unroll4=%llu res_ymm=%llu ro_ymm=%llu stk_promo=%llu licm_ad=%llu\n",
+    fprintf(stderr, "[hvdbt-t2-summary] reg=%llu samples=%llu compiled=%llu promoted=%llu unroll2=%llu unroll4=%llu res_ymm=%llu wide_ymm=%llu large=%llu ro_ymm=%llu stk_promo=%llu licm_ad=%llu\n",
             (unsigned long long)reg, (unsigned long long)smp, (unsigned long long)cmp,
             (unsigned long long)pro, (unsigned long long)unr, (unsigned long long)un4,
-            (unsigned long long)res, (unsigned long long)ro, (unsigned long long)stk,
-            (unsigned long long)ad);
+            (unsigned long long)res, (unsigned long long)wid, (unsigned long long)lrg,
+            (unsigned long long)ro, (unsigned long long)stk, (unsigned long long)ad);
 }
 
 void t2_init(const TrConfig *cfg, EngineCtx *ctx, u32 *cc_base_p) {
@@ -2025,6 +2137,9 @@ void t2_init(const TrConfig *cfg, EngineCtx *ctx, u32 *cc_base_p) {
     const char *no_mem_ymm = getenv("LC_HVDBT_T2_NO_MEM_YMM");
     const char *no_stk = getenv("LC_HVDBT_T2_NO_STK_PROMO");
     const char *no_u4 = getenv("LC_HVDBT_T2_NO_UNROLL4");
+    const char *max96 = getenv("LC_HVDBT_T2_MAX96");
+    const char *old_promo = getenv("LC_HVDBT_T2_OLD_PROMO");
+    const char *no_wide = getenv("LC_HVDBT_T2_NO_WIDE_POOL");
 
     t2_is_enabled = !(no_t2 && !strcmp(no_t2, "1")) && !cfg->precise_flags && !cfg->all_flags_live && !cfg->profile_compile_inputs;
     t2_is_eager = (eager && !strcmp(eager, "1"));
@@ -2032,11 +2147,14 @@ void t2_init(const TrConfig *cfg, EngineCtx *ctx, u32 *cc_base_p) {
     t2_no_mem_ymm = (no_mem_ymm && !strcmp(no_mem_ymm, "1"));
     t2_no_stk_promo = (no_stk && !strcmp(no_stk, "1"));
     t2_no_unroll4 = (no_u4 && !strcmp(no_u4, "1"));
+    t2_max96 = (max96 && !strcmp(max96, "1"));
+    t2_old_promo = (old_promo && !strcmp(old_promo, "1"));
+    t2_no_wide_pool = (no_wide && !strcmp(no_wide, "1"));
     if ((t2_log_enabled || (stats_e && !strcmp(stats_e, "1"))) && !t2_summary_registered) {
         atexit(t2_print_summary);
         t2_summary_registered = true;
     }
-    t2_hit_thresh = 4;
+    t2_hit_thresh = t2_old_promo ? 4U : 3U;
     if (thresh && thresh[0]) {
         int v = atoi(thresh);
         if (v >= 1 && v <= 1000)
@@ -2059,15 +2177,20 @@ void t2_init(const TrConfig *cfg, EngineCtx *ctx, u32 *cc_base_p) {
     }
     t2_stat_registered = t2_stat_samples = t2_stat_compiled = t2_stat_promoted = 0;
     t2_stat_unrolled = t2_stat_unrolled4 = t2_stat_ro_ymm_loops = t2_stat_res_ymm_loops = 0;
+    t2_stat_wide_ymm_loops = t2_stat_large_loops = 0;
     t2_stat_stk_promo_loops = t2_stat_licm_ad_loops = 0;
     pthread_mutex_unlock(&t2_meta_lock);
 
     if (t2_is_enabled && !t2_is_eager && !t2_thread_started) {
         t2_thread_stop = false;
-        if (pthread_create(&t2_thread, NULL, t2_worker_main, NULL) == 0) {
+        pthread_attr_t attr;
+        pthread_attr_init(&attr);
+        pthread_attr_setstacksize(&attr, 1024 * 1024);
+        if (pthread_create(&t2_thread, &attr, t2_worker_main, NULL) == 0) {
             pthread_detach(t2_thread);
             t2_thread_started = true;
         }
+        pthread_attr_destroy(&attr);
     }
 }
 
@@ -2079,10 +2202,29 @@ void t2_register_loop(u32 t1_idx, u32 part, u32 p0_slot, u32 entry_word, u32 arm
     u32 b = t2_bucket_of(part, p0_slot);
     pthread_mutex_lock(&t2_meta_lock);
     if (t2_buckets[b] && t2_bucket_cnt[b] < T2_MAX_LOOPS_PER_BUCKET) {
-        u32 pos = t2_bucket_cnt[b];
-        // Maintain strict ascending entry_word order within each bucket (invariant of bump cursor).
-        if (pos == 0 || t2_buckets[b][pos - 1].entry_word < entry_word) {
-            T2LoopDesc *ld = &t2_buckets[b][pos];
+        T2LoopDesc *arr = t2_buckets[b];
+        u32 cnt = t2_bucket_cnt[b];
+        u32 ins = cnt;
+        bool dup = false;
+        if (cnt > 0 && arr[cnt - 1].entry_word >= entry_word) {
+            // Parallel AOT hits can register unlocked out of entry_word order: insert sorted so no loop is dropped.
+            u32 lo = 0, hi = cnt;
+            while (lo < hi) {
+                u32 mid = lo + (hi - lo) / 2;
+                if (arr[mid].entry_word < entry_word)
+                    lo = mid + 1;
+                else
+                    hi = mid;
+            }
+            if (lo < cnt && arr[lo].entry_word == entry_word)
+                dup = true;
+            else
+                ins = lo;
+        }
+        if (!dup) {
+            if (ins < cnt)
+                memmove(&arr[ins + 1], &arr[ins], (size_t)(cnt - ins) * sizeof(T2LoopDesc));
+            T2LoopDesc *ld = &arr[ins];
             memset(ld, 0, sizeof *ld);
             ld->t1_idx = t1_idx;
             ld->part = part;
@@ -2100,8 +2242,9 @@ void t2_register_loop(u32 t1_idx, u32 part, u32 p0_slot, u32 entry_word, u32 arm
             ld->cpl = cpl;
             ld->compat = compat;
             ld->state = T2_IDLE;
-            t2_bucket_cnt[b] = pos + 1U;
-            t2_t1_map_insert(t1_idx, b, pos);
+            t2_bucket_cnt[b] = cnt + 1U;
+            for (u32 k = ins; k <= cnt; k++)
+                t2_t1_map_insert(arr[k].t1_idx, b, k);
             t2_stat_registered++;
         }
     }

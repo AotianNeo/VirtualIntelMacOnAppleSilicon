@@ -22,7 +22,7 @@
 #define PROF_HASH_SIZE       (1U << PROF_HASH_BITS)
 #define PROF_TOP_BLOCKS      50U
 #define PROF_MAX_BLOCK_INSNS 256U
-#define PROF_T2_MAX_INSNS    96U
+#define PROF_T2_MAX_INSNS    256U
 #define PROF_TICK_HZ         24000000.0
 
 typedef struct {
@@ -132,7 +132,7 @@ const char *tr_profile_t2_diag_str(TrProfT2Diag d) {
         case TR_PROF_T2_NO_BACKEDGE:           return "NO_BACKEDGE";
         case TR_PROF_T2_HAS_CALL_RET:          return "HAS_CALL_RET";
         case TR_PROF_T2_FORBIDDEN_OP:          return "FORBIDDEN_OP";
-        case TR_PROF_T2_TOO_LARGE:             return "TOO_LARGE(>96)";
+        case TR_PROF_T2_TOO_LARGE:             return "TOO_LARGE(>256)";
         case TR_PROF_T2_CROSS_PAGE:            return "CROSS_PAGE";
         case TR_PROF_T2_NESTED_LOOP:           return "NESTED_LOOP";
         case TR_PROF_T2_UNREADABLE_GUEST:      return "UNREADABLE_GUEST";
