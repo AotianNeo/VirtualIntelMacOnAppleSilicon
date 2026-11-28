@@ -134,6 +134,16 @@ enum {
     OP_FAR, // sub 0 retf, 1 call, 2 jmp. has_imm: direct, imm the offset, disp the selector
 };
 
+enum { EXT_OP_NONE = 0, EXT_OP_GPR = 1, EXT_OP_VEC = 2, EXT_OP_MEM = 3, EXT_OP_IMM = 4 };
+
+typedef struct {
+    u16 mnem;        // ZydisMnemonic
+    u8  op_cnt;      // visible operand count (0..4)
+    u8  op_type[4];  // EXT_OP_*
+    u8  op_reg[4];   // GPR/VEC index 0..15
+    u8  op_bytes[4]; // operand size in bytes (1, 2, 4, 8, 16, 32)
+} ExtDecoded;
+
 typedef struct {
     u8 op, sz, srcsz, sub, cc, rm, reg, base, index, scale;
     u8 reads, writes; // flag liveness
@@ -145,8 +155,7 @@ typedef struct {
     bool rm_reg, to_reg, has_imm, by_cl, lock, addr32, addr16, pop_seg, riprel, no_base, no_index, high_reg, high_rm, memop, vsib;
     i64 disp, imm;
     u64 rip, next, target;
-    u8 ext_bytes[16];
-    u8 ext_len;
+    ExtDecoded ext;
     const char *why;
 } Insn;
 

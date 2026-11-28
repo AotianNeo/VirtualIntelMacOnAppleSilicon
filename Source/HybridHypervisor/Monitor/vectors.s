@@ -638,3 +638,11 @@ _stub_lookup_l1_fast:
     eor x23, x23, x16
     cbnz x23, _stub_lookup_l1
     ret
+
+    .org _stub_base + 0x930
+// CPL=3 64-bit return-stack miss: probe per-vCPU L1 before falling back to L2 hash.
+    .globl _stub_ret_miss_l1
+_stub_ret_miss_l1:
+    ldr x26, [x18, #CTX_RS_TOP]
+    bl _stub_lookup_l1_fast
+    br x22

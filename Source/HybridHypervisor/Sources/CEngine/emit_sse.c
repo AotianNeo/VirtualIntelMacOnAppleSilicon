@@ -324,22 +324,55 @@ static void pack(const Insn *in, u32 base, u32 base2) {
 static void emit_lanes32(int d, int src1, int src2, int imm) {
     imm &= 0xff;
     if (src1 == src2) {
-        if (imm == 0xE4) {
-            vmov(d, src1);
-            return;
-        }
-        if (imm == 0x00 || imm == 0x55 || imm == 0xAA || imm == 0xFF) {
-            int k = imm & 3;
-            E(0x4E040400u | (u32)k << 19 | (u32)src1 << 5 | (u32)d); // dup v.4s, vn.s[k]
-            return;
-        }
-        if (imm == 0x4E) {
-            E(0x6E004000u | (u32)src1 << 16 | (u32)src1 << 5 | (u32)d); // ext v.16b, vn, vn, #8
-            return;
-        }
-        if (imm == 0xB1) {
-            RR(0x4EA00800u, d, src1); // rev64 v.4s, vn.4s
-            return;
+        switch (imm) {
+            case 0xE4: vmov(d, src1); return;
+            case 0x00: case 0x55: case 0xAA: case 0xFF: {
+                int k = imm & 3;
+                E(0x4E040400u | (u32)k << 19 | (u32)src1 << 5 | (u32)d); // dup v.4s, vn.s[k]
+                return;
+            }
+            case 0x44: E(0x4E080400u | (u32)src1 << 5 | (u32)d); return; // dup v.2d, vn.d[0]
+            case 0xEE: E(0x4E180400u | (u32)src1 << 5 | (u32)d); return; // dup v.2d, vn.d[1]
+            case 0xB1: RR(0x4EA00800u, d, src1); return; // rev64 v.4s, vn.4s
+            case 0x4E: E(0x6E004000u | (u32)src1 << 16 | (u32)src1 << 5 | (u32)d); return; // ext #8
+            case 0x39: E(0x6E002000u | (u32)src1 << 16 | (u32)src1 << 5 | (u32)d); return; // ext #4
+            case 0x93: E(0x6E006000u | (u32)src1 << 16 | (u32)src1 << 5 | (u32)d); return; // ext #12
+            case 0x50: RRR(0x4E803800u, d, src1, src1); return; // zip1 .4s
+            case 0xFA: RRR(0x4E807800u, d, src1, src1); return; // zip2 .4s
+            case 0x88: RRR(0x4E801800u, d, src1, src1); return; // uzp1 .4s
+            case 0xDD: RRR(0x4E805800u, d, src1, src1); return; // uzp2 .4s
+            case 0xA0: RRR(0x4E802800u, d, src1, src1); return; // trn1 .4s
+            case 0xF5: RRR(0x4E806800u, d, src1, src1); return; // trn2 .4s
+            case 0x1B:
+                RR(0x4EA00800u, V_S0, src1);
+                E(0x6E004000u | (u32)V_S0 << 16 | (u32)V_S0 << 5 | (u32)d);
+                return;
+            case 0x11:
+                RR(0x4EA00800u, V_S0, src1);
+                RRR(0x4EC03800u, d, V_S0, V_S0);
+                return;
+            case 0xBB:
+                RR(0x4EA00800u, V_S0, src1);
+                RRR(0x4EC07800u, d, V_S0, V_S0);
+                return;
+            case 0x33:
+                E(0x6E002000u | (u32)src1 << 16 | (u32)src1 << 5 | V_S0);
+                RRR(0x4EC07800u, d, V_S0, V_S0);
+                return;
+            case 0x22:
+                E(0x6E004000u | (u32)src1 << 16 | (u32)src1 << 5 | V_S0); // ext #8 -> [2,3,0,1]
+                RRR(0x4E801800u, d, V_S0, V_S0); // uzp1 .4s -> [2,0,2,0]
+                return;
+            case 0x77:
+                E(0x6E004000u | (u32)src1 << 16 | (u32)src1 << 5 | V_S0); // ext #8 -> [2,3,0,1]
+                RRR(0x4E805800u, d, V_S0, V_S0); // uzp2 .4s -> [3,1,3,1]
+                return;
+            case 0x99:
+                E(0x6E002000u | (u32)src1 << 16 | (u32)src1 << 5 | V_S0); // ext #4 -> [1,2,3,0]
+                RRR(0x4EC03800u, d, V_S0, V_S0); // zip1 .2d -> [1,2,1,2]
+                return;
+            default:
+                break;
         }
     }
     if (imm == 0x44) {
@@ -350,6 +383,10 @@ static void emit_lanes32(int d, int src1, int src2, int imm) {
         RRR(0x4EC07800u, d, src1, src2); // zip2 v.2d, vsrc1.2d, vsrc2.2d
         return;
     }
+    if (imm == 0x4E) {
+        E(0x6E004000u | (u32)src2 << 16 | (u32)src1 << 5 | (u32)d); // ext .16b, src1, src2, #8
+        return;
+    }
     if (imm == 0x88) {
         RRR(0x4E801800u, d, src1, src2); // uzp1 v.4s, vsrc1.4s, vsrc2.4s
         return;
@@ -358,11 +395,31 @@ static void emit_lanes32(int d, int src1, int src2, int imm) {
         RRR(0x4E805800u, d, src1, src2); // uzp2 v.4s, vsrc1.4s, vsrc2.4s
         return;
     }
+    if (imm == 0xE4) {
+        int dst = (d == src2 && d != src1) ? V_S0 : d;
+        vmov(dst, src1);
+        ins_elem(dst, 1, src2, 1, 8);
+        if (dst != d)
+            vmov(d, dst);
+        return;
+    }
     int tmp = (d != src1 && d != src2) ? d : V_S0;
-    ins_elem(tmp, 0, src1, imm & 3, 4);
-    ins_elem(tmp, 1, src1, (imm >> 2) & 3, 4);
-    ins_elem(tmp, 2, src2, (imm >> 4) & 3, 4);
-    ins_elem(tmp, 3, src2, (imm >> 6) & 3, 4);
+    if ((imm & 0xf) == 0x4) {
+        ins_elem(tmp, 0, src1, 0, 8);
+    } else if ((imm & 0xf) == 0xe) {
+        ins_elem(tmp, 0, src1, 1, 8);
+    } else {
+        ins_elem(tmp, 0, src1, imm & 3, 4);
+        ins_elem(tmp, 1, src1, (imm >> 2) & 3, 4);
+    }
+    if ((imm >> 4) == 0x4) {
+        ins_elem(tmp, 1, src2, 0, 8);
+    } else if ((imm >> 4) == 0xe) {
+        ins_elem(tmp, 1, src2, 1, 8);
+    } else {
+        ins_elem(tmp, 2, src2, (imm >> 4) & 3, 4);
+        ins_elem(tmp, 3, src2, (imm >> 6) & 3, 4);
+    }
     if (tmp != d)
         vmov(d, tmp);
 }
@@ -371,20 +428,14 @@ static void lanes32(const Insn *in, int src1, int src2) {
     emit_lanes32(in->reg, src1, src2, (int)in->imm);
 }
 
-// pmovmskb, movmskps and movmskpd: gather sign bits through a multiply, no NZCV.
+// pmovmskb: 6-insn zero-constant NEON USHR+USRA bit-pack, single UMOV, no NZCV.
 static void emit_pmovmskb(int rd, int s) {
-    u32 enc;
-    logimm(0x8080808080808080ULL, 1, &enc);
-    movimm(S2, 0x0002040810204081ULL);
-    umov_d(S0, s, 0);
-    umov_d(S1, s, 1);
-    E(0x92000000u | enc | S0 << 5 | S0);
-    E(0x92000000u | enc | S1 << 5 | S1);
-    mul(1, S0, S0, S2);
-    mul(1, S1, S1, S2);
-    lsr_imm(1, S0, S0, 56);
-    lsr_imm(1, S1, S1, 56);
-    logic_sh(1, 1, 0, rd, S0, S1, 0, 8);
+    RR(0x6F090400u, V_S0, s);      // ushr v24.16b, vs.16b, #7
+    RR(0x6F191400u, V_S0, V_S0);   // usra v24.8h, v24.8h, #7
+    RR(0x6F321400u, V_S0, V_S0);   // usra v24.4s, v24.4s, #14
+    RR(0x6F641400u, V_S0, V_S0);   // usra v24.2d, v24.2d, #28
+    ins_elem(V_S0, 1, V_S0, 8, 1); // ins v24.b[1], v24.b[8]
+    E(0x0E023C00u | (u32)V_S0 << 5 | (u32)rd); // umov w_rd, v24.h[0]
 }
 
 // SSSE3: opcode from the 0F 38 or 0F 3A map, 66 prefix checked by the decoder.
@@ -471,10 +522,25 @@ static void emit_ssse3(const Insn *in) {
     }
 }
 
-// addsubps and addsubpd, lane by lane, so that no lane raises an FP flag for the operation it does not perform.
+// addsubps and addsubpd: 3-4 insn pure NEON fast path when !tr_precise_flags; lane-by-lane under precise flags.
 static void emit_addsub(const Insn *in) {
     bool isd = in->pfx == 0x66;
-    int s = src_op(in, 4, true), d = in->reg, bytes = isd ? 8 : 4, lanes = 16 / bytes;
+    int s = src_op(in, 4, true), d = in->reg;
+    if (!tr_precise_flags) {
+        if (isd) {
+            RRR(0x4EE0D400u, V_S0, d, s); // fsub .2d
+            RRR(0x4E60D400u, V_S1, d, s); // fadd .2d
+            ins_elem(V_S0, 1, V_S1, 1, 8);
+            vmov(d, V_S0);
+        } else {
+            RRR(0x4EA0D400u, V_S0, d, s); // fsub .4s
+            RRR(0x4E20D400u, V_S1, d, s); // fadd .4s
+            RR(0x4EA00800u, V_S0, V_S0);  // rev64 .4s -> [sub1, sub0, sub3, sub2]
+            RRR(0x4E806800u, d, V_S0, V_S1); // trn2 .4s -> [sub0, add1, sub2, add3]
+        }
+        return;
+    }
+    int bytes = isd ? 8 : 4, lanes = 16 / bytes;
     u32 ftype = isd ? 1u << 22 : 0;
     for (int i = 0; i < lanes; i++) {
         ins_elem(V_S0, 0, d, i, bytes);
@@ -684,8 +750,36 @@ static void emit_sse41(const Insn *in, int live) {
             case 0x0D:
             case 0x0E: {
                 int s = src_op(in, 4, true), bytes = opc == 0x0C ? 4 : opc == 0x0D ? 8 : 2;
-                for (int i = 0; i < 16 / bytes; i++)
-                    if ((imm >> i) & 1)
+                int lanes = 16 / bytes;
+                int mask = imm & ((1 << lanes) - 1);
+                if (mask == 0)
+                    return;
+                if (mask == (1 << lanes) - 1) {
+                    vmov(d, s);
+                    return;
+                }
+                if (bytes == 4) {
+                    if (mask == 0x3) { ins_elem(d, 0, s, 0, 8); return; }
+                    if (mask == 0xC) { ins_elem(d, 1, s, 1, 8); return; }
+                    if (mask == 0x5) { RR(0x4EA00800u, V_S0, s); RRR(0x4E806800u, d, V_S0, d); return; }
+                    if (mask == 0xA) { RR(0x4EA00800u, V_S0, d); RRR(0x4E806800u, d, V_S0, s); return; }
+                } else if (bytes == 2) {
+                    if (mask == 0x0F) { ins_elem(d, 0, s, 0, 8); return; }
+                    if (mask == 0xF0) { ins_elem(d, 1, s, 1, 8); return; }
+                    if (mask == 0x55) { RR(0x6E600800u, V_S0, s); RRR(0x4E406800u, d, V_S0, d); return; }
+                    if (mask == 0xAA) { RR(0x6E600800u, V_S0, d); RRR(0x4E406800u, d, V_S0, s); return; }
+                    if (mask == 0x33) { RR(0x4EA00800u, V_S0, s); RRR(0x4E806800u, d, V_S0, d); return; }
+                    if (mask == 0xCC) { RR(0x4EA00800u, V_S0, d); RRR(0x4E806800u, d, V_S0, s); return; }
+                    // Coalesce adjacent matching 16-bit lanes into 32-bit INS when possible.
+                    if (((mask & 0x55) << 1) == (mask & 0xAA)) {
+                        for (int i = 0; i < 4; i++)
+                            if ((mask >> (2 * i)) & 1)
+                                ins_elem(d, i, s, i, 4);
+                        return;
+                    }
+                }
+                for (int i = 0; i < lanes; i++)
+                    if ((mask >> i) & 1)
                         ins_elem(d, i, s, i, bytes);
                 return;
             }
@@ -727,19 +821,20 @@ static void emit_sse41(const Insn *in, int live) {
                 }
                 RRR(dbl ? 0x6E60DC00u : 0x6E20DC00u, V_S0, d, s);
                 if (srcm != full) {
-                    u64 lo, hi;
                     if (dbl) {
-                        lo = (srcm & 1) ? ~0ULL : 0;
-                        hi = (srcm & 2) ? ~0ULL : 0;
+                        if (srcm == 1)
+                            RR(0x1E604000u, V_S0, V_S0); // fmov d, d: clear lane 1
+                        else
+                            E(0x4E081C00u | (u32)XZR << 5 | V_S0); // ins v.d[0], xzr
+                    } else if (srcm == 0x3) {
+                        RR(0x1E604000u, V_S0, V_S0); // fmov d, d: clear lanes 2,3
+                    } else if (srcm == 0xC) {
+                        E(0x4E081C00u | (u32)XZR << 5 | V_S0); // ins v.d[0], xzr: clear lanes 0,1
                     } else {
-                        lo = ((srcm & 1) ? 0xffffffffULL : 0) | ((srcm & 2) ? 0xffffffffULL << 32 : 0);
-                        hi = ((srcm & 4) ? 0xffffffffULL : 0) | ((srcm & 8) ? 0xffffffffULL << 32 : 0);
+                        for (int i = 0; i < 4; i++)
+                            if (!(srcm & (1u << i)))
+                                E(0x4E041C00u | (u32)i << 19 | (u32)XZR << 5 | V_S0); // ins v.s[i], wzr
                     }
-                    movimm(S0, lo);
-                    RR(0x9E670000u, V_S1, S0);
-                    movimm(S0, hi);
-                    E(0x4E081C00u | 1u << 20 | (u32)S0 << 5 | V_S1);
-                    RRR(0x4E201C00u, V_S0, V_S0, V_S1); // and
                 }
                 E(0x6E201C00u | V_S1 << 16 | V_S1 << 5 | V_S1);
                 RRR(dbl ? 0x6E60D400u : 0x6E20D400u, V_S0, V_S0, V_S1);
@@ -822,21 +917,51 @@ static void emit_sse41(const Insn *in, int live) {
             RRR(0x6EA01C00u, d, s, V_S0); // bit
             return;
         case 0x17: { // ptest: ZF from d AND s, CF from NOT d AND s, the rest clear
-            RRR(0x4E201C00u, V_S0, d, s);
-            RRR(0x4E601C00u, V_S1, s, d); // bic
-            umov_d(S0, V_S0, 0);
-            umov_d(S1, V_S0, 1);
-            logic_sh(1, 1, 0, S0, S0, S1, 0, 0);
-            umov_d(S1, V_S1, 0);
-            umov_d(S2, V_S1, 1);
-            logic_sh(1, 1, 0, S1, S1, S2, 0, 0);
-            add_imm(1, 1, 1, XZR, S0, 0);
-            cset(S0, 0);
-            add_imm(1, 1, 1, XZR, S1, 0);
-            cset(S1, 1); // the engine keeps x86 CF inverted in C
-            lsl_imm(1, S0, S0, 30);
-            logic_sh(1, 1, 0, S0, S0, S1, 0, 29);
-            E(0xD51B4200u | S0); // msr nzcv
+            if (!live)
+                return;
+            if (live == F_Z) {
+                int av = d;
+                if (d != s) {
+                    RRR(0x4E201C00u, V_S0, d, s);
+                    av = V_S0;
+                }
+                RRR(0x6EA0A400u, V_S0, av, av); // umaxp .4s
+                RR(0x9E660000u, S0, V_S0);      // fmov xS0, d24
+                add_imm(1, 1, 1, XZR, S0, 0);   // cmp xS0, #0 -> Z = (S0 == 0)
+                return;
+            }
+            if (live == F_C) {
+                if (d == s) {
+                    rmif(XZR, 0, 2); // ~d & d == 0 -> x86 CF=1 -> Arm64 C=0
+                    return;
+                }
+                RRR(0x4E601C00u, V_S1, s, d);   // bic
+                RRR(0x6EA0A400u, V_S1, V_S1, V_S1); // umaxp .4s
+                RR(0x9E660000u, S1, V_S1);      // fmov xS1, d25
+                add_imm(1, 1, 1, XZR, S1, 1);   // cmp xS1, #1 -> C = (S1 != 0) = !CF
+                return;
+            }
+            if (d == s) {
+                RRR(0x6EA0A400u, V_S0, d, d);   // umaxp .4s
+                RR(0x9E660000u, S0, V_S0);      // fmov xS0, d24
+                add_imm(1, 1, 1, XZR, S0, 0);
+                cset(S0, 0);
+                lsl_imm(1, S0, S0, 30);         // Z=(d==0), C=0(CF=1), N=0, V=0
+                E(0xD51B4200u | S0);            // msr nzcv
+            } else {
+                RRR(0x4E201C00u, V_S0, d, s);
+                RRR(0x4E601C00u, V_S1, s, d);   // bic
+                RRR(0x6EA0A400u, V_S0, V_S0, V_S1); // umaxp .4s: d[0]=any(V_S0), d[1]=any(V_S1)
+                RR(0x9E660000u, S0, V_S0);      // fmov xS0, d24
+                umov_d(S1, V_S0, 1);
+                add_imm(1, 1, 1, XZR, S0, 0);
+                cset(S0, 0);
+                add_imm(1, 1, 1, XZR, S1, 0);
+                cset(S1, 1); // the engine keeps x86 CF inverted in C
+                lsl_imm(1, S0, S0, 30);
+                logic_sh(1, 1, 0, S0, S0, S1, 0, 29);
+                E(0xD51B4200u | S0); // msr nzcv
+            }
             if (live & (F_P | F_A)) {
                 movimm(R_PF, 1); // an odd low byte: PF clear
                 mov_reg(1, R_AF, R_PF);
@@ -1268,20 +1393,19 @@ void emit_sse(const Insn *in, int live) {
                 svc(SVC_UD);
                 break;
             }
-            umov_d(S0, in->rm, 0);
-            umov_d(S1, in->rm, 1);
             if (pfx == 0) {
-                ubfx(1, S2, S0, 31, 1);
-                lsr_imm(1, S0, S0, 63);
-                logic_sh(1, 1, 0, S2, S2, S0, 0, 1);
-                ubfx(1, S0, S1, 31, 1);
-                logic_sh(1, 1, 0, S2, S2, S0, 0, 2);
-                lsr_imm(1, S1, S1, 63);
-                logic_sh(1, 1, 0, d, S2, S1, 0, 3);
+                // movmskps: 5-insn pure NEON USHR+USRA+XTN + single FMOV.
+                RR(0x6F210400u, V_S0, in->rm); // ushr v24.4s, vrm.4s, #31
+                RR(0x6F611400u, V_S0, V_S0);   // usra v24.2d, v24.2d, #31
+                RR(0x0EA12800u, V_S0, V_S0);   // xtn v24.2s, v24.2d
+                RR(0x7F621400u, V_S0, V_S0);   // usra d24, d24, #30
+                RR(0x1E260000u, d, V_S0);      // fmov w_d, s24
             } else {
-                lsr_imm(1, S0, S0, 63);
-                lsr_imm(1, S1, S1, 63);
-                logic_sh(1, 1, 0, d, S0, S1, 0, 1);
+                // movmskpd: 4-insn pure NEON USHR+XTN+USRA + single FMOV.
+                RR(0x6F410400u, V_S0, in->rm); // ushr v24.2d, vrm.2d, #63
+                RR(0x0EA12800u, V_S0, V_S0);   // xtn v24.2s, v24.2d
+                RR(0x7F611400u, V_S0, V_S0);   // usra d24, d24, #31
+                RR(0x1E260000u, d, V_S0);      // fmov w_d, s24
             }
             break;
         }

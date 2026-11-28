@@ -130,7 +130,7 @@ Addr addr_prepare(const Insn *in, int access) {
         u64 target = in->next + (u64)in->disp;
         u64 pg = target & ~0xfffULL;
         u32 off = (u32)(target & 0xfffULL);
-        if ((off & (u32)(access - 1)) == 0) {
+        if ((off & (u32)(access - 1)) == 0 || off < 256) {
             if (pg != tr_ad_page) {
                 movimm(AD, pg);
                 tr_ad_page = pg;
@@ -524,10 +524,12 @@ static void emit_alu(const Insn *in, int live) {
         if (use_imm)
             src = imm_to(in, S1);
         if (tr_opt_peep && (alu == ALU_XOR || alu == ALU_SUB) && dst == src && dst_is_reg && !mem && !use_imm) {
-            mov_reg(sf, rd, XZR);
+            if (live & F_NZCV) {
+                add_reg(sf, 1, 1, rd, XZR, XZR, 0); // subs rd, xzr, xzr -> rd=0, N=0, Z=1, C=1(CF=0), V=0
+            } else {
+                mov_reg(sf, rd, XZR);
+            }
             if (live) {
-                if (live & F_NZCV)
-                    add_reg(0, 1, 1, XZR, XZR, XZR, 0); // subs wzr, wzr, wzr -> N=0, Z=1, C=1(CF=0), V=0
                 if (live & (F_P | F_A))
                     mov_reg(0, R_PF, XZR);
                 if (live & F_A)
@@ -1404,15 +1406,56 @@ static void emit_shd(const Insn *in, int live) {
         }
         return;
     }
-    if (sz == 4 && in->by_cl && !mem && !live) {
-        // 32-bit code's 64-bit shifts, in every libgcc division: with flags dead, a wide shift of the pair. The helper is a trap each.
-        and_imm_w(S1, 1, 31);
-        mov_reg(0, S0, right ? d : in->reg);
-        logic_sh(1, 1, 0, S0, S0, right ? in->reg : d, 0, 32);
-        var_shift(1, right ? 1 : 0, S0, S0, S1);
-        if (!right)
-            lsr_imm(1, S0, S0, 32);
-        mov_reg(0, in->rm, S0);
+    if (sz >= 4 && in->by_cl) {
+        // Inline EL0 SHLD/SHRD by CL for 32/64-bit (reg or mem, dead or live flags):
+        // avoids ~800-cycle SVC_H_SHD trap while matching h_shd() bit-for-bit.
+        if (d != S0)
+            mov_reg(sf, S0, d);
+        else if (!sf)
+            mov_reg(0, S0, S0);
+        and_imm_w(S1, 1, bits - 1);
+        mov_reg(sf, S2, S0);
+        u32 *skip_shift = tr_cc;
+        cbz(0, 0, S1, 0);
+        add_reg(0, 1, 0, S3, XZR, S1, 0); // -cnt (mod bits == bits - cnt for 1 <= cnt < bits)
+        if (right) {
+            var_shift(sf, 1, S2, S0, S1);
+            var_shift(sf, 0, S4, in->reg, S3);
+        } else {
+            var_shift(sf, 0, S2, S0, S1);
+            var_shift(sf, 1, S4, in->reg, S3);
+        }
+        logic_reg(sf, 1, 0, S2, S2, S4);
+        *skip_shift |= ((u32)(tr_cc - skip_shift) & 0x7ffffu) << 5;
+        if (mem)
+            ldst(0, sz, S2, a); // store before touching flags so faults remain precise
+        if (live) {
+            u32 *skip_flags = tr_cc;
+            cbz(0, 0, S1, 0);
+            if (live & (F_N | F_Z | F_V))
+                logic_reg(sf, 3, 0, XZR, S2, S2); // N, Z, C=0, V=0
+            if (live & F_C) {
+                if (right) {
+                    add_imm(0, 1, 0, S4, S1, 1);
+                    var_shift(sf, 1, S4, S0, S4);
+                } else {
+                    var_shift(sf, 1, S4, S0, S3);
+                }
+                rmif(S4, 63, 2);
+                cfinv();
+            }
+            if (live & F_V) {
+                logic_reg(sf, 2, 0, S4, S0, S2);
+                rmif(S4, bits - 1, 1);
+            }
+            if (live & (F_P | F_A))
+                mov_reg(0, R_PF, S2);
+            if (live & F_A)
+                mov_reg(1, R_AF, R_PF);
+            *skip_flags |= ((u32)(tr_cc - skip_flags) & 0x7ffffu) << 5;
+        }
+        if (!mem)
+            mov_reg(sf, in->rm, S2);
         return;
     }
     if (d != S0)
@@ -1672,6 +1715,41 @@ static void emit_bt(const Insn *in, int live) {
     bool mem = !in->rm_reg;
     if (in->lock && (!mem || sub == 0)) {
         emit_ud();
+        return;
+    }
+    if (in->has_imm && !in->lock) {
+        // Immediate bit index: direct RMIF for CF and 1-insn logical immediate for BTS/BTR/BTC.
+        int bit = (int)((u64)in->imm & (u64)(bits - 1));
+        Addr a = {0};
+        if (mem) {
+            a = addr_prepare(in, sz);
+            ldst(1, sz, S0, a);
+        }
+        int v = mem ? S0 : in->rm;
+        if (sub) {
+            u64 mask = 1ULL << bit;
+            u32 enc = 0;
+            int opc = sub == 1 ? 1 : sub == 2 ? 0 : 2; // ORR / AND(~mask) / EOR
+            logimm(sub == 2 ? ~mask : mask, 1, &enc);
+            int dst = (!mem && sz >= 4 && !(live & F_C)) ? in->rm : S2;
+            E(0x92000000u | (u32)opc << 29 | enc | (u32)v << 5 | (u32)dst);
+            if (mem)
+                ldst(0, sz, dst, a);
+            else if (dst != in->rm) {
+                if (live & F_C) {
+                    rmif(v, (bit - 1) & 63, 2);
+                    cfinv();
+                }
+                gpr_write(in->rm, sz, false, dst);
+                return;
+            } else if (sz == 4) {
+                mov_reg(0, in->rm, in->rm);
+            }
+        }
+        if (live & F_C) {
+            rmif(v, (bit - 1) & 63, 2);
+            cfinv();
+        }
         return;
     }
     int cnt = S1;
@@ -1941,6 +2019,15 @@ static void emit_lea(const Insn *in) {
         int rd = in->reg, sf = in->sz == 8;
         if (in->riprel) {
             u64 target = in->next + in->disp;
+            u64 pg = target & ~0xfffULL;
+            u32 off = (u32)(target & 0xfffULL);
+            if (tr_opt_peep && tr_ad_page == pg) {
+                if (off == 0)
+                    mov_reg(sf, rd, AD);
+                else
+                    add_imm(sf, 0, 0, rd, AD, off);
+                return;
+            }
             movimm(rd, sf ? target : (target & 0xffffffffULL));
             return;
         }

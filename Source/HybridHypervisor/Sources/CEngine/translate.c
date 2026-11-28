@@ -87,6 +87,7 @@ bool tr_reload_backend(const char *dylib_path) {
 #define MAX_DAG_SPAN 1024
 #define STUB_OFF_LOOKUP_L1 0x860ULL
 #define STUB_OFF_LOOKUP_L1_FAST 0x900ULL
+#define STUB_OFF_RET_MISS_L1 0x930ULL
 #define MAP_BITS 22
 #define MAP_SIZE (1u << MAP_BITS)
 
@@ -353,6 +354,9 @@ ok:
 }
 
 static u64 fetch_lo, fetch_hi; // all a translation has read
+static bool fetch_cache_valid;
+static u64 fetch_cache_va_page, fetch_cache_gpa_page, fetch_cache_cr3;
+static int fetch_cache_cpl;
 
 // ---- Inert analyzed-input recurrence census ----
 // One entry per direct-mapped identity, full population: this is not a sampled cache with an inflated retention budget.
@@ -529,17 +533,29 @@ int tr_fetch(u64 va, u8 *out, int n) {
     if (va + (u64)n > fetch_hi)
         fetch_hi = va + (u64)n;
     while (got < n) {
+        u64 cur = va + (u64)got;
+        u64 cur_pg = cur & ~0xfffULL;
         u64 gpa;
-        if (!fetch_walk(va + got, &gpa)) {
-            compile_inputs_reject(TR_CI_PARTIAL);
-            return got;
+        if (fetch_cache_valid && cur_pg == fetch_cache_va_page &&
+            walk_cr3 == fetch_cache_cr3 && walk_cpl == fetch_cache_cpl) {
+            gpa = fetch_cache_gpa_page | (cur & 0xfffULL);
+        } else {
+            if (!fetch_walk(cur, &gpa)) {
+                compile_inputs_reject(TR_CI_PARTIAL);
+                return got;
+            }
+            fetch_cache_va_page = cur_pg;
+            fetch_cache_gpa_page = gpa & ~0xfffULL;
+            fetch_cache_cr3 = walk_cr3;
+            fetch_cache_cpl = walk_cpl;
+            fetch_cache_valid = true;
         }
-        int chunk = 4096 - (int)((va + got) & 0xfff);
+        int chunk = 4096 - (int)(cur & 0xfff);
         if (chunk > n - got)
             chunk = n - got;
         memcpy(out + got, ram_at(gpa), chunk);
         if (cfg.profile_compile_inputs)
-            compile_inputs_read(va + got, out + got, chunk, gpa);
+            compile_inputs_read(cur, out + got, chunk, gpa);
         got += chunk;
     }
     return got;
@@ -944,15 +960,18 @@ static void emit_control(const Insn *in, int idx, int live_after) {
                     add_reg(!tr_compat, 0, 0, 4, 4, S1, 0);
                 }
             }
+            u64 ret_miss_va = use_native_l1(tr_cpl, tr_compat)
+                                  ? STUB(PRIV_VA + OFF_STUBS + STUB_OFF_RET_MISS_L1)
+                                  : STUB(tr_stub_ret_miss);
             if (cfg.no_return_prediction) { // the guest's value decides, by lookup
-                b_rel((int)((i64)(STUB(tr_stub_ret_miss) - tr_cc_va(tr_cc)) / 4));
+                b_rel((int)((i64)(ret_miss_va - tr_cc_va(tr_cc)) / 4));
                 break;
             }
             E(0xA8C00000u | 2 << 15 | LR << 10 | RS << 5 | S1); // ldp x17, x30, [x26], #16
             logic_reg(1, 2, 0, S1, S1, S0);
             cbz(1, 1, S1, 2);
             ret_reg(LR);
-            b_rel((int)((i64)(STUB(tr_stub_ret_miss) - tr_cc_va(tr_cc)) / 4));
+            b_rel((int)((i64)(ret_miss_va - tr_cc_va(tr_cc)) / 4));
             break;
         }
         default:
@@ -1182,10 +1201,10 @@ static int est_insn_words(const Insn *in) {
 
 static void expand_forward_dag(Insn *list, int *count_p, int key, u64 entry_rip, u64 page) {
     int count = *count_p;
-    int max_dag_blocks = tr_cpl == 0 ? 4 : 8;
-    int max_dag_insns = tr_cpl == 0 ? 96 : 192;
-    u64 max_dag_span = tr_cpl == 0 ? 384 : 640;
-    int max_est_words = tr_cpl == 0 ? 1200 : 2200;
+    int max_dag_blocks = tr_cpl == 0 ? 4 : 6;
+    int max_dag_insns = tr_cpl == 0 ? 96 : 144;
+    u64 max_dag_span = tr_cpl == 0 ? 384 : 512;
+    int max_est_words = tr_cpl == 0 ? 1200 : 1600;
     if (count <= 0 || count >= max_dag_insns)
         return;
     int est_words = 0;
@@ -1226,7 +1245,7 @@ static void expand_forward_dag(Insn *list, int *count_p, int key, u64 entry_rip,
         u64 t = q[qh++];
         if (t < max_end && linear_find_rip(list, count, t) >= 0)
             continue;
-        if (!cfg.profile_compile_inputs && count >= 12) {
+        if (!cfg.profile_compile_inputs) {
             u32 hit = map_find(key, t);
             if (hit && !hblocks[hit - 1].dead)
                 continue;
@@ -1477,6 +1496,7 @@ static TrResult do_translate(int key, int view, u64 cr3, int cpl, u64 rip, bool 
     walk_cr3 = cr3;
     walk_cpl = cpl;
     tr_cpl = cpl;
+    fetch_cache_valid = false;
     if (tr_needs_flush()) {
         if (ctx_ptr->vcpu_count > 1) {
             res.needs_flush = true;
@@ -1669,7 +1689,7 @@ static TrResult do_translate(int key, int view, u64 cr3, int cpl, u64 rip, bool 
             ext_ymm_cache_flush_dirty();
         }
         if (in->op == OP_SSE || in->op == OP_LDMXCSR || in->op == OP_STMXCSR ||
-            in->op == OP_X87 || in->op == OP_POPCNT) {
+            in->op == OP_X87 || (in->op == OP_POPCNT && !tr_hybrid)) {
             ext_ymm_cache_flush_and_drop();
         }
         if ((!tr_opt_peep && in->op != OP_SSE && in->op != OP_EXT) ||
@@ -1785,6 +1805,58 @@ static TrResult do_translate(int key, int view, u64 cr3, int cpl, u64 rip, bool 
                         }
                     }
                 }
+            } else if (in->op == OP_SETCC && in->rm_reg && !in->high_rm &&
+                       nx->op == OP_MOVZX && nx->rm_reg && !nx->high_rm &&
+                       nx->srcsz == 1 && nx->sz >= 4 && nx->rm == in->rm && nx->reg == in->rm) {
+                // 2b) SETcc r8; MOVZX r32/64, r8 (same reg) -> single CSET (1 insn vs 3).
+                int acc = x86_to_arm_cc[in->cc];
+                if (acc < 0) {
+                    emit_parity(nx->reg);
+                    if (in->cc == 11)
+                        E(0x52000000u | (u32)nx->reg << 5 | (u32)nx->reg); // eor wd, wd, #1
+                } else {
+                    cset(nx->reg, acc);
+                }
+                u16 bit = (u16)(1u << nx->reg);
+                tr_zext8 |= bit;
+                tr_zext16 |= bit;
+                insn_arm[i + 1] = insn_arm[i];
+                stats.op_insns[nx->op & 127]++;
+                stats.insns++;
+                i++;
+                fused = true;
+            } else if (in->op == OP_BT && in->sub == 0 && in->has_imm && in->rm_reg && in->sz >= 4 &&
+                       nx->op == OP_JCC && (nx->cc == 2 || nx->cc == 3) && live_after[i + 1] == 0) {
+                // 2c) BT r32/64, imm; JC/JNC -> TBNZ/TBZ (internal target within 14-bit range).
+                u32 *back = internal_target(nx->target, i);
+                int fwd = back ? -1 : forward_target_idx(nx->target, i + 1);
+                bool back_ok = back && (back - tr_cc) >= -(1 << 13) + 16 && (back - tr_cc) < (1 << 13) - 16;
+                bool fwd_ok = false;
+                if (fwd >= 0 && (fwd - (i + 1)) <= 48 && fwd_count < MAX_FWD_FIX) {
+                    fwd_ok = true;
+                    for (int k = i + 2; k < fwd; k++) {
+                        u8 kop = list[k].op;
+                        if (kop == OP_EXT || kop == OP_SSE || kop == OP_X87 || kop == OP_STRING) {
+                            fwd_ok = false;
+                            break;
+                        }
+                    }
+                }
+                if (back_ok || fwd_ok) {
+                    int bit = (int)((u64)in->imm & (u64)(in->sz * 8 - 1));
+                    int nz = nx->cc == 2 ? 1 : 0; // cc==2 is JB/JC (CF==1 -> bit==1 -> TBNZ)
+                    if (back_ok) {
+                        tbz(nz, in->rm, bit, (int)(back - tr_cc));
+                    } else {
+                        add_fwd(tr_cc, fwd, 2);
+                        tbz(nz, in->rm, bit, 0);
+                    }
+                    insn_arm[i + 1] = insn_arm[i];
+                    stats.op_insns[nx->op & 127]++;
+                    stats.insns++;
+                    i++;
+                    fused = true;
+                }
             } else if (!tr_compat && !tr_precise_flags) {
                 // 3) PUSH r1; PUSH r2 -> stp r2, r1, [x4, #-16]!
                 if (in->op == OP_PUSH && in->rm_reg && !in->has_imm && !in->sub && in->sz == 8 && in->rm != 4 &&
@@ -1813,15 +1885,18 @@ static TrResult do_translate(int key, int view, u64 cr3, int cpl, u64 rip, bool 
                 } else if (in->op == OP_POP && in->rm_reg && !in->sub && in->sz == 8 && in->rm != 4 &&
                            nx->op == OP_RET && nx->imm == 0) {
                     // 5) POP r1; RET -> ldp r1, x16, [x4], #16 + 4-insn RAS return
+                    u64 ret_miss_va = use_native_l1(tr_cpl, tr_compat)
+                                          ? STUB(PRIV_VA + OFF_STUBS + STUB_OFF_RET_MISS_L1)
+                                          : STUB(tr_stub_ret_miss);
                     E(0xA8C00000u | (2u << 15) | (u32)S0 << 10 | 4u << 5 | (u32)in->rm);
                     if (cfg.no_return_prediction) {
-                        b_rel((int)((i64)(STUB(tr_stub_ret_miss) - tr_cc_va(tr_cc)) / 4));
+                        b_rel((int)((i64)(ret_miss_va - tr_cc_va(tr_cc)) / 4));
                     } else {
                         E(0xA8C00000u | 2 << 15 | LR << 10 | RS << 5 | S1); // ldp x17, x30, [x26], #16
                         logic_reg(1, 2, 0, S1, S1, S0);
                         cbz(1, 1, S1, 2);
                         ret_reg(LR);
-                        b_rel((int)((i64)(STUB(tr_stub_ret_miss) - tr_cc_va(tr_cc)) / 4));
+                        b_rel((int)((i64)(ret_miss_va - tr_cc_va(tr_cc)) / 4));
                     }
                     tr_ad_page = ~0ULL;
                     tr_zext8 = tr_zext16 = 0;
@@ -1831,6 +1906,42 @@ static TrResult do_translate(int key, int view, u64 cr3, int cpl, u64 rip, bool 
                     stats.insns++;
                     i++;
                     fused = true;
+                } else if (in->op == OP_MOV && nx->op == OP_MOV &&
+                           !in->has_imm && !nx->has_imm && !in->rm_reg && !nx->rm_reg &&
+                           in->sz == nx->sz && (in->sz == 4 || in->sz == 8) &&
+                           in->to_reg == nx->to_reg &&
+                           !in->riprel && !nx->riprel && !in->no_base && !nx->no_base &&
+                           in->no_index && nx->no_index && in->seg == 0 && nx->seg == 0 &&
+                           !in->addr32 && !nx->addr32 && !in->addr16 && !nx->addr16 &&
+                           in->base == nx->base &&
+                           (tr_cpl == 3 || in->base == 4 || in->base == 5)) {
+                    // 6) Adjacent MOV [base+d], r1; MOV [base+d+sz], r2 -> STP/LDP (Win64 prologues/epilogues & struct spills).
+                    int sz = in->sz;
+                    bool fwd_pair = (nx->disp == in->disp + sz);
+                    bool rev_pair = (in->disp == nx->disp + sz);
+                    if (fwd_pair || rev_pair) {
+                        i64 lo = fwd_pair ? in->disp : nx->disp;
+                        int rt1 = fwd_pair ? in->reg : nx->reg;
+                        int rt2 = fwd_pair ? nx->reg : in->reg;
+                        bool load = in->to_reg;
+                        bool ldp_ok = !load || (rt1 != rt2 && in->reg != in->base && nx->reg != in->base);
+                        if (ldp_ok && (lo & (sz - 1)) == 0 && lo >= -64 * sz && lo <= 63 * sz) {
+                            u32 imm7 = (u32)(lo / sz) & 0x7fu;
+                            u32 base_opc = sz == 8 ? (load ? 0xA9400000u : 0xA9000000u)
+                                                   : (load ? 0x29400000u : 0x29000000u);
+                            E(base_opc | imm7 << 15 | (u32)rt2 << 10 | (u32)in->base << 5 | (u32)rt1);
+                            if (load) {
+                                u16 clr = (u16)((1u << rt1) | (1u << rt2));
+                                tr_zext8 &= (u16)~clr;
+                                tr_zext16 &= (u16)~clr;
+                            }
+                            insn_arm[i + 1] = insn_arm[i];
+                            stats.op_insns[nx->op & 127]++;
+                            stats.insns++;
+                            i++;
+                            fused = true;
+                        }
+                    }
                 }
             }
         }

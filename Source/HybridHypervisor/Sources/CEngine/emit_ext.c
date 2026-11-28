@@ -1,10 +1,14 @@
 // Extended x86-64 ISA translator backed by Zydis v4.1.1 decoder and Box64's MIT arm64_emitter.h.
 // Covers Alder Lake scalar/crypto/vector extensions (XGETBV, BMI1, BMI2, ADX, SHA-NI, AVX/AVX2/FMA).
 #include <stddef.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include "tr_internal.h"
 #include <Zydis.h>
 #include "arm64_emitter.h"
+
+_Static_assert(ZYDIS_MNEMONIC_MAX_VALUE <= 65535, "ZydisMnemonic must fit in u16");
 
 #define RRR(base, rd, rn, rm) E((u32)(base) | (u32)(rm) << 16 | (u32)(rn) << 5 | (u32)(rd))
 #define RR(base, rd, rn) E((u32)(base) | (u32)(rn) << 5 | (u32)(rd))
@@ -344,17 +348,17 @@ static void ext_store256_pair(const Insn *in, int vlo, int vhi) {
     VSTP128_I7(vlo, vhi, r, 0);
 }
 
-static int ext_vec_src128(const Insn *in, const ZydisDecodedOperand *op, int scratch_v) {
-    if (op->type == ZYDIS_OPERAND_TYPE_REGISTER)
-        return zydis_vec_idx(op->reg.value, NULL);
+static int ext_vec_src128(const Insn *in, int opi, int scratch_v) {
+    if (in->ext.op_type[opi] == EXT_OP_VEC)
+        return in->ext.op_reg[opi];
     Addr a = addr_prepare(in, 16);
     ext_vldst(4, true, scratch_v, a);
     return scratch_v;
 }
 
-static int ext_gpr_src(const Insn *in, const ZydisDecodedOperand *op, int sz, int scratch_r) {
-    if (op->type == ZYDIS_OPERAND_TYPE_REGISTER) {
-        int r = zydis_gpr_idx(op->reg.value, NULL, NULL);
+static int ext_gpr_src(const Insn *in, int opi, int sz, int scratch_r) {
+    if (in->ext.op_type[opi] == EXT_OP_GPR) {
+        int r = in->ext.op_reg[opi];
         if (sz == 4) {
             mov_reg(0, scratch_r, r);
             return scratch_r;
@@ -684,7 +688,815 @@ static int ext_reject(u64 rip) {
     return 0;
 }
 
+static bool ext_fill_from_zydis(const ZydisDecodedInstruction *zi, const ZydisDecodedOperand *ops, Insn *in) {
+    in->ext.mnem = (u16)zi->mnemonic;
+    u8 cnt = zi->operand_count_visible <= 4 ? zi->operand_count_visible : 4;
+    in->ext.op_cnt = cnt;
+    for (u8 i = 0; i < 4; i++) {
+        in->ext.op_type[i] = EXT_OP_NONE;
+        in->ext.op_reg[i] = 0;
+        in->ext.op_bytes[i] = 0;
+    }
+    for (u8 i = 0; i < cnt; i++) {
+        if (ops[i].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+            u8 vb = 0;
+            int vr = zydis_vec_idx(ops[i].reg.value, &vb);
+            if (vr >= 0) {
+                in->ext.op_type[i] = EXT_OP_VEC;
+                in->ext.op_reg[i] = (u8)vr;
+                in->ext.op_bytes[i] = vb;
+            } else {
+                u8 gs = 0;
+                int gr = zydis_gpr_idx(ops[i].reg.value, &gs, NULL);
+                if (gr < 0)
+                    return false;
+                in->ext.op_type[i] = EXT_OP_GPR;
+                in->ext.op_reg[i] = (u8)gr;
+                in->ext.op_bytes[i] = gs;
+            }
+        } else if (ops[i].type == ZYDIS_OPERAND_TYPE_MEMORY) {
+            in->ext.op_type[i] = EXT_OP_MEM;
+            in->ext.op_bytes[i] = (u8)(ops[i].size >> 3);
+        } else if (ops[i].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+            in->ext.op_type[i] = EXT_OP_IMM;
+            in->ext.op_bytes[i] = (u8)(ops[i].size >> 3);
+            in->imm = (i64)ops[i].imm.value.u;
+        } else {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool fast_vex_modrm(const u8 **pp, const u8 *end, int R, int X, int B, Insn *in, u8 *out_mod, u8 *out_reg, u8 *out_rm) {
+    if (*pp >= end)
+        return false;
+    u8 m = *(*pp)++;
+    u8 mod = m >> 6, rm = m & 7;
+    *out_mod = mod;
+    *out_reg = (u8)(((m >> 3) & 7) | (R << 3));
+    if (mod == 3) {
+        *out_rm = (u8)(rm | (B << 3));
+        return true;
+    }
+    in->memop = true;
+    in->no_index = true;
+    if (rm == 4) {
+        if (*pp >= end)
+            return false;
+        u8 s = *(*pp)++;
+        u8 idx = (u8)(((s >> 3) & 7) | (X << 3));
+        u8 bs = s & 7;
+        if (idx != 4) {
+            in->no_index = false;
+            in->index = idx;
+            in->scale = s >> 6;
+        }
+        if (bs == 5 && mod == 0) {
+            if (*pp + 4 > end)
+                return false;
+            in->no_base = true;
+            i32 d;
+            memcpy(&d, *pp, 4);
+            in->disp = d;
+            *pp += 4;
+        } else {
+            in->base = (u8)(bs | (B << 3));
+        }
+    } else if (rm == 5 && mod == 0) {
+        if (*pp + 4 > end)
+            return false;
+        in->riprel = true;
+        i32 d;
+        memcpy(&d, *pp, 4);
+        in->disp = d;
+        *pp += 4;
+    } else {
+        in->base = (u8)(rm | (B << 3));
+    }
+    if (mod == 1) {
+        if (*pp >= end)
+            return false;
+        in->disp = *(const int8_t *)(*pp)++;
+    } else if (mod == 2) {
+        if (*pp + 4 > end)
+            return false;
+        i32 d;
+        memcpy(&d, *pp, 4);
+        in->disp = d;
+        *pp += 4;
+    }
+    return true;
+}
+
+static inline void ext_set_op(ExtDecoded *e, int idx, u8 type, u8 reg, u8 bytes) {
+    e->op_type[idx] = type;
+    e->op_reg[idx] = reg;
+    e->op_bytes[idx] = bytes;
+}
+
+// Box64-style direct byte decoder for hot 64-bit VEX (0xC5/0xC4) AVX/AVX2/FMA/BMI1/BMI2 instructions.
+// Bypasses ZydisDecoderDecodeFull (~500 ns -> ~15 ns). Falls back to Zydis on any uncommon/invalid/edge encoding.
+static bool fast_decode_vex(u64 rip, Insn *in, const u8 *b, int avail) {
+    if (tr_compat || avail < 3 || (b[0] != 0xC5 && b[0] != 0xC4))
+        return false;
+    const u8 *end = b + (avail > 15 ? 15 : avail);
+    const u8 *p;
+    int R, X, B, W, L, pp, mm, vvvv;
+    u8 opc;
+    if (b[0] == 0xC5) {
+        u8 b1 = b[1];
+        R = !(b1 >> 7);
+        X = 0; B = 0; W = 0;
+        mm = 1;
+        vvvv = (~(b1 >> 3)) & 15;
+        L = (b1 >> 2) & 1;
+        pp = b1 & 3;
+        opc = b[2];
+        p = b + 3;
+    } else {
+        if (avail < 4)
+            return false;
+        u8 b1 = b[1], b2 = b[2];
+        R = !(b1 >> 7);
+        X = !((b1 >> 6) & 1);
+        B = !((b1 >> 5) & 1);
+        mm = b1 & 0x1f;
+        if (mm < 1 || mm > 3)
+            return false;
+        W = (b2 >> 7) & 1;
+        vvvv = (~(b2 >> 3)) & 15;
+        L = (b2 >> 2) & 1;
+        pp = b2 & 3;
+        opc = b[3];
+        p = b + 4;
+    }
+
+    u8 vb = L ? 32 : 16;
+    Insn tmp = *in;
+    tmp.op = OP_EXT;
+    tmp.reads = 0;
+    tmp.writes = 0;
+    tmp.memop = false;
+    tmp.riprel = false;
+    tmp.no_base = false;
+    tmp.no_index = true;
+    tmp.vsib = false;
+    tmp.seg = 0;
+    tmp.addr32 = false;
+    tmp.addr16 = false;
+    tmp.disp = 0;
+    tmp.imm = 0;
+    memset(&tmp.ext, 0, sizeof tmp.ext);
+
+    // Special no-ModRM VEX opcodes: VZEROUPPER / VZEROALL
+    if (mm == 1 && opc == 0x77) {
+        if (pp != 0 || vvvv != 0)
+            return false;
+        tmp.ext.mnem = (u16)(L ? ZYDIS_MNEMONIC_VZEROALL : ZYDIS_MNEMONIC_VZEROUPPER);
+        tmp.ext.op_cnt = 0;
+        tmp.next = rip + (u64)(p - b);
+        *in = tmp;
+        return true;
+    }
+
+    u8 mod = 0, reg = 0, rm = 0;
+    if (!fast_vex_modrm(&p, end, R, X, B, &tmp, &mod, &reg, &rm))
+        return false;
+    u8 rm_type = mod == 3 ? EXT_OP_VEC : EXT_OP_MEM;
+    u8 rm_reg = mod == 3 ? rm : 0;
+
+    u16 mn = 0;
+    bool need_imm = false;
+    int form = 0;
+    // form: 1=3vec(reg,vvvv,rm), 2=2vec(reg,rm,vvvv==0), 3=2vec_store(rm,reg,vvvv==0),
+    //       4=3vec_imm(reg,rm,imm,vvvv==0), 5=4vec_imm(reg,vvvv,rm,imm),
+    //       6=custom (already filled tmp.ext)
+
+    if (mm == 1) {
+        switch (opc) {
+            case 0x10: case 0x11:
+                if (pp <= 1) {
+                    if (vvvv != 0) return false;
+                    mn = pp ? ZYDIS_MNEMONIC_VMOVUPD : ZYDIS_MNEMONIC_VMOVUPS;
+                    form = opc == 0x10 ? 2 : 3;
+                } else {
+                    if (L != 0) return false;
+                    mn = pp == 2 ? ZYDIS_MNEMONIC_VMOVSS : ZYDIS_MNEMONIC_VMOVSD;
+                    u8 mb = pp == 2 ? 4 : 8;
+                    if (mod == 3) {
+                        tmp.ext.op_cnt = 3;
+                        if (opc == 0x10) {
+                            ext_set_op(&tmp.ext, 0, EXT_OP_VEC, reg, 16);
+                            ext_set_op(&tmp.ext, 1, EXT_OP_VEC, (u8)vvvv, 16);
+                            ext_set_op(&tmp.ext, 2, EXT_OP_VEC, rm, 16);
+                        } else {
+                            ext_set_op(&tmp.ext, 0, EXT_OP_VEC, rm, 16);
+                            ext_set_op(&tmp.ext, 1, EXT_OP_VEC, (u8)vvvv, 16);
+                            ext_set_op(&tmp.ext, 2, EXT_OP_VEC, reg, 16);
+                        }
+                    } else {
+                        if (vvvv != 0) return false;
+                        tmp.ext.op_cnt = 2;
+                        if (opc == 0x10) {
+                            ext_set_op(&tmp.ext, 0, EXT_OP_VEC, reg, 16);
+                            ext_set_op(&tmp.ext, 1, EXT_OP_MEM, 0, mb);
+                        } else {
+                            ext_set_op(&tmp.ext, 0, EXT_OP_MEM, 0, mb);
+                            ext_set_op(&tmp.ext, 1, EXT_OP_VEC, reg, 16);
+                        }
+                    }
+                    form = 6;
+                }
+                break;
+            case 0x28: case 0x29:
+                if (pp > 1 || vvvv != 0) return false;
+                mn = pp ? ZYDIS_MNEMONIC_VMOVAPD : ZYDIS_MNEMONIC_VMOVAPS;
+                form = opc == 0x28 ? 2 : 3;
+                break;
+            case 0x6F: case 0x7F:
+                if ((pp != 1 && pp != 2) || vvvv != 0) return false;
+                mn = pp == 1 ? ZYDIS_MNEMONIC_VMOVDQA : ZYDIS_MNEMONIC_VMOVDQU;
+                form = opc == 0x6F ? 2 : 3;
+                break;
+            case 0x6E:
+                if (pp != 1 || L != 0 || vvvv != 0) return false;
+                mn = W ? ZYDIS_MNEMONIC_VMOVQ : ZYDIS_MNEMONIC_VMOVD;
+                tmp.ext.op_cnt = 2;
+                ext_set_op(&tmp.ext, 0, EXT_OP_VEC, reg, 16);
+                ext_set_op(&tmp.ext, 1, mod == 3 ? EXT_OP_GPR : EXT_OP_MEM, rm_reg, W ? 8 : 4);
+                form = 6;
+                break;
+            case 0x7E:
+                if (L != 0 || vvvv != 0) return false;
+                if (pp == 1) {
+                    mn = W ? ZYDIS_MNEMONIC_VMOVQ : ZYDIS_MNEMONIC_VMOVD;
+                    tmp.ext.op_cnt = 2;
+                    ext_set_op(&tmp.ext, 0, mod == 3 ? EXT_OP_GPR : EXT_OP_MEM, rm_reg, W ? 8 : 4);
+                    ext_set_op(&tmp.ext, 1, EXT_OP_VEC, reg, 16);
+                    form = 6;
+                } else if (pp == 2) {
+                    mn = ZYDIS_MNEMONIC_VMOVQ;
+                    tmp.ext.op_cnt = 2;
+                    ext_set_op(&tmp.ext, 0, EXT_OP_VEC, reg, 16);
+                    ext_set_op(&tmp.ext, 1, rm_type, rm_reg, mod == 3 ? 16 : 8);
+                    form = 6;
+                } else return false;
+                break;
+            case 0xD6:
+                if (pp != 1 || L != 0 || vvvv != 0) return false;
+                mn = ZYDIS_MNEMONIC_VMOVQ;
+                tmp.ext.op_cnt = 2;
+                ext_set_op(&tmp.ext, 0, rm_type, rm_reg, mod == 3 ? 16 : 8);
+                ext_set_op(&tmp.ext, 1, EXT_OP_VEC, reg, 16);
+                form = 6;
+                break;
+            case 0x58: case 0x59: case 0x5C: case 0x5D: case 0x5E: case 0x5F: {
+                static const u16 fp_tbl[6][4] = {
+                    {ZYDIS_MNEMONIC_VADDPS, ZYDIS_MNEMONIC_VADDPD, ZYDIS_MNEMONIC_VADDSS, ZYDIS_MNEMONIC_VADDSD},
+                    {ZYDIS_MNEMONIC_VMULPS, ZYDIS_MNEMONIC_VMULPD, ZYDIS_MNEMONIC_VMULSS, ZYDIS_MNEMONIC_VMULSD},
+                    {ZYDIS_MNEMONIC_VSUBPS, ZYDIS_MNEMONIC_VSUBPD, ZYDIS_MNEMONIC_VSUBSS, ZYDIS_MNEMONIC_VSUBSD},
+                    {ZYDIS_MNEMONIC_VMINPS, ZYDIS_MNEMONIC_VMINPD, ZYDIS_MNEMONIC_VMINSS, ZYDIS_MNEMONIC_VMINSD},
+                    {ZYDIS_MNEMONIC_VDIVPS, ZYDIS_MNEMONIC_VDIVPD, ZYDIS_MNEMONIC_VDIVSS, ZYDIS_MNEMONIC_VDIVSD},
+                    {ZYDIS_MNEMONIC_VMAXPS, ZYDIS_MNEMONIC_VMAXPD, ZYDIS_MNEMONIC_VMAXSS, ZYDIS_MNEMONIC_VMAXSD},
+                };
+                int row = opc == 0x58 ? 0 : opc == 0x59 ? 1 : opc - 0x5A;
+                mn = fp_tbl[row][pp];
+                if (pp >= 2) {
+                    if (L != 0) return false;
+                    tmp.ext.op_cnt = 3;
+                    ext_set_op(&tmp.ext, 0, EXT_OP_VEC, reg, 16);
+                    ext_set_op(&tmp.ext, 1, EXT_OP_VEC, (u8)vvvv, 16);
+                    ext_set_op(&tmp.ext, 2, rm_type, rm_reg, mod == 3 ? 16 : (pp == 2 ? 4 : 8));
+                    form = 6;
+                } else {
+                    form = 1;
+                }
+                break;
+            }
+            case 0x51:
+                if (pp <= 1) {
+                    if (vvvv != 0) return false;
+                    mn = pp ? ZYDIS_MNEMONIC_VSQRTPD : ZYDIS_MNEMONIC_VSQRTPS;
+                    form = 2;
+                } else {
+                    if (L != 0) return false;
+                    mn = pp == 2 ? ZYDIS_MNEMONIC_VSQRTSS : ZYDIS_MNEMONIC_VSQRTSD;
+                    tmp.ext.op_cnt = 3;
+                    ext_set_op(&tmp.ext, 0, EXT_OP_VEC, reg, 16);
+                    ext_set_op(&tmp.ext, 1, EXT_OP_VEC, (u8)vvvv, 16);
+                    ext_set_op(&tmp.ext, 2, rm_type, rm_reg, mod == 3 ? 16 : (pp == 2 ? 4 : 8));
+                    form = 6;
+                }
+                break;
+            case 0x52: case 0x53:
+                if (pp == 0) {
+                    if (vvvv != 0) return false;
+                    mn = opc == 0x52 ? ZYDIS_MNEMONIC_VRSQRTPS : ZYDIS_MNEMONIC_VRCPPS;
+                    form = 2;
+                } else if (pp == 2 && L == 0) {
+                    mn = opc == 0x52 ? ZYDIS_MNEMONIC_VRSQRTSS : ZYDIS_MNEMONIC_VRCPSS;
+                    tmp.ext.op_cnt = 3;
+                    ext_set_op(&tmp.ext, 0, EXT_OP_VEC, reg, 16);
+                    ext_set_op(&tmp.ext, 1, EXT_OP_VEC, (u8)vvvv, 16);
+                    ext_set_op(&tmp.ext, 2, rm_type, rm_reg, mod == 3 ? 16 : 4);
+                    form = 6;
+                } else return false;
+                break;
+            case 0x54: if (pp > 1) return false; mn = pp ? ZYDIS_MNEMONIC_VANDPD : ZYDIS_MNEMONIC_VANDPS; form = 1; break;
+            case 0x55: if (pp > 1) return false; mn = pp ? ZYDIS_MNEMONIC_VANDNPD : ZYDIS_MNEMONIC_VANDNPS; form = 1; break;
+            case 0x56: if (pp > 1) return false; mn = pp ? ZYDIS_MNEMONIC_VORPD : ZYDIS_MNEMONIC_VORPS; form = 1; break;
+            case 0x57: if (pp > 1) return false; mn = pp ? ZYDIS_MNEMONIC_VXORPD : ZYDIS_MNEMONIC_VXORPS; form = 1; break;
+            case 0x14: if (pp > 1) return false; mn = pp ? ZYDIS_MNEMONIC_VUNPCKLPD : ZYDIS_MNEMONIC_VUNPCKLPS; form = 1; break;
+            case 0x15: if (pp > 1) return false; mn = pp ? ZYDIS_MNEMONIC_VUNPCKHPD : ZYDIS_MNEMONIC_VUNPCKHPS; form = 1; break;
+            case 0x7C: if (pp != 1 && pp != 3) return false; mn = pp == 1 ? ZYDIS_MNEMONIC_VHADDPD : ZYDIS_MNEMONIC_VHADDPS; form = 1; break;
+            case 0x7D: if (pp != 1 && pp != 3) return false; mn = pp == 1 ? ZYDIS_MNEMONIC_VHSUBPD : ZYDIS_MNEMONIC_VHSUBPS; form = 1; break;
+            case 0xD0: if (pp != 1 && pp != 3) return false; mn = pp == 1 ? ZYDIS_MNEMONIC_VADDSUBPD : ZYDIS_MNEMONIC_VADDSUBPS; form = 1; break;
+            case 0x12:
+                if (vvvv != 0) return false;
+                if (pp == 2) { mn = ZYDIS_MNEMONIC_VMOVSLDUP; form = 2; }
+                else if (pp == 3) {
+                    mn = ZYDIS_MNEMONIC_VMOVDDUP;
+                    tmp.ext.op_cnt = 2;
+                    ext_set_op(&tmp.ext, 0, EXT_OP_VEC, reg, vb);
+                    ext_set_op(&tmp.ext, 1, rm_type, rm_reg, (mod == 3 || L) ? vb : 8);
+                    form = 6;
+                } else return false;
+                break;
+            case 0x16:
+                if (pp != 2 || vvvv != 0) return false;
+                mn = ZYDIS_MNEMONIC_VMOVSHDUP; form = 2;
+                break;
+            case 0x5B:
+                if (pp > 2 || vvvv != 0) return false;
+                mn = pp == 0 ? ZYDIS_MNEMONIC_VCVTDQ2PS : pp == 1 ? ZYDIS_MNEMONIC_VCVTPS2DQ : ZYDIS_MNEMONIC_VCVTTPS2DQ;
+                form = 2;
+                break;
+            case 0x2E: case 0x2F:
+                if (pp > 1 || L != 0 || vvvv != 0) return false;
+                mn = opc == 0x2E ? (pp ? ZYDIS_MNEMONIC_VUCOMISD : ZYDIS_MNEMONIC_VUCOMISS)
+                                 : (pp ? ZYDIS_MNEMONIC_VCOMISD : ZYDIS_MNEMONIC_VCOMISS);
+                tmp.writes = F_ARITH;
+                tmp.ext.op_cnt = 2;
+                ext_set_op(&tmp.ext, 0, EXT_OP_VEC, reg, 16);
+                ext_set_op(&tmp.ext, 1, rm_type, rm_reg, mod == 3 ? 16 : (pp ? 8 : 4));
+                form = 6;
+                break;
+            case 0x50:
+                if (pp > 1 || vvvv != 0 || mod != 3) return false;
+                mn = pp ? ZYDIS_MNEMONIC_VMOVMSKPD : ZYDIS_MNEMONIC_VMOVMSKPS;
+                tmp.ext.op_cnt = 2;
+                ext_set_op(&tmp.ext, 0, EXT_OP_GPR, reg, 4);
+                ext_set_op(&tmp.ext, 1, EXT_OP_VEC, rm, vb);
+                form = 6;
+                break;
+            case 0xD7:
+                if (pp != 1 || vvvv != 0 || mod != 3) return false;
+                mn = ZYDIS_MNEMONIC_VPMOVMSKB;
+                tmp.ext.op_cnt = 2;
+                ext_set_op(&tmp.ext, 0, EXT_OP_GPR, reg, 4);
+                ext_set_op(&tmp.ext, 1, EXT_OP_VEC, rm, vb);
+                form = 6;
+                break;
+            case 0x70:
+                if (pp == 0 || vvvv != 0) return false;
+                mn = pp == 1 ? ZYDIS_MNEMONIC_VPSHUFD : pp == 2 ? ZYDIS_MNEMONIC_VPSHUFHW : ZYDIS_MNEMONIC_VPSHUFLW;
+                form = 4; need_imm = true;
+                break;
+            case 0xC6:
+                if (pp > 1) return false;
+                mn = pp ? ZYDIS_MNEMONIC_VSHUFPD : ZYDIS_MNEMONIC_VSHUFPS;
+                form = 5; need_imm = true;
+                break;
+            case 0xC2:
+                if (pp <= 1) {
+                    mn = pp ? ZYDIS_MNEMONIC_VCMPPD : ZYDIS_MNEMONIC_VCMPPS;
+                    form = 5; need_imm = true;
+                } else {
+                    if (L != 0 || p >= end) return false;
+                    mn = pp == 2 ? ZYDIS_MNEMONIC_VCMPSS : ZYDIS_MNEMONIC_VCMPSD;
+                    tmp.imm = *p++;
+                    tmp.ext.op_cnt = 4;
+                    ext_set_op(&tmp.ext, 0, EXT_OP_VEC, reg, 16);
+                    ext_set_op(&tmp.ext, 1, EXT_OP_VEC, (u8)vvvv, 16);
+                    ext_set_op(&tmp.ext, 2, rm_type, rm_reg, mod == 3 ? 16 : (pp == 2 ? 4 : 8));
+                    ext_set_op(&tmp.ext, 3, EXT_OP_IMM, 0, 1);
+                    form = 6;
+                }
+                break;
+            case 0x71: case 0x72: case 0x73: {
+                if (pp != 1 || mod != 3 || R != 0 || p >= end) return false;
+                int sub = reg & 7;
+                if (opc == 0x71)
+                    mn = sub == 2 ? ZYDIS_MNEMONIC_VPSRLW : sub == 4 ? ZYDIS_MNEMONIC_VPSRAW : sub == 6 ? ZYDIS_MNEMONIC_VPSLLW : 0;
+                else if (opc == 0x72)
+                    mn = sub == 2 ? ZYDIS_MNEMONIC_VPSRLD : sub == 4 ? ZYDIS_MNEMONIC_VPSRAD : sub == 6 ? ZYDIS_MNEMONIC_VPSLLD : 0;
+                else
+                    mn = sub == 2 ? ZYDIS_MNEMONIC_VPSRLQ : sub == 3 ? ZYDIS_MNEMONIC_VPSRLDQ :
+                         sub == 6 ? ZYDIS_MNEMONIC_VPSLLQ : sub == 7 ? ZYDIS_MNEMONIC_VPSLLDQ : 0;
+                if (!mn) return false;
+                tmp.imm = *p++;
+                tmp.ext.op_cnt = 3;
+                ext_set_op(&tmp.ext, 0, EXT_OP_VEC, (u8)vvvv, vb);
+                ext_set_op(&tmp.ext, 1, EXT_OP_VEC, rm, vb);
+                ext_set_op(&tmp.ext, 2, EXT_OP_IMM, 0, 1);
+                form = 6;
+                break;
+            }
+            default:
+                if (pp != 1) return false;
+                switch (opc) {
+                    case 0x60: mn = ZYDIS_MNEMONIC_VPUNPCKLBW; break;
+                    case 0x61: mn = ZYDIS_MNEMONIC_VPUNPCKLWD; break;
+                    case 0x62: mn = ZYDIS_MNEMONIC_VPUNPCKLDQ; break;
+                    case 0x63: mn = ZYDIS_MNEMONIC_VPACKSSWB; break;
+                    case 0x64: mn = ZYDIS_MNEMONIC_VPCMPGTB; break;
+                    case 0x65: mn = ZYDIS_MNEMONIC_VPCMPGTW; break;
+                    case 0x66: mn = ZYDIS_MNEMONIC_VPCMPGTD; break;
+                    case 0x67: mn = ZYDIS_MNEMONIC_VPACKUSWB; break;
+                    case 0x68: mn = ZYDIS_MNEMONIC_VPUNPCKHBW; break;
+                    case 0x69: mn = ZYDIS_MNEMONIC_VPUNPCKHWD; break;
+                    case 0x6A: mn = ZYDIS_MNEMONIC_VPUNPCKHDQ; break;
+                    case 0x6B: mn = ZYDIS_MNEMONIC_VPACKSSDW; break;
+                    case 0x6C: mn = ZYDIS_MNEMONIC_VPUNPCKLQDQ; break;
+                    case 0x6D: mn = ZYDIS_MNEMONIC_VPUNPCKHQDQ; break;
+                    case 0x74: mn = ZYDIS_MNEMONIC_VPCMPEQB; break;
+                    case 0x75: mn = ZYDIS_MNEMONIC_VPCMPEQW; break;
+                    case 0x76: mn = ZYDIS_MNEMONIC_VPCMPEQD; break;
+                    case 0xD4: mn = ZYDIS_MNEMONIC_VPADDQ; break;
+                    case 0xD5: mn = ZYDIS_MNEMONIC_VPMULLW; break;
+                    case 0xD8: mn = ZYDIS_MNEMONIC_VPSUBUSB; break;
+                    case 0xD9: mn = ZYDIS_MNEMONIC_VPSUBUSW; break;
+                    case 0xDA: mn = ZYDIS_MNEMONIC_VPMINUB; break;
+                    case 0xDB: mn = ZYDIS_MNEMONIC_VPAND; break;
+                    case 0xDC: mn = ZYDIS_MNEMONIC_VPADDUSB; break;
+                    case 0xDD: mn = ZYDIS_MNEMONIC_VPADDUSW; break;
+                    case 0xDE: mn = ZYDIS_MNEMONIC_VPMAXUB; break;
+                    case 0xDF: mn = ZYDIS_MNEMONIC_VPANDN; break;
+                    case 0xE0: mn = ZYDIS_MNEMONIC_VPAVGB; break;
+                    case 0xE3: mn = ZYDIS_MNEMONIC_VPAVGW; break;
+                    case 0xE4: mn = ZYDIS_MNEMONIC_VPMULHUW; break;
+                    case 0xE5: mn = ZYDIS_MNEMONIC_VPMULHW; break;
+                    case 0xE8: mn = ZYDIS_MNEMONIC_VPSUBSB; break;
+                    case 0xE9: mn = ZYDIS_MNEMONIC_VPSUBSW; break;
+                    case 0xEA: mn = ZYDIS_MNEMONIC_VPMINSW; break;
+                    case 0xEB: mn = ZYDIS_MNEMONIC_VPOR; break;
+                    case 0xEC: mn = ZYDIS_MNEMONIC_VPADDSB; break;
+                    case 0xED: mn = ZYDIS_MNEMONIC_VPADDSW; break;
+                    case 0xEE: mn = ZYDIS_MNEMONIC_VPMAXSW; break;
+                    case 0xEF: mn = ZYDIS_MNEMONIC_VPXOR; break;
+                    case 0xF4: mn = ZYDIS_MNEMONIC_VPMULUDQ; break;
+                    case 0xF5: mn = ZYDIS_MNEMONIC_VPMADDWD; break;
+                    case 0xF6: mn = ZYDIS_MNEMONIC_VPSADBW; break;
+                    case 0xF8: mn = ZYDIS_MNEMONIC_VPSUBB; break;
+                    case 0xF9: mn = ZYDIS_MNEMONIC_VPSUBW; break;
+                    case 0xFA: mn = ZYDIS_MNEMONIC_VPSUBD; break;
+                    case 0xFB: mn = ZYDIS_MNEMONIC_VPSUBQ; break;
+                    case 0xFC: mn = ZYDIS_MNEMONIC_VPADDB; break;
+                    case 0xFD: mn = ZYDIS_MNEMONIC_VPADDW; break;
+                    case 0xFE: mn = ZYDIS_MNEMONIC_VPADDD; break;
+                    default: return false;
+                }
+                form = 1;
+                break;
+        }
+    } else if (mm == 2) {
+        if (pp == 1 && opc >= 0x96 && opc <= 0xBF) {
+            int grp = (opc - 0x90) >> 4; // 0=132, 1=213, 2=231
+            int lo = opc & 0xf;
+            if (lo < 6) return false;
+            static const u16 fma_ps[3][10] = {
+                {ZYDIS_MNEMONIC_VFMADDSUB132PS, ZYDIS_MNEMONIC_VFMSUBADD132PS, ZYDIS_MNEMONIC_VFMADD132PS, ZYDIS_MNEMONIC_VFMADD132SS,
+                 ZYDIS_MNEMONIC_VFMSUB132PS, ZYDIS_MNEMONIC_VFMSUB132SS, ZYDIS_MNEMONIC_VFNMADD132PS, ZYDIS_MNEMONIC_VFNMADD132SS,
+                 ZYDIS_MNEMONIC_VFNMSUB132PS, ZYDIS_MNEMONIC_VFNMSUB132SS},
+                {ZYDIS_MNEMONIC_VFMADDSUB213PS, ZYDIS_MNEMONIC_VFMSUBADD213PS, ZYDIS_MNEMONIC_VFMADD213PS, ZYDIS_MNEMONIC_VFMADD213SS,
+                 ZYDIS_MNEMONIC_VFMSUB213PS, ZYDIS_MNEMONIC_VFMSUB213SS, ZYDIS_MNEMONIC_VFNMADD213PS, ZYDIS_MNEMONIC_VFNMADD213SS,
+                 ZYDIS_MNEMONIC_VFNMSUB213PS, ZYDIS_MNEMONIC_VFNMSUB213SS},
+                {ZYDIS_MNEMONIC_VFMADDSUB231PS, ZYDIS_MNEMONIC_VFMSUBADD231PS, ZYDIS_MNEMONIC_VFMADD231PS, ZYDIS_MNEMONIC_VFMADD231SS,
+                 ZYDIS_MNEMONIC_VFMSUB231PS, ZYDIS_MNEMONIC_VFMSUB231SS, ZYDIS_MNEMONIC_VFNMADD231PS, ZYDIS_MNEMONIC_VFNMADD231SS,
+                 ZYDIS_MNEMONIC_VFNMSUB231PS, ZYDIS_MNEMONIC_VFNMSUB231SS},
+            };
+            static const u16 fma_pd[3][10] = {
+                {ZYDIS_MNEMONIC_VFMADDSUB132PD, ZYDIS_MNEMONIC_VFMSUBADD132PD, ZYDIS_MNEMONIC_VFMADD132PD, ZYDIS_MNEMONIC_VFMADD132SD,
+                 ZYDIS_MNEMONIC_VFMSUB132PD, ZYDIS_MNEMONIC_VFMSUB132SD, ZYDIS_MNEMONIC_VFNMADD132PD, ZYDIS_MNEMONIC_VFNMADD132SD,
+                 ZYDIS_MNEMONIC_VFNMSUB132PD, ZYDIS_MNEMONIC_VFNMSUB132SD},
+                {ZYDIS_MNEMONIC_VFMADDSUB213PD, ZYDIS_MNEMONIC_VFMSUBADD213PD, ZYDIS_MNEMONIC_VFMADD213PD, ZYDIS_MNEMONIC_VFMADD213SD,
+                 ZYDIS_MNEMONIC_VFMSUB213PD, ZYDIS_MNEMONIC_VFMSUB213SD, ZYDIS_MNEMONIC_VFNMADD213PD, ZYDIS_MNEMONIC_VFNMADD213SD,
+                 ZYDIS_MNEMONIC_VFNMSUB213PD, ZYDIS_MNEMONIC_VFNMSUB213SD},
+                {ZYDIS_MNEMONIC_VFMADDSUB231PD, ZYDIS_MNEMONIC_VFMSUBADD231PD, ZYDIS_MNEMONIC_VFMADD231PD, ZYDIS_MNEMONIC_VFMADD231SD,
+                 ZYDIS_MNEMONIC_VFMSUB231PD, ZYDIS_MNEMONIC_VFMSUB231SD, ZYDIS_MNEMONIC_VFNMADD231PD, ZYDIS_MNEMONIC_VFNMADD231SD,
+                 ZYDIS_MNEMONIC_VFNMSUB231PD, ZYDIS_MNEMONIC_VFNMSUB231SD},
+            };
+            bool is_sc = lo >= 9 && (lo & 1);
+            mn = W ? fma_pd[grp][lo - 6] : fma_ps[grp][lo - 6];
+            if (is_sc) {
+                if (L != 0) return false;
+                tmp.ext.op_cnt = 3;
+                ext_set_op(&tmp.ext, 0, EXT_OP_VEC, reg, 16);
+                ext_set_op(&tmp.ext, 1, EXT_OP_VEC, (u8)vvvv, 16);
+                ext_set_op(&tmp.ext, 2, rm_type, rm_reg, mod == 3 ? 16 : (W ? 8 : 4));
+                form = 6;
+            } else {
+                form = 1;
+            }
+        } else if (opc >= 0xF2 && opc <= 0xF7) {
+            if (L != 0) return false;
+            u8 gsz = W ? 8 : 4;
+            u8 grm_t = mod == 3 ? EXT_OP_GPR : EXT_OP_MEM;
+            if (opc == 0xF2 && pp == 0) {
+                mn = ZYDIS_MNEMONIC_ANDN;
+                tmp.writes = F_ARITH;
+                tmp.ext.op_cnt = 3;
+                ext_set_op(&tmp.ext, 0, EXT_OP_GPR, reg, gsz);
+                ext_set_op(&tmp.ext, 1, EXT_OP_GPR, (u8)vvvv, gsz);
+                ext_set_op(&tmp.ext, 2, grm_t, rm_reg, gsz);
+                form = 6;
+            } else if (opc == 0xF3 && pp == 0 && R == 0) {
+                int sub = reg & 7;
+                mn = sub == 1 ? ZYDIS_MNEMONIC_BLSR : sub == 2 ? ZYDIS_MNEMONIC_BLSMSK : sub == 3 ? ZYDIS_MNEMONIC_BLSI : 0;
+                if (!mn) return false;
+                tmp.writes = F_ARITH;
+                tmp.ext.op_cnt = 2;
+                ext_set_op(&tmp.ext, 0, EXT_OP_GPR, (u8)vvvv, gsz);
+                ext_set_op(&tmp.ext, 1, grm_t, rm_reg, gsz);
+                form = 6;
+            } else if (opc == 0xF5 && (pp == 0 || pp == 2 || pp == 3)) {
+                mn = pp == 0 ? ZYDIS_MNEMONIC_BZHI : pp == 2 ? ZYDIS_MNEMONIC_PEXT : ZYDIS_MNEMONIC_PDEP;
+                if (pp == 0) tmp.writes = F_ARITH;
+                tmp.ext.op_cnt = 3;
+                ext_set_op(&tmp.ext, 0, EXT_OP_GPR, reg, gsz);
+                if (pp == 0) {
+                    ext_set_op(&tmp.ext, 1, grm_t, rm_reg, gsz);
+                    ext_set_op(&tmp.ext, 2, EXT_OP_GPR, (u8)vvvv, gsz);
+                } else {
+                    ext_set_op(&tmp.ext, 1, EXT_OP_GPR, (u8)vvvv, gsz);
+                    ext_set_op(&tmp.ext, 2, grm_t, rm_reg, gsz);
+                }
+                form = 6;
+            } else if (opc == 0xF6 && pp == 3) {
+                mn = ZYDIS_MNEMONIC_MULX;
+                tmp.ext.op_cnt = 3;
+                ext_set_op(&tmp.ext, 0, EXT_OP_GPR, reg, gsz);
+                ext_set_op(&tmp.ext, 1, EXT_OP_GPR, (u8)vvvv, gsz);
+                ext_set_op(&tmp.ext, 2, grm_t, rm_reg, gsz);
+                form = 6;
+            } else if (opc == 0xF7) {
+                mn = pp == 0 ? ZYDIS_MNEMONIC_BEXTR : pp == 1 ? ZYDIS_MNEMONIC_SHLX : pp == 2 ? ZYDIS_MNEMONIC_SARX : ZYDIS_MNEMONIC_SHRX;
+                if (pp == 0) tmp.writes = F_ARITH;
+                tmp.ext.op_cnt = 3;
+                ext_set_op(&tmp.ext, 0, EXT_OP_GPR, reg, gsz);
+                ext_set_op(&tmp.ext, 1, grm_t, rm_reg, gsz);
+                ext_set_op(&tmp.ext, 2, EXT_OP_GPR, (u8)vvvv, gsz);
+                form = 6;
+            } else return false;
+        } else if (pp == 1) {
+            switch (opc) {
+                case 0x00: mn = ZYDIS_MNEMONIC_VPSHUFB; form = 1; break;
+                case 0x01: mn = ZYDIS_MNEMONIC_VPHADDW; form = 1; break;
+                case 0x02: mn = ZYDIS_MNEMONIC_VPHADDD; form = 1; break;
+                case 0x03: mn = ZYDIS_MNEMONIC_VPHADDSW; form = 1; break;
+                case 0x04: mn = ZYDIS_MNEMONIC_VPMADDUBSW; form = 1; break;
+                case 0x05: mn = ZYDIS_MNEMONIC_VPHSUBW; form = 1; break;
+                case 0x06: mn = ZYDIS_MNEMONIC_VPHSUBD; form = 1; break;
+                case 0x07: mn = ZYDIS_MNEMONIC_VPHSUBSW; form = 1; break;
+                case 0x08: mn = ZYDIS_MNEMONIC_VPSIGNB; form = 1; break;
+                case 0x09: mn = ZYDIS_MNEMONIC_VPSIGNW; form = 1; break;
+                case 0x0A: mn = ZYDIS_MNEMONIC_VPSIGND; form = 1; break;
+                case 0x0B: mn = ZYDIS_MNEMONIC_VPMULHRSW; form = 1; break;
+                case 0x0E: if (vvvv || W) return false; mn = ZYDIS_MNEMONIC_VTESTPS; tmp.writes = F_ARITH; form = 2; break;
+                case 0x0F: if (vvvv || W) return false; mn = ZYDIS_MNEMONIC_VTESTPD; tmp.writes = F_ARITH; form = 2; break;
+                case 0x16: if (!L || W) return false; mn = ZYDIS_MNEMONIC_VPERMPS; form = 1; break;
+                case 0x17: if (vvvv || W) return false; mn = ZYDIS_MNEMONIC_VPTEST; tmp.writes = F_ARITH; form = 2; break;
+                case 0x1C: if (vvvv) return false; mn = ZYDIS_MNEMONIC_VPABSB; form = 2; break;
+                case 0x1D: if (vvvv) return false; mn = ZYDIS_MNEMONIC_VPABSW; form = 2; break;
+                case 0x1E: if (vvvv) return false; mn = ZYDIS_MNEMONIC_VPABSD; form = 2; break;
+                case 0x28: mn = ZYDIS_MNEMONIC_VPMULDQ; form = 1; break;
+                case 0x29: mn = ZYDIS_MNEMONIC_VPCMPEQQ; form = 1; break;
+                case 0x2B: mn = ZYDIS_MNEMONIC_VPACKUSDW; form = 1; break;
+                case 0x36: if (!L || W) return false; mn = ZYDIS_MNEMONIC_VPERMD; form = 1; break;
+                case 0x37: mn = ZYDIS_MNEMONIC_VPCMPGTQ; form = 1; break;
+                case 0x38: mn = ZYDIS_MNEMONIC_VPMINSB; form = 1; break;
+                case 0x39: mn = ZYDIS_MNEMONIC_VPMINSD; form = 1; break;
+                case 0x3A: mn = ZYDIS_MNEMONIC_VPMINUW; form = 1; break;
+                case 0x3B: mn = ZYDIS_MNEMONIC_VPMINUD; form = 1; break;
+                case 0x3C: mn = ZYDIS_MNEMONIC_VPMAXSB; form = 1; break;
+                case 0x3D: mn = ZYDIS_MNEMONIC_VPMAXSD; form = 1; break;
+                case 0x3E: mn = ZYDIS_MNEMONIC_VPMAXUW; form = 1; break;
+                case 0x3F: mn = ZYDIS_MNEMONIC_VPMAXUD; form = 1; break;
+                case 0x40: mn = ZYDIS_MNEMONIC_VPMULLD; form = 1; break;
+                case 0x45: mn = W ? ZYDIS_MNEMONIC_VPSRLVQ : ZYDIS_MNEMONIC_VPSRLVD; form = 1; break;
+                case 0x46: if (W) return false; mn = ZYDIS_MNEMONIC_VPSRAVD; form = 1; break;
+                case 0x47: mn = W ? ZYDIS_MNEMONIC_VPSLLVQ : ZYDIS_MNEMONIC_VPSLLVD; form = 1; break;
+                case 0x18: case 0x19: case 0x1A: case 0x58: case 0x59: case 0x5A: case 0x78: case 0x79: {
+                    if (vvvv || W) return false;
+                    u8 eb = 4;
+                    if (opc == 0x18) { mn = ZYDIS_MNEMONIC_VBROADCASTSS; eb = 4; }
+                    else if (opc == 0x19) { if (!L) return false; mn = ZYDIS_MNEMONIC_VBROADCASTSD; eb = 8; }
+                    else if (opc == 0x1A) { if (!L || mod == 3) return false; mn = ZYDIS_MNEMONIC_VBROADCASTF128; eb = 16; }
+                    else if (opc == 0x5A) { if (!L || mod == 3) return false; mn = ZYDIS_MNEMONIC_VBROADCASTI128; eb = 16; }
+                    else if (opc == 0x78) { mn = ZYDIS_MNEMONIC_VPBROADCASTB; eb = 1; }
+                    else if (opc == 0x79) { mn = ZYDIS_MNEMONIC_VPBROADCASTW; eb = 2; }
+                    else if (opc == 0x58) { mn = ZYDIS_MNEMONIC_VPBROADCASTD; eb = 4; }
+                    else { mn = ZYDIS_MNEMONIC_VPBROADCASTQ; eb = 8; }
+                    tmp.ext.op_cnt = 2;
+                    ext_set_op(&tmp.ext, 0, EXT_OP_VEC, reg, vb);
+                    ext_set_op(&tmp.ext, 1, rm_type, rm_reg, mod == 3 ? 16 : eb);
+                    form = 6;
+                    break;
+                }
+                case 0x20: case 0x21: case 0x22: case 0x23: case 0x24: case 0x25:
+                case 0x30: case 0x31: case 0x32: case 0x33: case 0x34: case 0x35: {
+                    if (vvvv) return false;
+                    static const u16 sx_tbl[6] = {
+                        ZYDIS_MNEMONIC_VPMOVSXBW, ZYDIS_MNEMONIC_VPMOVSXBD, ZYDIS_MNEMONIC_VPMOVSXBQ,
+                        ZYDIS_MNEMONIC_VPMOVSXWD, ZYDIS_MNEMONIC_VPMOVSXWQ, ZYDIS_MNEMONIC_VPMOVSXDQ,
+                    };
+                    static const u16 zx_tbl[6] = {
+                        ZYDIS_MNEMONIC_VPMOVZXBW, ZYDIS_MNEMONIC_VPMOVZXBD, ZYDIS_MNEMONIC_VPMOVZXBQ,
+                        ZYDIS_MNEMONIC_VPMOVZXWD, ZYDIS_MNEMONIC_VPMOVZXWQ, ZYDIS_MNEMONIC_VPMOVZXDQ,
+                    };
+                    static const u8 mb128[6] = {8, 4, 2, 8, 4, 8};
+                    int k = opc & 7;
+                    mn = opc < 0x30 ? sx_tbl[k] : zx_tbl[k];
+                    tmp.ext.op_cnt = 2;
+                    ext_set_op(&tmp.ext, 0, EXT_OP_VEC, reg, vb);
+                    ext_set_op(&tmp.ext, 1, rm_type, rm_reg, mod == 3 ? 16 : (u8)(mb128[k] << L));
+                    form = 6;
+                    break;
+                }
+                default: return false;
+            }
+        } else return false;
+    } else { // mm == 3
+        if (opc == 0xF0) {
+            if (pp != 3 || L != 0 || vvvv != 0 || p >= end) return false;
+            u8 gsz = W ? 8 : 4;
+            mn = ZYDIS_MNEMONIC_RORX;
+            tmp.imm = *p++;
+            tmp.ext.op_cnt = 3;
+            ext_set_op(&tmp.ext, 0, EXT_OP_GPR, reg, gsz);
+            ext_set_op(&tmp.ext, 1, mod == 3 ? EXT_OP_GPR : EXT_OP_MEM, rm_reg, gsz);
+            ext_set_op(&tmp.ext, 2, EXT_OP_IMM, 0, 1);
+            form = 6;
+        } else if (pp == 1) {
+            switch (opc) {
+                case 0x00: if (!L || !W || vvvv) return false; mn = ZYDIS_MNEMONIC_VPERMQ; form = 4; need_imm = true; break;
+                case 0x01: if (!L || !W || vvvv) return false; mn = ZYDIS_MNEMONIC_VPERMPD; form = 4; need_imm = true; break;
+                case 0x02: if (W) return false; mn = ZYDIS_MNEMONIC_VPBLENDD; form = 5; need_imm = true; break;
+                case 0x04: if (W || vvvv) return false; mn = ZYDIS_MNEMONIC_VPERMILPS; form = 4; need_imm = true; break;
+                case 0x05: if (W || vvvv) return false; mn = ZYDIS_MNEMONIC_VPERMILPD; form = 4; need_imm = true; break;
+                case 0x06: if (!L || W) return false; mn = ZYDIS_MNEMONIC_VPERM2F128; form = 5; need_imm = true; break;
+                case 0x08: if (vvvv) return false; mn = ZYDIS_MNEMONIC_VROUNDPS; form = 4; need_imm = true; break;
+                case 0x09: if (vvvv) return false; mn = ZYDIS_MNEMONIC_VROUNDPD; form = 4; need_imm = true; break;
+                case 0x0C: mn = ZYDIS_MNEMONIC_VBLENDPS; form = 5; need_imm = true; break;
+                case 0x0D: mn = ZYDIS_MNEMONIC_VBLENDPD; form = 5; need_imm = true; break;
+                case 0x0E: mn = ZYDIS_MNEMONIC_VPBLENDW; form = 5; need_imm = true; break;
+                case 0x0F: mn = ZYDIS_MNEMONIC_VPALIGNR; form = 5; need_imm = true; break;
+                case 0x18: case 0x38:
+                    if (!L || W || p >= end) return false;
+                    mn = opc == 0x18 ? ZYDIS_MNEMONIC_VINSERTF128 : ZYDIS_MNEMONIC_VINSERTI128;
+                    tmp.imm = *p++;
+                    tmp.ext.op_cnt = 4;
+                    ext_set_op(&tmp.ext, 0, EXT_OP_VEC, reg, 32);
+                    ext_set_op(&tmp.ext, 1, EXT_OP_VEC, (u8)vvvv, 32);
+                    ext_set_op(&tmp.ext, 2, rm_type, rm_reg, 16);
+                    ext_set_op(&tmp.ext, 3, EXT_OP_IMM, 0, 1);
+                    form = 6;
+                    break;
+                case 0x19: case 0x39:
+                    if (!L || W || vvvv || p >= end) return false;
+                    mn = opc == 0x19 ? ZYDIS_MNEMONIC_VEXTRACTF128 : ZYDIS_MNEMONIC_VEXTRACTI128;
+                    tmp.imm = *p++;
+                    tmp.ext.op_cnt = 3;
+                    ext_set_op(&tmp.ext, 0, rm_type, rm_reg, 16);
+                    ext_set_op(&tmp.ext, 1, EXT_OP_VEC, reg, 32);
+                    ext_set_op(&tmp.ext, 2, EXT_OP_IMM, 0, 1);
+                    form = 6;
+                    break;
+                case 0x40: mn = ZYDIS_MNEMONIC_VDPPS; form = 5; need_imm = true; break;
+                case 0x41: if (L) return false; mn = ZYDIS_MNEMONIC_VDPPD; form = 5; need_imm = true; break;
+                case 0x46: if (!L || W) return false; mn = ZYDIS_MNEMONIC_VPERM2I128; form = 5; need_imm = true; break;
+                case 0x4A: case 0x4B: case 0x4C: {
+                    if (W || p >= end) return false;
+                    u8 im = *p++;
+                    mn = opc == 0x4A ? ZYDIS_MNEMONIC_VBLENDVPS : opc == 0x4B ? ZYDIS_MNEMONIC_VBLENDVPD : ZYDIS_MNEMONIC_VPBLENDVB;
+                    tmp.ext.op_cnt = 4;
+                    ext_set_op(&tmp.ext, 0, EXT_OP_VEC, reg, vb);
+                    ext_set_op(&tmp.ext, 1, EXT_OP_VEC, (u8)vvvv, vb);
+                    ext_set_op(&tmp.ext, 2, rm_type, rm_reg, vb);
+                    ext_set_op(&tmp.ext, 3, EXT_OP_VEC, (u8)(im >> 4), vb);
+                    form = 6;
+                    break;
+                }
+                default: return false;
+            }
+        } else return false;
+    }
+
+    if (need_imm) {
+        if (p >= end)
+            return false;
+        tmp.imm = *p++;
+    }
+    int len = (int)(p - b);
+    if (len > 15 || len > avail)
+        return false;
+
+    tmp.ext.mnem = mn;
+    if (form == 1) {
+        tmp.ext.op_cnt = 3;
+        ext_set_op(&tmp.ext, 0, EXT_OP_VEC, reg, vb);
+        ext_set_op(&tmp.ext, 1, EXT_OP_VEC, (u8)vvvv, vb);
+        ext_set_op(&tmp.ext, 2, rm_type, rm_reg, vb);
+    } else if (form == 2) {
+        tmp.ext.op_cnt = 2;
+        ext_set_op(&tmp.ext, 0, EXT_OP_VEC, reg, vb);
+        ext_set_op(&tmp.ext, 1, rm_type, rm_reg, vb);
+    } else if (form == 3) {
+        tmp.ext.op_cnt = 2;
+        ext_set_op(&tmp.ext, 0, rm_type, rm_reg, vb);
+        ext_set_op(&tmp.ext, 1, EXT_OP_VEC, reg, vb);
+    } else if (form == 4) {
+        tmp.ext.op_cnt = 3;
+        ext_set_op(&tmp.ext, 0, EXT_OP_VEC, reg, vb);
+        ext_set_op(&tmp.ext, 1, rm_type, rm_reg, vb);
+        ext_set_op(&tmp.ext, 2, EXT_OP_IMM, 0, 1);
+    } else if (form == 5) {
+        tmp.ext.op_cnt = 4;
+        ext_set_op(&tmp.ext, 0, EXT_OP_VEC, reg, vb);
+        ext_set_op(&tmp.ext, 1, EXT_OP_VEC, (u8)vvvv, vb);
+        ext_set_op(&tmp.ext, 2, rm_type, rm_reg, vb);
+        ext_set_op(&tmp.ext, 3, EXT_OP_IMM, 0, 1);
+    }
+    tmp.next = rip + (u64)len;
+    *in = tmp;
+    return true;
+}
+
+static int verify_fast_vex_mode = -1;
+
 int x86_decode_ext(u64 rip, Insn *in, const u8 *b, int avail) {
+    if (__builtin_expect(verify_fast_vex_mode < 0, 0)) {
+        const char *e = getenv("LC_HVDBT_VERIFY_FAST_VEX");
+        verify_fast_vex_mode = (e && e[0] == '2') ? 2 : (e && e[0] == '1') ? 1 : 0;
+    }
+    Insn fast_in = *in;
+    if (fast_decode_vex(rip, &fast_in, b, avail)) {
+        if (__builtin_expect(!verify_fast_vex_mode, 1)) {
+            *in = fast_in;
+            return 1;
+        }
+        // Self-verification mode: compare every decoded field against Zydis!
+        ZydisDecodedInstruction zi;
+        ZydisDecodedOperand ops[ZYDIS_MAX_OPERAND_COUNT];
+        ZyanStatus st = ZydisDecoderDecodeFull(active_decoder(), b, avail > 0 ? (ZyanUSize)avail : 0, &zi, ops);
+        Insn z_in = *in;
+        z_in.op = OP_EXT;
+        z_in.next = rip + zi.length;
+        z_in.reads = 0; z_in.writes = 0; z_in.memop = false; z_in.riprel = false;
+        z_in.no_base = false; z_in.no_index = true; z_in.vsib = false;
+        z_in.seg = 0; z_in.addr32 = tr_compat; z_in.addr16 = false; z_in.disp = 0; z_in.imm = 0;
+        memset(&z_in.ext, 0, sizeof z_in.ext);
+        bool z_ok = ZYAN_SUCCESS(st) && zi.length > 0 && zi.length <= 15 && zi.length <= (u8)avail;
+        if (z_ok) {
+            for (u8 i = 0; i < zi.operand_count_visible; i++)
+                if (ops[i].type == ZYDIS_OPERAND_TYPE_MEMORY && !ext_populate_mem(&zi, &ops[i], &z_in))
+                    z_ok = false;
+            if (z_ok && (!ext_is_supported(&zi, ops, &z_in) || !ext_fill_from_zydis(&zi, ops, &z_in)))
+                z_ok = false;
+        }
+        if (!z_ok || fast_in.next != z_in.next || fast_in.reads != z_in.reads || fast_in.writes != z_in.writes ||
+            fast_in.memop != z_in.memop || fast_in.riprel != z_in.riprel || fast_in.no_base != z_in.no_base ||
+            fast_in.no_index != z_in.no_index || fast_in.base != z_in.base || fast_in.index != z_in.index ||
+            fast_in.scale != z_in.scale || fast_in.disp != z_in.disp || fast_in.imm != z_in.imm ||
+            memcmp(&fast_in.ext, &z_in.ext, sizeof(ExtDecoded)) != 0) {
+            fprintf(stderr, "FAST_VEX_MISMATCH rip=%llx bytes=%02x %02x %02x %02x %02x %02x z_ok=%d "
+                    "fast(mn=%u cnt=%u len=%llu r=%u w=%u m=%d rip=%d nb=%d ni=%d b=%u i=%u s=%u d=%lld im=%lld "
+                    "op=[%u:%u:%u,%u:%u:%u,%u:%u:%u,%u:%u:%u]) "
+                    "zydis(mn=%u cnt=%u len=%llu r=%u w=%u m=%d rip=%d nb=%d ni=%d b=%u i=%u s=%u d=%lld im=%lld "
+                    "op=[%u:%u:%u,%u:%u:%u,%u:%u:%u,%u:%u:%u])\n",
+                    (unsigned long long)rip, b[0], b[1], b[2], b[3], b[4], b[5], z_ok,
+                    fast_in.ext.mnem, fast_in.ext.op_cnt, (unsigned long long)(fast_in.next - rip),
+                    fast_in.reads, fast_in.writes, fast_in.memop, fast_in.riprel, fast_in.no_base, fast_in.no_index,
+                    fast_in.base, fast_in.index, fast_in.scale, (long long)fast_in.disp, (long long)fast_in.imm,
+                    fast_in.ext.op_type[0], fast_in.ext.op_reg[0], fast_in.ext.op_bytes[0],
+                    fast_in.ext.op_type[1], fast_in.ext.op_reg[1], fast_in.ext.op_bytes[1],
+                    fast_in.ext.op_type[2], fast_in.ext.op_reg[2], fast_in.ext.op_bytes[2],
+                    fast_in.ext.op_type[3], fast_in.ext.op_reg[3], fast_in.ext.op_bytes[3],
+                    z_in.ext.mnem, z_in.ext.op_cnt, (unsigned long long)(z_in.next - rip),
+                    z_in.reads, z_in.writes, z_in.memop, z_in.riprel, z_in.no_base, z_in.no_index,
+                    z_in.base, z_in.index, z_in.scale, (long long)z_in.disp, (long long)z_in.imm,
+                    z_in.ext.op_type[0], z_in.ext.op_reg[0], z_in.ext.op_bytes[0],
+                    z_in.ext.op_type[1], z_in.ext.op_reg[1], z_in.ext.op_bytes[1],
+                    z_in.ext.op_type[2], z_in.ext.op_reg[2], z_in.ext.op_bytes[2],
+                    z_in.ext.op_type[3], z_in.ext.op_reg[3], z_in.ext.op_bytes[3]);
+            if (verify_fast_vex_mode == 1)
+                abort();
+        }
+        *in = fast_in;
+        return 1;
+    }
+
     ZydisDecodedInstruction zi;
     ZydisDecodedOperand ops[ZYDIS_MAX_OPERAND_COUNT];
     // Pass only the bytes tr_fetch really read. The buffer past `avail` is
@@ -701,8 +1513,6 @@ int x86_decode_ext(u64 rip, Insn *in, const u8 *b, int avail) {
     Insn tmp = *in;
     tmp.op = OP_EXT;
     tmp.next = rip + zi.length;
-    tmp.ext_len = (u8)zi.length;
-    memcpy(tmp.ext_bytes, b, zi.length);
     tmp.reads = 0;
     tmp.writes = 0;
     tmp.memop = false;
@@ -714,12 +1524,16 @@ int x86_decode_ext(u64 rip, Insn *in, const u8 *b, int avail) {
     tmp.addr32 = tr_compat;
     tmp.addr16 = false;
     tmp.disp = 0;
+    tmp.imm = 0;
+    memset(&tmp.ext, 0, sizeof tmp.ext);
 
     for (u8 i = 0; i < zi.operand_count_visible; i++) {
         if (ops[i].type == ZYDIS_OPERAND_TYPE_MEMORY && !ext_populate_mem(&zi, &ops[i], &tmp))
             return ext_reject(rip);
     }
     if (!ext_is_supported(&zi, ops, &tmp))
+        return ext_reject(rip);
+    if (!ext_fill_from_zydis(&zi, ops, &tmp))
         return ext_reject(rip);
 
     *in = tmp;
@@ -752,33 +1566,57 @@ static inline void vrev128_32(int vd, int vn) {
     VEXTQ_8(vd, vd, vd, 8);
 }
 
+static bool ext_emit_pshufd128(int d, int s, u8 imm8, int t0);
+
 static void ext_lanes32(int d, int src1, int src2, int imm) {
     enum { T0 = 27 };
     imm &= 0xff;
-    if (src1 == src2) {
-        if (imm == 0xE4) {
-            vmov128(d, src1);
-            return;
-        }
-        if (imm == 0x00 || imm == 0x55 || imm == 0xAA || imm == 0xFF) {
-            int k = imm & 3;
-            VDUPQ_32(d, src1, k);
-            return;
-        }
-        if (imm == 0x4E) {
-            VEXTQ_8(d, src1, src1, 8);
-            return;
-        }
-        if (imm == 0xB1) {
-            VREV64Q_32(d, src1);
-            return;
-        }
+    if (src1 == src2 && ext_emit_pshufd128(d, src1, (u8)imm, T0))
+        return;
+    if (imm == 0x44) {
+        VZIP1Q_64(d, src1, src2);
+        return;
+    }
+    if (imm == 0xEE) {
+        VZIP2Q_64(d, src1, src2);
+        return;
+    }
+    if (imm == 0x4E) {
+        VEXTQ_8(d, src1, src2, 8);
+        return;
+    }
+    if (imm == 0x88) {
+        RRR(0x4E801800u, d, src1, src2); // uzp1 .4s
+        return;
+    }
+    if (imm == 0xDD) {
+        RRR(0x4E805800u, d, src1, src2); // uzp2 .4s
+        return;
+    }
+    if (imm == 0xE4) {
+        int dst = (d == src2 && d != src1) ? T0 : d;
+        vmov128(dst, src1);
+        ins_elem(dst, 1, src2, 1, 8);
+        vmov128(d, dst);
+        return;
     }
     int tmp = (d != src1 && d != src2) ? d : T0;
-    ins_elem(tmp, 0, src1, imm & 3, 4);
-    ins_elem(tmp, 1, src1, (imm >> 2) & 3, 4);
-    ins_elem(tmp, 2, src2, (imm >> 4) & 3, 4);
-    ins_elem(tmp, 3, src2, (imm >> 6) & 3, 4);
+    if ((imm & 0xf) == 0x4) {
+        ins_elem(tmp, 0, src1, 0, 8);
+    } else if ((imm & 0xf) == 0xe) {
+        ins_elem(tmp, 0, src1, 1, 8);
+    } else {
+        ins_elem(tmp, 0, src1, imm & 3, 4);
+        ins_elem(tmp, 1, src1, (imm >> 2) & 3, 4);
+    }
+    if ((imm >> 4) == 0x4) {
+        ins_elem(tmp, 1, src2, 0, 8);
+    } else if ((imm >> 4) == 0xe) {
+        ins_elem(tmp, 1, src2, 1, 8);
+    } else {
+        ins_elem(tmp, 2, src2, (imm >> 4) & 3, 4);
+        ins_elem(tmp, 3, src2, (imm >> 6) & 3, 4);
+    }
     if (tmp != d)
         vmov128(d, tmp);
 }
@@ -842,21 +1680,6 @@ static void ext_shift_var128(int d, int s, int vcnt, int esize, int kind) {
         RRR(0x4E204400u | sz << 22, d, s, T1); // sshl
     else
         RRR(0x6E204400u | sz << 22, d, s, T1); // ushl
-}
-
-static void ext_pmovmskb128(int rd, int s) {
-    u32 enc;
-    logimm(0x8080808080808080ULL, 1, &enc);
-    movimm(S2, 0x0002040810204081ULL);
-    umov_d(S0, s, 0);
-    umov_d(S1, s, 1);
-    E(0x92000000u | enc | S0 << 5 | S0);
-    E(0x92000000u | enc | S1 << 5 | S1);
-    mul(1, S0, S0, S2);
-    mul(1, S1, S1, S2);
-    lsr_imm(1, S0, S0, 56);
-    lsr_imm(1, S1, S1, 56);
-    logic_sh(1, 1, 0, rd, S0, S1, 0, 8);
 }
 
 static void umov_w(int rd, int rn, int lane, int bytes) {
@@ -1023,6 +1846,18 @@ static bool ext_emit_pshufd128(int d, int s, u8 imm8, int t0) {
             VEXTQ_8(t0, s, s, 4);
             VZIP2Q_64(d, t0, t0);
             return true;
+        case 0x22:
+            VEXTQ_8(t0, s, s, 8);
+            RRR(0x4E801800u, d, t0, t0); // uzp1 .4s -> [2,0,2,0]
+            return true;
+        case 0x77:
+            VEXTQ_8(t0, s, s, 8);
+            RRR(0x4E805800u, d, t0, t0); // uzp2 .4s -> [3,1,3,1]
+            return true;
+        case 0x99:
+            VEXTQ_8(t0, s, s, 4);
+            VZIP1Q_64(d, t0, t0); // [1,2,1,2]
+            return true;
         default:
             return false;
     }
@@ -1088,23 +1923,27 @@ static void ext_emit_vpermd_indices(int dst, int idx, int t_mask, int t_rep, int
     VADDQ_8(dst, dst, t_rep);
 }
 
-static void ext_emit_pmovmskb128(int rd_gpr, int src_vec, int t_mask, int t0) {
-    RR(0x4E20A800u, t0, src_vec);  // cmlt t0.16b, src.16b, #0
-    VANDQ(t0, t0, t_mask);
-    RRR(0x4E20BC00u, t0, t0, t0);  // addp .16b
-    RRR(0x4E20BC00u, t0, t0, t0);  // addp .16b
-    RRR(0x0E20BC00u, t0, t0, t0);  // addp .8b
+static void ext_emit_pmovmskb128(int rd_gpr, int src_vec, int t0) {
+    RR(0x6F090400u, t0, src_vec);  // ushr t0.16b, src.16b, #7
+    RR(0x6F191400u, t0, t0);       // usra t0.8h, t0.8h, #7
+    RR(0x6F321400u, t0, t0);       // usra t0.4s, t0.4s, #14
+    RR(0x6F641400u, t0, t0);       // usra t0.2d, t0.2d, #28
+    ins_elem(t0, 1, t0, 8, 1);     // ins t0.b[1], t0.b[8]
     umov_w(rd_gpr, t0, 0, 2);      // umov w_rd, t0.h[0]
 }
 
-static void ext_emit_vpmovmskb256(int rd_gpr, int src_lo, int src_hi, int t_mask, int t0, int t1) {
-    RR(0x4E20A800u, t0, src_lo);
-    VANDQ(t0, t0, t_mask);
-    RR(0x4E20A800u, t1, src_hi);
-    VANDQ(t1, t1, t_mask);
-    RRR(0x4E20BC00u, t0, t0, t1);  // addp t0.16b, t0.16b, t1.16b
-    RRR(0x4E20BC00u, t0, t0, t0);  // addp .16b
-    RRR(0x0E20BC00u, t0, t0, t0);  // addp .8b
+static void ext_emit_vpmovmskb256(int rd_gpr, int src_lo, int src_hi, int t0, int t1) {
+    RR(0x6F090400u, t0, src_lo);   // ushr t0.16b, src_lo.16b, #7
+    RR(0x6F090400u, t1, src_hi);   // ushr t1.16b, src_hi.16b, #7
+    RR(0x6F191400u, t0, t0);       // usra t0.8h, t0.8h, #7
+    RR(0x6F191400u, t1, t1);       // usra t1.8h, t1.8h, #7
+    RR(0x6F321400u, t0, t0);       // usra t0.4s, t0.4s, #14
+    RR(0x6F321400u, t1, t1);       // usra t1.4s, t1.4s, #14
+    RR(0x6F641400u, t0, t0);       // usra t0.2d, t0.2d, #28
+    RR(0x6F641400u, t1, t1);       // usra t1.2d, t1.2d, #28
+    ins_elem(t0, 1, t0, 8, 1);
+    ins_elem(t0, 2, t1, 0, 1);
+    ins_elem(t0, 3, t1, 8, 1);
     umov_w(rd_gpr, t0, 0, 4);      // umov w_rd, t0.s[0] (full 32-bit mask!)
 }
 
@@ -1430,6 +2269,35 @@ static void emit_lane128_op(ZydisMnemonic m, int d, int n, int s, int c, int imm
                 vmov128(d, s);
                 return;
             }
+            if (bytes == 2) {
+                if (mask == 0x0F || mask == 0xF0) {
+                    int lane64 = mask == 0xF0 ? 1 : 0;
+                    int dst = (d == s && d != n) ? T0 : d;
+                    vmov128(dst, n);
+                    ins_elem(dst, lane64, s, lane64, 8);
+                    vmov128(d, dst);
+                    return;
+                }
+                if (mask == 0x55) {
+                    RR(0x6E600800u, T0, s);         // rev32 .8h
+                    RRR(0x4E406800u, d, T0, n);     // trn2 .8h
+                    return;
+                }
+                if (mask == 0xAA) {
+                    RR(0x6E600800u, T0, n);         // rev32 .8h
+                    RRR(0x4E406800u, d, T0, s);     // trn2 .8h
+                    return;
+                }
+                if (mask == 0x33 || mask == 0xCC) {
+                    ext_emit_vblend32_128(d, n, s, mask == 0x33 ? 0x5 : 0xA, T0);
+                    return;
+                }
+                if (((mask & 0x55) << 1) == (mask & 0xAA)) {
+                    u8 m4 = (u8)((mask & 1) | ((mask >> 1) & 2) | ((mask >> 2) & 4) | ((mask >> 3) & 8));
+                    ext_emit_vblend32_128(d, n, s, m4, T0);
+                    return;
+                }
+            }
             int s_cnt = __builtin_popcount((unsigned)mask);
             bool use_n = (lanes - s_cnt) >= s_cnt;
             int base_v = use_n ? n : s, patch_v = use_n ? s : n;
@@ -1501,6 +2369,20 @@ static void emit_lane128_op(ZydisMnemonic m, int d, int n, int s, int c, int imm
         case ZYDIS_MNEMONIC_VADDSUBPS:
         case ZYDIS_MNEMONIC_VADDSUBPD: {
             bool isd = m == ZYDIS_MNEMONIC_VADDSUBPD;
+            if (!tr_precise_flags) {
+                if (isd) {
+                    RRR(0x4EE0D400u, T0, n, s); // fsub .2d
+                    RRR(0x4E60D400u, T1, n, s); // fadd .2d
+                    ins_elem(T0, 1, T1, 1, 8);
+                    vmov128(d, T0);
+                } else {
+                    RRR(0x4EA0D400u, T0, n, s); // fsub .4s
+                    RRR(0x4E20D400u, T1, n, s); // fadd .4s
+                    RR(0x4EA00800u, T0, T0);    // rev64 .4s
+                    RRR(0x4E806800u, d, T0, T1); // trn2 .4s
+                }
+                return;
+            }
             int bytes = isd ? 8 : 4, lanes = 16 / bytes;
             u32 ftype = isd ? 1u << 22 : 0;
             for (int i = 0; i < lanes; i++) {
@@ -1607,19 +2489,19 @@ static void emit_lane128_op(ZydisMnemonic m, int d, int n, int s, int c, int imm
             RRR(dbl ? 0x6E60DC00u : 0x6E20DC00u, T0, n, s);
             if (srcm != full) {
                 if (dbl) {
-                    movimm(S0, (srcm & 1) ? ~0ULL : 0);
-                    fmov_to_d(T1, S0);
-                    movimm(S0, (srcm & 2) ? ~0ULL : 0);
-                    ins_x(T1, 1, S0);
+                    if (srcm == 1)
+                        RR(0x1E604000u, T0, T0); // fmov d, d: clear lane 1
+                    else
+                        ins_gpr(T0, 0, XZR, 8);
+                } else if (srcm == 0x3) {
+                    RR(0x1E604000u, T0, T0); // clear lanes 2,3
+                } else if (srcm == 0xC) {
+                    ins_gpr(T0, 0, XZR, 8);  // clear lanes 0,1
                 } else {
-                    u64 lo = ((srcm & 1) ? 0xffffffffULL : 0) | ((srcm & 2) ? 0xffffffffULL << 32 : 0);
-                    u64 hi = ((srcm & 4) ? 0xffffffffULL : 0) | ((srcm & 8) ? 0xffffffffULL << 32 : 0);
-                    movimm(S0, lo);
-                    fmov_to_d(T1, S0);
-                    movimm(S0, hi);
-                    ins_x(T1, 1, S0);
+                    for (int i = 0; i < 4; i++)
+                        if (!(srcm & (1u << i)))
+                            ins_gpr(T0, i, XZR, 4);
                 }
-                VANDQ(T0, T0, T1);
             }
             VEORQ(T1, T1, T1);
             RRR(dbl ? 0x6E60D400u : 0x6E20D400u, T0, T0, T1);
@@ -1663,18 +2545,18 @@ static void emit_fma128(int d, int op1, int op2, int op3, int order, int kind, b
     // addend lanes, then one FMLA. That is a single rounding of product ± addend.
     if (kind >= 4) {
         bool sub_even = kind == 4;
-        u64 lo, hi;
         if (!is_double) {
-            lo = sub_even ? 0x0000000080000000ULL : 0x8000000000000000ULL;
-            hi = lo;
+            E(0x4F046400u | (u32)T1); // movi T1.4s, #0x80, lsl #24
+            if (sub_even)
+                RR(0x6F600400u, T1, T1); // ushr T1.2d, T1.2d, #32 -> [0x80000000, 0, 0x80000000, 0]
+            else
+                RR(0x4F605400u, T1, T1); // shl T1.2d, T1.2d, #32 -> [0, 0x80000000, 0, 0x80000000]
         } else {
-            lo = sub_even ? 0x8000000000000000ULL : 0;
-            hi = sub_even ? 0 : 0x8000000000000000ULL;
+            E(0x0F046400u | (u32)T1); // movi T1.2s, #0x80, lsl #24 (d0=0x80000000_80000000, d1=0)
+            RR(0x5F605400u, T1, T1);  // shl dT1, dT1, #32 -> [0x80000000_00000000, 0]
+            if (!sub_even)
+                VEXTQ_8(T1, T1, T1, 8); // [0, 0x80000000_00000000]
         }
-        movimm(S0, lo);
-        fmov_to_d(T1, S0);
-        movimm(S0, hi);
-        ins_x(T1, 1, S0);
         VEORQ(T0, acc, T1);
         if (is_double) VFMLAQD(T0, mulA, mulB); else VFMLAQS(T0, mulA, mulB);
         vmov128(d, T0);
@@ -1756,29 +2638,30 @@ static void emit_mpsadbw_lane(int vd, int vs1, int vs2, u8 lane_imm) {
 }
 
 void emit_ext(const Insn *in, int live) {
-    ZydisDecodedInstruction zi;
-    ZydisDecodedOperand ops[ZYDIS_MAX_OPERAND_COUNT];
-    if (!ZYAN_SUCCESS(ZydisDecoderDecodeFull(active_decoder(), in->ext_bytes, in->ext_len, &zi, ops))) {
-        emit_stop(in->rip, "ext: redecode failed");
+    const ExtDecoded *ex = &in->ext;
+    ZydisMnemonic mnem = (ZydisMnemonic)ex->mnem;
+    u8 op_cnt = ex->op_cnt;
+    if (mnem == ZYDIS_MNEMONIC_INVALID) {
+        emit_stop(in->rip, "ext: invalid cached opcode");
         return;
     }
 
     int fma_ord = 0, fma_kind = 0;
     bool fma_sc = false, fma_dbl = false;
-    if (is_fma_mnemonic(zi.mnemonic, &fma_ord, &fma_kind, &fma_sc, &fma_dbl)) {
-        u8 vbytes = 16;
-        int d = zydis_vec_idx(ops[0].reg.value, &vbytes);
-        int n = zydis_vec_idx(ops[1].reg.value, NULL);
+    if (is_fma_mnemonic(mnem, &fma_ord, &fma_kind, &fma_sc, &fma_dbl)) {
+        u8 vbytes = ex->op_bytes[0];
+        int d = ex->op_reg[0];
+        int n = ex->op_reg[1];
         if (fma_sc) {
-            int s = ops[2].type == ZYDIS_OPERAND_TYPE_REGISTER
-                        ? zydis_vec_idx(ops[2].reg.value, NULL)
+            int s = ex->op_type[2] == EXT_OP_VEC
+                        ? ex->op_reg[2]
                         : (ext_vldst(fma_dbl ? 3 : 2, true, V_MEM, addr_prepare(in, fma_dbl ? 8 : 4)), V_MEM);
             emit_fma128(d, d, n, s, fma_ord, fma_kind, true, fma_dbl);
             ymm_zero_hi(d);
             return;
         }
         if (vbytes == 16) {
-            int s = ext_vec_src128(in, &ops[2], V_MEM);
+            int s = ext_vec_src128(in, 2, V_MEM);
             emit_fma128(d, d, n, s, fma_ord, fma_kind, false, fma_dbl);
             ymm_zero_hi(d);
             return;
@@ -1786,8 +2669,8 @@ void emit_ext(const Insn *in, int live) {
         if (tr_opt_ymm_cache) {
             u8 pin = 0;
             int s_lo = V_MEM, s_hi_r = V_S2;
-            if (ops[2].type == ZYDIS_OPERAND_TYPE_REGISTER) {
-                int sr = zydis_vec_idx(ops[2].reg.value, NULL);
+            if (ex->op_type[2] == EXT_OP_VEC) {
+                int sr = ex->op_reg[2];
                 s_lo = sr;
                 s_hi_r = ymm_cache_get(sr, true, false, &pin);
             } else {
@@ -1802,8 +2685,8 @@ void emit_ext(const Insn *in, int live) {
             return;
         }
         int s_lo = V_MEM, s_hi_r = V_S2;
-        if (ops[2].type == ZYDIS_OPERAND_TYPE_REGISTER) {
-            int sr = zydis_vec_idx(ops[2].reg.value, NULL);
+        if (ex->op_type[2] == EXT_OP_VEC) {
+            int sr = ex->op_reg[2];
             s_lo = sr;
             int home = ymm_resident(sr);
             if (home >= 0)
@@ -1834,71 +2717,68 @@ void emit_ext(const Insn *in, int live) {
         return;
     }
 
-    if (is_lanewise_vex(zi.mnemonic)) {
-        u8 vbytes = 16;
-        int d = zydis_vec_idx(ops[0].reg.value, &vbytes);
-        int n = zydis_vec_idx(ops[1].reg.value, NULL);
+    if (is_lanewise_vex(mnem)) {
+        u8 vbytes = ex->op_bytes[0];
+        int d = ex->op_reg[0];
+        int n = ex->op_reg[1];
         int s_idx = 2;
-        bool two_vec = (zi.operand_count_visible == 2) ||
-                       (zi.operand_count_visible == 3 && ops[2].type == ZYDIS_OPERAND_TYPE_IMMEDIATE);
+        bool two_vec = (op_cnt == 2) || (op_cnt == 3 && ex->op_type[2] == EXT_OP_IMM);
         if (two_vec)
             s_idx = 1;
-        int imm = 0;
+        int imm = (int)in->imm;
         bool has_imm = false;
         int c_reg = 0;
-        for (u8 i = 0; i < zi.operand_count_visible; i++) {
-            if (ops[i].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
-                imm = (int)ops[i].imm.value.u;
+        for (u8 i = 0; i < op_cnt; i++) {
+            if (ex->op_type[i] == EXT_OP_IMM) {
                 has_imm = true;
             }
         }
-        if (zi.mnemonic == ZYDIS_MNEMONIC_VPBLENDVB ||
-            zi.mnemonic == ZYDIS_MNEMONIC_VBLENDVPS ||
-            zi.mnemonic == ZYDIS_MNEMONIC_VBLENDVPD) {
-            c_reg = zydis_vec_idx(ops[3].reg.value, NULL);
+        if (mnem == ZYDIS_MNEMONIC_VPBLENDVB ||
+            mnem == ZYDIS_MNEMONIC_VBLENDVPS ||
+            mnem == ZYDIS_MNEMONIC_VBLENDVPD) {
+            c_reg = ex->op_reg[3];
         }
-        bool cnt_is_128 = (zi.mnemonic == ZYDIS_MNEMONIC_VPSLLW || zi.mnemonic == ZYDIS_MNEMONIC_VPSLLD ||
-                           zi.mnemonic == ZYDIS_MNEMONIC_VPSLLQ || zi.mnemonic == ZYDIS_MNEMONIC_VPSRLW ||
-                           zi.mnemonic == ZYDIS_MNEMONIC_VPSRLD || zi.mnemonic == ZYDIS_MNEMONIC_VPSRLQ ||
-                           zi.mnemonic == ZYDIS_MNEMONIC_VPSRAW || zi.mnemonic == ZYDIS_MNEMONIC_VPSRAD) && !has_imm;
-        bool uses_t2 = zi.mnemonic == ZYDIS_MNEMONIC_VPSIGNB || zi.mnemonic == ZYDIS_MNEMONIC_VPSIGNW ||
-                       zi.mnemonic == ZYDIS_MNEMONIC_VPSIGND || zi.mnemonic == ZYDIS_MNEMONIC_VPMADDUBSW ||
-                       zi.mnemonic == ZYDIS_MNEMONIC_VADDSUBPS || zi.mnemonic == ZYDIS_MNEMONIC_VADDSUBPD ||
-                       (zi.mnemonic == ZYDIS_MNEMONIC_VPERMILPS && !has_imm) ||
-                       zi.mnemonic == ZYDIS_MNEMONIC_VAESKEYGENASSIST;
+        bool cnt_is_128 = (mnem == ZYDIS_MNEMONIC_VPSLLW || mnem == ZYDIS_MNEMONIC_VPSLLD ||
+                           mnem == ZYDIS_MNEMONIC_VPSLLQ || mnem == ZYDIS_MNEMONIC_VPSRLW ||
+                           mnem == ZYDIS_MNEMONIC_VPSRLD || mnem == ZYDIS_MNEMONIC_VPSRLQ ||
+                           mnem == ZYDIS_MNEMONIC_VPSRAW || mnem == ZYDIS_MNEMONIC_VPSRAD) && !has_imm;
+        bool uses_t2 = mnem == ZYDIS_MNEMONIC_VPSIGNB || mnem == ZYDIS_MNEMONIC_VPSIGNW ||
+                       mnem == ZYDIS_MNEMONIC_VPSIGND || mnem == ZYDIS_MNEMONIC_VPMADDUBSW ||
+                       (tr_precise_flags && (mnem == ZYDIS_MNEMONIC_VADDSUBPS || mnem == ZYDIS_MNEMONIC_VADDSUBPD)) ||
+                       (mnem == ZYDIS_MNEMONIC_VPERMILPS && !has_imm) ||
+                       mnem == ZYDIS_MNEMONIC_VAESKEYGENASSIST;
         if (uses_t2)
             ymm_cache_evict_vreg(29);
 
         if (vbytes == 16) {
             int s = 0;
             if (two_vec) {
-                n = ext_vec_src128(in, &ops[1], V_MEM);
+                n = ext_vec_src128(in, 1, V_MEM);
             } else {
-                s = ext_vec_src128(in, &ops[s_idx], V_MEM);
+                s = ext_vec_src128(in, s_idx, V_MEM);
             }
-            emit_lane128_op(zi.mnemonic, d, n, s, c_reg, imm, has_imm);
+            emit_lane128_op(mnem, d, n, s, c_reg, imm, has_imm);
             ymm_zero_hi(d);
             return;
         }
 
         // 256-bit YMM lane-wise operation
-        if ((zi.mnemonic == ZYDIS_MNEMONIC_VXORPS || zi.mnemonic == ZYDIS_MNEMONIC_VXORPD ||
-             zi.mnemonic == ZYDIS_MNEMONIC_VPXOR) &&
-            ops[s_idx].type == ZYDIS_OPERAND_TYPE_REGISTER &&
-            zydis_vec_idx(ops[s_idx].reg.value, NULL) == n) {
+        if ((mnem == ZYDIS_MNEMONIC_VXORPS || mnem == ZYDIS_MNEMONIC_VXORPD ||
+             mnem == ZYDIS_MNEMONIC_VPXOR) &&
+            ex->op_type[s_idx] == EXT_OP_VEC && ex->op_reg[s_idx] == (u8)n) {
             VEORQ(d, d, d);
             ymm_zero_hi(d);
             return;
         }
-        int hi_imm = (zi.mnemonic == ZYDIS_MNEMONIC_VBLENDPS) ? (imm >> 4) :
-                     (zi.mnemonic == ZYDIS_MNEMONIC_VBLENDPD || zi.mnemonic == ZYDIS_MNEMONIC_VSHUFPD ||
-                      zi.mnemonic == ZYDIS_MNEMONIC_VPERMILPD) ? (imm >> 2) : imm;
+        int hi_imm = (mnem == ZYDIS_MNEMONIC_VBLENDPS) ? (imm >> 4) :
+                     (mnem == ZYDIS_MNEMONIC_VBLENDPD || mnem == ZYDIS_MNEMONIC_VSHUFPD ||
+                      mnem == ZYDIS_MNEMONIC_VPERMILPD) ? (imm >> 2) : imm;
         if (tr_opt_ymm_cache) {
             u8 pin = uses_t2 ? (u8)(1u << 2) : 0; // slot 2 is v29 (T2)
             int n_lo = n, n_hi = V_S2, s_lo = 0, s_hi = V_S2, c_lo = c_reg, c_hi = c_reg;
             if (two_vec) {
-                if (ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER) {
-                    int nr = zydis_vec_idx(ops[1].reg.value, NULL);
+                if (ex->op_type[1] == EXT_OP_VEC) {
+                    int nr = ex->op_reg[1];
                     n_lo = nr;
                     n_hi = ymm_cache_get(nr, true, false, &pin);
                 } else {
@@ -1908,12 +2788,12 @@ void emit_ext(const Insn *in, int live) {
                 }
             } else if (cnt_is_128) {
                 n_hi = ymm_cache_get(n, true, false, &pin);
-                s_lo = ext_vec_src128(in, &ops[s_idx], V_MEM);
+                s_lo = ext_vec_src128(in, s_idx, V_MEM);
                 s_hi = s_lo;
             } else {
                 n_hi = ymm_cache_get(n, true, false, &pin);
-                if (ops[s_idx].type == ZYDIS_OPERAND_TYPE_REGISTER) {
-                    int sr = zydis_vec_idx(ops[s_idx].reg.value, NULL);
+                if (ex->op_type[s_idx] == EXT_OP_VEC) {
+                    int sr = ex->op_reg[s_idx];
                     s_lo = sr;
                     s_hi = ymm_cache_get(sr, true, false, &pin);
                 } else {
@@ -1922,15 +2802,15 @@ void emit_ext(const Insn *in, int live) {
                     s_hi = V_S2;
                 }
             }
-            if (zi.mnemonic == ZYDIS_MNEMONIC_VPBLENDVB ||
-                zi.mnemonic == ZYDIS_MNEMONIC_VBLENDVPS ||
-                zi.mnemonic == ZYDIS_MNEMONIC_VBLENDVPD) {
+            if (mnem == ZYDIS_MNEMONIC_VPBLENDVB ||
+                mnem == ZYDIS_MNEMONIC_VBLENDVPS ||
+                mnem == ZYDIS_MNEMONIC_VBLENDVPD) {
                 c_hi = ymm_cache_get(c_reg, true, false, &pin);
             }
             int d_hi = ymm_cache_get(d, false, true, &pin);
             if (d_hi >= 0) {
-                emit_lane128_op(zi.mnemonic, d_hi, n_hi, s_hi, c_hi, hi_imm, has_imm);
-                emit_lane128_op(zi.mnemonic, d, n_lo, s_lo, c_lo, imm, has_imm);
+                emit_lane128_op(mnem, d_hi, n_hi, s_hi, c_hi, hi_imm, has_imm);
+                emit_lane128_op(mnem, d, n_lo, s_lo, c_lo, imm, has_imm);
                 if (d >= 8)
                     ymm_dirty_run_cnt++;
                 return;
@@ -1939,8 +2819,8 @@ void emit_ext(const Insn *in, int live) {
         }
         int n_lo = n, n_hi = V_S0, s_lo = 0, s_hi = V_S2, c_lo = c_reg, c_hi = c_reg;
         if (two_vec) {
-            if (ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER) {
-                int nr = zydis_vec_idx(ops[1].reg.value, NULL);
+            if (ex->op_type[1] == EXT_OP_VEC) {
+                int nr = ex->op_reg[1];
                 n_lo = nr;
                 int nh = ymm_resident(nr);
                 if (nh >= 0) n_hi = nh;
@@ -1954,14 +2834,14 @@ void emit_ext(const Insn *in, int live) {
             int nh = ymm_resident(n);
             if (nh >= 0) n_hi = nh;
             else ymm_load_hi(V_S0, n);
-            s_lo = ext_vec_src128(in, &ops[s_idx], V_MEM);
+            s_lo = ext_vec_src128(in, s_idx, V_MEM);
             s_hi = s_lo;
         } else {
             int nh = ymm_resident(n);
             if (nh >= 0) n_hi = nh;
             else ymm_load_hi(V_S0, n);
-            if (ops[s_idx].type == ZYDIS_OPERAND_TYPE_REGISTER) {
-                int sr = zydis_vec_idx(ops[s_idx].reg.value, NULL);
+            if (ex->op_type[s_idx] == EXT_OP_VEC) {
+                int sr = ex->op_reg[s_idx];
                 s_lo = sr;
                 int sh = ymm_resident(sr);
                 if (sh >= 0) s_hi = sh;
@@ -1972,19 +2852,19 @@ void emit_ext(const Insn *in, int live) {
             }
         }
         // Compute high 128-bit half first so if d == s_lo (e.g. cnt_is_128), s_lo is not clobbered before high half uses it.
-        if (zi.mnemonic == ZYDIS_MNEMONIC_VPBLENDVB ||
-            zi.mnemonic == ZYDIS_MNEMONIC_VBLENDVPS ||
-            zi.mnemonic == ZYDIS_MNEMONIC_VBLENDVPD) {
+        if (mnem == ZYDIS_MNEMONIC_VPBLENDVB ||
+            mnem == ZYDIS_MNEMONIC_VBLENDVPS ||
+            mnem == ZYDIS_MNEMONIC_VBLENDVPD) {
             int ch = ymm_resident(c_reg);
             if (ch >= 0) c_hi = ch;
             else { ymm_load_hi(V_S1, c_reg); c_hi = V_S1; }
         }
         int d_home = ymm_resident(d);
         bool d_hi_direct = d_home >= 0 && !(cnt_is_128 && d == s_lo) &&
-                           !(zi.mnemonic == ZYDIS_MNEMONIC_VPBLENDVB && d == 0);
+                           !(mnem == ZYDIS_MNEMONIC_VPBLENDVB && d == 0);
         int d_hi = d_hi_direct ? d_home : V_S0;
-        emit_lane128_op(zi.mnemonic, d_hi, n_hi, s_hi, c_hi, hi_imm, has_imm);
-        emit_lane128_op(zi.mnemonic, d, n_lo, s_lo, c_lo, imm, has_imm);
+        emit_lane128_op(mnem, d_hi, n_hi, s_hi, c_hi, hi_imm, has_imm);
+        emit_lane128_op(mnem, d, n_lo, s_lo, c_lo, imm, has_imm);
         if (!d_hi_direct)
             ymm_store_hi(d_hi, d);
         else
@@ -1992,8 +2872,8 @@ void emit_ext(const Insn *in, int live) {
         return;
     }
 
-    // Rare vector/SHA-NI switch cases use V_S0/V_S1/T2 directly; preserve cache across pure integer/BMI/ADX and hot VMOV/VZERO/VBROADCAST/VPBLENDD cases.
-    switch (zi.mnemonic) {
+    // Rare vector/SHA-NI switch cases use V_S0/V_S1/T2 directly; preserve cache across integer/BMI/ADX and all cache-safe VEX cases.
+    switch (mnem) {
         case ZYDIS_MNEMONIC_XGETBV: case ZYDIS_MNEMONIC_XSETBV:
         case ZYDIS_MNEMONIC_ANDN: case ZYDIS_MNEMONIC_BEXTR: case ZYDIS_MNEMONIC_BLSI:
         case ZYDIS_MNEMONIC_BLSMSK: case ZYDIS_MNEMONIC_BLSR: case ZYDIS_MNEMONIC_BZHI:
@@ -2007,6 +2887,25 @@ void emit_ext(const Insn *in, int live) {
         case ZYDIS_MNEMONIC_VMOVNTDQ: case ZYDIS_MNEMONIC_VMOVNTDQA:
         case ZYDIS_MNEMONIC_VMOVNTPS: case ZYDIS_MNEMONIC_VMOVNTPD:
         case ZYDIS_MNEMONIC_VLDDQU:
+        case ZYDIS_MNEMONIC_VMOVSS: case ZYDIS_MNEMONIC_VMOVSD:
+        case ZYDIS_MNEMONIC_VMOVD: case ZYDIS_MNEMONIC_VMOVQ:
+        case ZYDIS_MNEMONIC_VMOVLPS: case ZYDIS_MNEMONIC_VMOVLPD:
+        case ZYDIS_MNEMONIC_VMOVHPS: case ZYDIS_MNEMONIC_VMOVHPD:
+        case ZYDIS_MNEMONIC_VMOVLHPS: case ZYDIS_MNEMONIC_VMOVHLPS:
+        case ZYDIS_MNEMONIC_VADDSS: case ZYDIS_MNEMONIC_VADDSD:
+        case ZYDIS_MNEMONIC_VSUBSS: case ZYDIS_MNEMONIC_VSUBSD:
+        case ZYDIS_MNEMONIC_VMULSS: case ZYDIS_MNEMONIC_VMULSD:
+        case ZYDIS_MNEMONIC_VDIVSS: case ZYDIS_MNEMONIC_VDIVSD:
+        case ZYDIS_MNEMONIC_VMINSS: case ZYDIS_MNEMONIC_VMINSD:
+        case ZYDIS_MNEMONIC_VMAXSS: case ZYDIS_MNEMONIC_VMAXSD:
+        case ZYDIS_MNEMONIC_VSQRTSS: case ZYDIS_MNEMONIC_VSQRTSD:
+        case ZYDIS_MNEMONIC_VRSQRTSS: case ZYDIS_MNEMONIC_VRCPSS:
+        case ZYDIS_MNEMONIC_VCVTSI2SS: case ZYDIS_MNEMONIC_VCVTSI2SD:
+        case ZYDIS_MNEMONIC_VCVTSS2SI: case ZYDIS_MNEMONIC_VCVTTSS2SI:
+        case ZYDIS_MNEMONIC_VCVTSD2SI: case ZYDIS_MNEMONIC_VCVTTSD2SI:
+        case ZYDIS_MNEMONIC_VCVTSS2SD: case ZYDIS_MNEMONIC_VCVTSD2SS:
+        case ZYDIS_MNEMONIC_VUCOMISS: case ZYDIS_MNEMONIC_VUCOMISD:
+        case ZYDIS_MNEMONIC_VCOMISS: case ZYDIS_MNEMONIC_VCOMISD:
         case ZYDIS_MNEMONIC_VBROADCASTF128: case ZYDIS_MNEMONIC_VBROADCASTI128:
         case ZYDIS_MNEMONIC_VBROADCASTSS: case ZYDIS_MNEMONIC_VBROADCASTSD:
         case ZYDIS_MNEMONIC_VPBROADCASTB: case ZYDIS_MNEMONIC_VPBROADCASTW:
@@ -2016,11 +2915,19 @@ void emit_ext(const Insn *in, int live) {
         case ZYDIS_MNEMONIC_VEXTRACTF128: case ZYDIS_MNEMONIC_VEXTRACTI128:
         case ZYDIS_MNEMONIC_VPERM2F128: case ZYDIS_MNEMONIC_VPERM2I128:
         case ZYDIS_MNEMONIC_VPERMQ: case ZYDIS_MNEMONIC_VPERMPD:
+        case ZYDIS_MNEMONIC_VPEXTRB: case ZYDIS_MNEMONIC_VPEXTRW:
+        case ZYDIS_MNEMONIC_VPEXTRD: case ZYDIS_MNEMONIC_VPEXTRQ:
+        case ZYDIS_MNEMONIC_VPINSRB: case ZYDIS_MNEMONIC_VPINSRW:
+        case ZYDIS_MNEMONIC_VPINSRD: case ZYDIS_MNEMONIC_VPINSRQ:
+        case ZYDIS_MNEMONIC_VINSERTPS: case ZYDIS_MNEMONIC_VEXTRACTPS:
+        case ZYDIS_MNEMONIC_VROUNDSS: case ZYDIS_MNEMONIC_VROUNDSD:
+        case ZYDIS_MNEMONIC_VCMPSS: case ZYDIS_MNEMONIC_VCMPSD:
         case ZYDIS_MNEMONIC_VPMOVSXBW: case ZYDIS_MNEMONIC_VPMOVSXBD: case ZYDIS_MNEMONIC_VPMOVSXBQ:
         case ZYDIS_MNEMONIC_VPMOVSXWD: case ZYDIS_MNEMONIC_VPMOVSXWQ: case ZYDIS_MNEMONIC_VPMOVSXDQ:
         case ZYDIS_MNEMONIC_VPMOVZXBW: case ZYDIS_MNEMONIC_VPMOVZXBD: case ZYDIS_MNEMONIC_VPMOVZXBQ:
         case ZYDIS_MNEMONIC_VPMOVZXWD: case ZYDIS_MNEMONIC_VPMOVZXWQ: case ZYDIS_MNEMONIC_VPMOVZXDQ:
-        case ZYDIS_MNEMONIC_VPMOVMSKB:
+        case ZYDIS_MNEMONIC_VPMOVMSKB: case ZYDIS_MNEMONIC_VMOVMSKPS: case ZYDIS_MNEMONIC_VMOVMSKPD:
+        case ZYDIS_MNEMONIC_VPTEST:
         case ZYDIS_MNEMONIC_VCVTDQ2PS: case ZYDIS_MNEMONIC_VCVTPS2DQ: case ZYDIS_MNEMONIC_VCVTTPS2DQ:
             break;
         default:
@@ -2028,7 +2935,7 @@ void emit_ext(const Insn *in, int live) {
             break;
     }
 
-    switch (zi.mnemonic) {
+    switch (mnem) {
         case ZYDIS_MNEMONIC_XGETBV: {
             u32 *bad_ecx = tr_cc;
             cbz(1, 0, 1, 0);
@@ -2055,21 +2962,21 @@ void emit_ext(const Insn *in, int live) {
 
         // ---- BMI1 ----
         case ZYDIS_MNEMONIC_ANDN: {
-            u8 sz = 8;
-            int dst = zydis_gpr_idx(ops[0].reg.value, &sz, NULL);
+            u8 sz = ex->op_bytes[0];
+            int dst = ex->op_reg[0];
             int sf = sz == 8;
-            int src1 = zydis_gpr_idx(ops[1].reg.value, NULL, NULL);
-            int src2 = ext_gpr_src(in, &ops[2], sz, S0);
+            int src1 = ex->op_reg[1];
+            int src2 = ext_gpr_src(in, 2, sz, S0);
             logic_reg(sf, 0, 1, dst, src2, src1);
             emit_bmi_flags(sf, dst, live, 0, 0);
             return;
         }
         case ZYDIS_MNEMONIC_BEXTR: {
-            u8 sz = 8;
-            int dst = zydis_gpr_idx(ops[0].reg.value, &sz, NULL);
+            u8 sz = ex->op_bytes[0];
+            int dst = ex->op_reg[0];
             int sf = sz == 8, width = sf ? 64 : 32;
-            int src1 = ext_gpr_src(in, &ops[1], sz, S0);
-            int src2 = zydis_gpr_idx(ops[2].reg.value, NULL, NULL);
+            int src1 = ext_gpr_src(in, 1, sz, S0);
+            int src2 = ex->op_reg[2];
             ubfx(1, S1, src2, 0, 8);
             ubfx(1, S2, src2, 8, 8);
             var_shift(sf, 1, S3, src1, S1);
@@ -2084,10 +2991,10 @@ void emit_ext(const Insn *in, int live) {
             return;
         }
         case ZYDIS_MNEMONIC_BLSI: {
-            u8 sz = 8;
-            int dst = zydis_gpr_idx(ops[0].reg.value, &sz, NULL);
+            u8 sz = ex->op_bytes[0];
+            int dst = ex->op_reg[0];
             int sf = sz == 8;
-            int src = ext_gpr_src(in, &ops[1], sz, S0);
+            int src = ext_gpr_src(in, 1, sz, S0);
             if (live & F_C) {
                 add_imm(sf, 1, 1, XZR, src, 0);
                 cset(S3, 1);
@@ -2098,10 +3005,10 @@ void emit_ext(const Insn *in, int live) {
             return;
         }
         case ZYDIS_MNEMONIC_BLSMSK: {
-            u8 sz = 8;
-            int dst = zydis_gpr_idx(ops[0].reg.value, &sz, NULL);
+            u8 sz = ex->op_bytes[0];
+            int dst = ex->op_reg[0];
             int sf = sz == 8;
-            int src = ext_gpr_src(in, &ops[1], sz, S0);
+            int src = ext_gpr_src(in, 1, sz, S0);
             if (live & F_C) {
                 add_imm(sf, 1, 1, XZR, src, 0);
                 cset(S3, 0);
@@ -2112,10 +3019,10 @@ void emit_ext(const Insn *in, int live) {
             return;
         }
         case ZYDIS_MNEMONIC_BLSR: {
-            u8 sz = 8;
-            int dst = zydis_gpr_idx(ops[0].reg.value, &sz, NULL);
+            u8 sz = ex->op_bytes[0];
+            int dst = ex->op_reg[0];
             int sf = sz == 8;
-            int src = ext_gpr_src(in, &ops[1], sz, S0);
+            int src = ext_gpr_src(in, 1, sz, S0);
             if (live & F_C) {
                 add_imm(sf, 1, 1, XZR, src, 0);
                 cset(S3, 0);
@@ -2128,11 +3035,11 @@ void emit_ext(const Insn *in, int live) {
 
         // ---- BMI2 ----
         case ZYDIS_MNEMONIC_BZHI: {
-            u8 sz = 8;
-            int dst = zydis_gpr_idx(ops[0].reg.value, &sz, NULL);
+            u8 sz = ex->op_bytes[0];
+            int dst = ex->op_reg[0];
             int sf = sz == 8, width = sf ? 64 : 32;
-            int src1 = ext_gpr_src(in, &ops[1], sz, S0);
-            int src2 = zydis_gpr_idx(ops[2].reg.value, NULL, NULL);
+            int src1 = ext_gpr_src(in, 1, sz, S0);
+            int src2 = ex->op_reg[2];
             ubfx(1, S1, src2, 0, 8);
             movimm(S2, ~0ULL);
             var_shift(1, 0, S2, S2, S1);
@@ -2144,11 +3051,11 @@ void emit_ext(const Insn *in, int live) {
             return;
         }
         case ZYDIS_MNEMONIC_MULX: {
-            u8 sz = 8;
-            int hi = zydis_gpr_idx(ops[0].reg.value, &sz, NULL);
-            int lo = zydis_gpr_idx(ops[1].reg.value, NULL, NULL);
+            u8 sz = ex->op_bytes[0];
+            int hi = ex->op_reg[0];
+            int lo = ex->op_reg[1];
             int sf = sz == 8;
-            int src2 = ext_gpr_src(in, &ops[2], sz, S0);
+            int src2 = ext_gpr_src(in, 2, sz, S0);
             if (sf) {
                 mul(1, S1, 2, src2);
                 umulh(S2, 2, src2);
@@ -2164,32 +3071,32 @@ void emit_ext(const Insn *in, int live) {
             return;
         }
         case ZYDIS_MNEMONIC_RORX: {
-            u8 sz = 8;
-            int dst = zydis_gpr_idx(ops[0].reg.value, &sz, NULL);
+            u8 sz = ex->op_bytes[0];
+            int dst = ex->op_reg[0];
             int sf = sz == 8;
-            int src = ext_gpr_src(in, &ops[1], sz, S0);
-            int count = (int)(ops[2].imm.value.u & (sf ? 63 : 31));
+            int src = ext_gpr_src(in, 1, sz, S0);
+            int count = (int)((u64)in->imm & (sf ? 63 : 31));
             extr(sf, dst, src, src, count);
             return;
         }
         case ZYDIS_MNEMONIC_SARX:
         case ZYDIS_MNEMONIC_SHLX:
         case ZYDIS_MNEMONIC_SHRX: {
-            u8 sz = 8;
-            int dst = zydis_gpr_idx(ops[0].reg.value, &sz, NULL);
+            u8 sz = ex->op_bytes[0];
+            int dst = ex->op_reg[0];
             int sf = sz == 8;
-            int src1 = ext_gpr_src(in, &ops[1], sz, S0);
-            int src2 = zydis_gpr_idx(ops[2].reg.value, NULL, NULL);
-            int op2 = zi.mnemonic == ZYDIS_MNEMONIC_SHLX ? 0 : (zi.mnemonic == ZYDIS_MNEMONIC_SHRX ? 1 : 2);
+            int src1 = ext_gpr_src(in, 1, sz, S0);
+            int src2 = ex->op_reg[2];
+            int op2 = mnem == ZYDIS_MNEMONIC_SHLX ? 0 : (mnem == ZYDIS_MNEMONIC_SHRX ? 1 : 2);
             var_shift(sf, op2, dst, src1, src2);
             return;
         }
         case ZYDIS_MNEMONIC_PDEP: {
-            u8 sz = 8;
-            int dst = zydis_gpr_idx(ops[0].reg.value, &sz, NULL);
+            u8 sz = ex->op_bytes[0];
+            int dst = ex->op_reg[0];
             int sf = sz == 8;
-            int src1 = zydis_gpr_idx(ops[1].reg.value, NULL, NULL);
-            int mask = ext_gpr_src(in, &ops[2], sz, S0);
+            int src1 = ex->op_reg[1];
+            int mask = ext_gpr_src(in, 2, sz, S0);
             mov_reg(sf, S1, src1);
             mov_reg(sf, S2, mask);
             mov_reg(1, S3, XZR);
@@ -2209,11 +3116,11 @@ void emit_ext(const Insn *in, int live) {
             return;
         }
         case ZYDIS_MNEMONIC_PEXT: {
-            u8 sz = 8;
-            int dst = zydis_gpr_idx(ops[0].reg.value, &sz, NULL);
+            u8 sz = ex->op_bytes[0];
+            int dst = ex->op_reg[0];
             int sf = sz == 8;
-            int src1 = zydis_gpr_idx(ops[1].reg.value, NULL, NULL);
-            int mask = ext_gpr_src(in, &ops[2], sz, S0);
+            int src1 = ex->op_reg[1];
+            int mask = ext_gpr_src(in, 2, sz, S0);
             mov_reg(sf, S1, src1);
             mov_reg(sf, S2, mask);
             mov_reg(1, S3, XZR);
@@ -2240,11 +3147,11 @@ void emit_ext(const Insn *in, int live) {
         // ---- ADX ----
         case ZYDIS_MNEMONIC_ADCX:
         case ZYDIS_MNEMONIC_ADOX: {
-            bool is_adcx = zi.mnemonic == ZYDIS_MNEMONIC_ADCX;
-            u8 sz = 8;
-            int dst = zydis_gpr_idx(ops[0].reg.value, &sz, NULL);
+            bool is_adcx = mnem == ZYDIS_MNEMONIC_ADCX;
+            u8 sz = ex->op_bytes[0];
+            int dst = ex->op_reg[0];
             int sf = sz == 8;
-            int src = ext_gpr_src(in, &ops[1], sz, S0);
+            int src = ext_gpr_src(in, 1, sz, S0);
             mrs_nzcv(S3);
             if (is_adcx) {
                 logic_reg(1, 1, 1, S2, XZR, S3);
@@ -2280,8 +3187,8 @@ void emit_ext(const Insn *in, int live) {
 
         // ---- SHA-NI ----
         case ZYDIS_MNEMONIC_SHA1NEXTE: {
-            int vd = zydis_vec_idx(ops[0].reg.value, NULL);
-            int vs = ext_vec_src128(in, &ops[1], V_MEM);
+            int vd = ex->op_reg[0];
+            int vs = ext_vec_src128(in, 1, V_MEM);
             VDUPQ_32(V_S0, vd, 3);
             SHA1H(V_S0, V_S0);
             VEXTQ_8(V_S0, V_S0, V_S0, 4);
@@ -2289,15 +3196,15 @@ void emit_ext(const Insn *in, int live) {
             return;
         }
         case ZYDIS_MNEMONIC_SHA1MSG1: {
-            int vd = zydis_vec_idx(ops[0].reg.value, NULL);
-            int vs = ext_vec_src128(in, &ops[1], V_MEM);
+            int vd = ex->op_reg[0];
+            int vs = ext_vec_src128(in, 1, V_MEM);
             VEXTQ_8(V_S0, vs, vd, 8);
             VEORQ(vd, vd, V_S0);
             return;
         }
         case ZYDIS_MNEMONIC_SHA1MSG2: {
-            int vd = zydis_vec_idx(ops[0].reg.value, NULL);
-            int vs = ext_vec_src128(in, &ops[1], V_MEM);
+            int vd = ex->op_reg[0];
+            int vs = ext_vec_src128(in, 1, V_MEM);
             vrev128_32(V_S0, vd);
             vrev128_32(V_S1, vs);
             SHA1SU1(V_S0, V_S1);
@@ -2306,9 +3213,9 @@ void emit_ext(const Insn *in, int live) {
         }
         case ZYDIS_MNEMONIC_SHA1RNDS4: {
             static const u32 sha1_k[4] = {0x5A827999u, 0x6ED9EBA1u, 0x8F1BBCDCu, 0xCA62C1D6u};
-            int vd = zydis_vec_idx(ops[0].reg.value, NULL);
-            int vs = ext_vec_src128(in, &ops[1], V_MEM);
-            int func = (int)(ops[2].imm.value.u & 3);
+            int vd = ex->op_reg[0];
+            int vs = ext_vec_src128(in, 1, V_MEM);
+            int func = (int)((u64)in->imm & 3);
             vrev128_32(V_S0, vd);
             vrev128_32(V_S1, vs);
             movimm(S0, sha1_k[func]);
@@ -2325,22 +3232,22 @@ void emit_ext(const Insn *in, int live) {
             return;
         }
         case ZYDIS_MNEMONIC_SHA256MSG1: {
-            int vd = zydis_vec_idx(ops[0].reg.value, NULL);
-            int vs = ext_vec_src128(in, &ops[1], V_MEM);
+            int vd = ex->op_reg[0];
+            int vs = ext_vec_src128(in, 1, V_MEM);
             SHA256SU0(vd, vs);
             return;
         }
         case ZYDIS_MNEMONIC_SHA256MSG2: {
-            int vd = zydis_vec_idx(ops[0].reg.value, NULL);
-            int vs = ext_vec_src128(in, &ops[1], V_MEM);
+            int vd = ex->op_reg[0];
+            int vs = ext_vec_src128(in, 1, V_MEM);
             VEORQ(V_S0, V_S0, V_S0);
             VZIP2Q_64(V_S1, V_S0, vs);
             SHA256SU1(vd, V_S0, V_S1);
             return;
         }
         case ZYDIS_MNEMONIC_SHA256RNDS2: {
-            int vd = zydis_vec_idx(ops[0].reg.value, NULL);
-            int vs = ext_vec_src128(in, &ops[1], V_MEM);
+            int vd = ex->op_reg[0];
+            int vs = ext_vec_src128(in, 1, V_MEM);
             VREV64Q_32(V_S0, vs);
             VREV64Q_32(V_S1, vd);
             VZIP2Q_64(V_S2, V_S0, V_S1);
@@ -2356,7 +3263,7 @@ void emit_ext(const Insn *in, int live) {
         // ---- Stage 5: Special / Cross-lane / Scalar VEX AVX & AVX2 ----
         case ZYDIS_MNEMONIC_VZEROUPPER:
         case ZYDIS_MNEMONIC_VZEROALL: {
-            bool all = zi.mnemonic == ZYDIS_MNEMONIC_VZEROALL;
+            bool all = mnem == ZYDIS_MNEMONIC_VZEROALL;
             if (all) {
                 for (int r = 0; r < 16; r++)
                     VEORQ(r, r, r);
@@ -2394,11 +3301,11 @@ void emit_ext(const Insn *in, int live) {
         case ZYDIS_MNEMONIC_VMOVNTDQ: case ZYDIS_MNEMONIC_VMOVNTDQA:
         case ZYDIS_MNEMONIC_VMOVNTPS: case ZYDIS_MNEMONIC_VMOVNTPD:
         case ZYDIS_MNEMONIC_VLDDQU: {
-            if (ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER) {
-                u8 vbytes = 16;
-                int d = zydis_vec_idx(ops[0].reg.value, &vbytes);
-                if (ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER) {
-                    int s = zydis_vec_idx(ops[1].reg.value, NULL);
+            if (ex->op_type[0] == EXT_OP_VEC) {
+                u8 vbytes = ex->op_bytes[0];
+                int d = ex->op_reg[0];
+                if (ex->op_type[1] == EXT_OP_VEC) {
+                    int s = ex->op_reg[1];
                     vmov128(d, s);
                     if (vbytes == 32) {
                         if (tr_opt_ymm_cache && (ymm_zero_mask & (1u << s))) {
@@ -2443,8 +3350,8 @@ void emit_ext(const Insn *in, int live) {
                     ymm_zero_hi(d);
                 }
             } else {
-                u8 vbytes = 16;
-                int s = zydis_vec_idx(ops[1].reg.value, &vbytes);
+                u8 vbytes = ex->op_bytes[1];
+                int s = ex->op_reg[1];
                 if (vbytes == 32) {
                     if (tr_opt_ymm_cache) {
                         u8 pin = 0;
@@ -2468,22 +3375,22 @@ void emit_ext(const Insn *in, int live) {
 
         case ZYDIS_MNEMONIC_VMOVSS:
         case ZYDIS_MNEMONIC_VMOVSD: {
-            bool isd = zi.mnemonic == ZYDIS_MNEMONIC_VMOVSD;
+            enum { T0 = 27 };
+            bool isd = mnem == ZYDIS_MNEMONIC_VMOVSD;
             int kind = isd ? 3 : 2, bytes = isd ? 8 : 4;
-            if (zi.operand_count_visible == 3) {
-                int d = zydis_vec_idx(ops[0].reg.value, NULL);
-                int n = zydis_vec_idx(ops[1].reg.value, NULL);
-                int s = zydis_vec_idx(ops[2].reg.value, NULL);
-                vmov128(V_S0, n);
-                ins_elem(V_S0, 0, s, 0, bytes);
-                vmov128(d, V_S0);
+            if (op_cnt == 3) {
+                int d = ex->op_reg[0], n = ex->op_reg[1], s = ex->op_reg[2];
+                int dst = (d == s && d != n) ? T0 : d;
+                vmov128(dst, n);
+                ins_elem(dst, 0, s, 0, bytes);
+                vmov128(d, dst);
                 ymm_zero_hi(d);
-            } else if (ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER) {
-                int d = zydis_vec_idx(ops[0].reg.value, NULL);
+            } else if (ex->op_type[0] == EXT_OP_VEC) {
+                int d = ex->op_reg[0];
                 ext_vldst(kind, true, d, addr_prepare(in, bytes));
                 ymm_zero_hi(d);
             } else {
-                int s = zydis_vec_idx(ops[1].reg.value, NULL);
+                int s = ex->op_reg[1];
                 ext_vldst(kind, false, s, addr_prepare(in, bytes));
             }
             return;
@@ -2491,30 +3398,23 @@ void emit_ext(const Insn *in, int live) {
 
         case ZYDIS_MNEMONIC_VMOVD:
         case ZYDIS_MNEMONIC_VMOVQ: {
-            if (ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER && zydis_vec_idx(ops[0].reg.value, NULL) >= 0) {
-                int d = zydis_vec_idx(ops[0].reg.value, NULL);
-                if (ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER) {
-                    int vs = zydis_vec_idx(ops[1].reg.value, NULL);
-                    if (vs >= 0) {
-                        RR(0x1E604000u, d, vs); // fmov d, ds (clears upper 64 bits)
-                    } else {
-                        u8 gsz = 4;
-                        int gr = zydis_gpr_idx(ops[1].reg.value, &gsz, NULL);
-                        RR(gsz == 8 ? 0x9E670000u : 0x1E270000u, d, gr);
-                    }
+            if (ex->op_type[0] == EXT_OP_VEC) {
+                int d = ex->op_reg[0];
+                if (ex->op_type[1] == EXT_OP_VEC) {
+                    RR(0x1E604000u, d, ex->op_reg[1]); // fmov d, ds (clears upper 64 bits)
+                } else if (ex->op_type[1] == EXT_OP_GPR) {
+                    RR(ex->op_bytes[1] == 8 ? 0x9E670000u : 0x1E270000u, d, ex->op_reg[1]);
                 } else {
-                    bool is64 = zi.mnemonic == ZYDIS_MNEMONIC_VMOVQ;
+                    bool is64 = mnem == ZYDIS_MNEMONIC_VMOVQ;
                     ext_vldst(is64 ? 3 : 2, true, d, addr_prepare(in, is64 ? 8 : 4));
                 }
                 ymm_zero_hi(d);
             } else {
-                int s = zydis_vec_idx(ops[1].reg.value, NULL);
-                if (ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER) {
-                    u8 gsz = 4;
-                    int gd = zydis_gpr_idx(ops[0].reg.value, &gsz, NULL);
-                    RR(gsz == 8 ? 0x9E660000u : 0x1E260000u, gd, s);
+                int s = ex->op_reg[1];
+                if (ex->op_type[0] == EXT_OP_GPR) {
+                    RR(ex->op_bytes[0] == 8 ? 0x9E660000u : 0x1E260000u, ex->op_reg[0], s);
                 } else {
-                    bool is64 = zi.mnemonic == ZYDIS_MNEMONIC_VMOVQ;
+                    bool is64 = mnem == ZYDIS_MNEMONIC_VMOVQ;
                     ext_vldst(is64 ? 3 : 2, false, s, addr_prepare(in, is64 ? 8 : 4));
                 }
             }
@@ -2525,21 +3425,20 @@ void emit_ext(const Insn *in, int live) {
         case ZYDIS_MNEMONIC_VMOVLPD:
         case ZYDIS_MNEMONIC_VMOVHPS:
         case ZYDIS_MNEMONIC_VMOVHPD: {
-            bool hi = zi.mnemonic == ZYDIS_MNEMONIC_VMOVHPS || zi.mnemonic == ZYDIS_MNEMONIC_VMOVHPD;
-            if (zi.operand_count_visible == 3) {
-                int d = zydis_vec_idx(ops[0].reg.value, NULL);
-                int n = zydis_vec_idx(ops[1].reg.value, NULL);
+            enum { T0 = 27 };
+            bool hi = mnem == ZYDIS_MNEMONIC_VMOVHPS || mnem == ZYDIS_MNEMONIC_VMOVHPD;
+            if (op_cnt == 3) {
+                int d = ex->op_reg[0], n = ex->op_reg[1];
                 ext_vldst(3, true, V_MEM, addr_prepare(in, 8));
-                vmov128(V_S0, n);
-                ins_elem(V_S0, hi ? 1 : 0, V_MEM, 0, 8);
-                vmov128(d, V_S0);
+                vmov128(d, n);
+                ins_elem(d, hi ? 1 : 0, V_MEM, 0, 8);
                 ymm_zero_hi(d);
             } else {
-                int s = zydis_vec_idx(ops[1].reg.value, NULL);
+                int s = ex->op_reg[1];
                 Addr a = addr_prepare(in, 8);
                 if (hi) {
-                    ins_elem(V_S0, 0, s, 1, 8);
-                    ext_vldst(3, false, V_S0, a);
+                    ins_elem(T0, 0, s, 1, 8);
+                    ext_vldst(3, false, T0, a);
                 } else {
                     ext_vldst(3, false, s, a);
                 }
@@ -2548,22 +3447,22 @@ void emit_ext(const Insn *in, int live) {
         }
         case ZYDIS_MNEMONIC_VMOVLHPS:
         case ZYDIS_MNEMONIC_VMOVHLPS: {
-            bool lh = zi.mnemonic == ZYDIS_MNEMONIC_VMOVLHPS;
-            int d = zydis_vec_idx(ops[0].reg.value, NULL);
-            int n = zydis_vec_idx(ops[1].reg.value, NULL);
-            int s = zydis_vec_idx(ops[2].reg.value, NULL);
-            vmov128(V_S0, n);
-            ins_elem(V_S0, lh ? 1 : 0, s, lh ? 0 : 1, 8);
-            vmov128(d, V_S0);
+            enum { T0 = 27 };
+            bool lh = mnem == ZYDIS_MNEMONIC_VMOVLHPS;
+            int d = ex->op_reg[0], n = ex->op_reg[1], s = ex->op_reg[2];
+            int dst = (d == s && d != n) ? T0 : d;
+            vmov128(dst, n);
+            ins_elem(dst, lh ? 1 : 0, s, lh ? 0 : 1, 8);
+            vmov128(d, dst);
             ymm_zero_hi(d);
             return;
         }
 
         case ZYDIS_MNEMONIC_VCVTPH2PS: {
-            u8 vbytes = 16;
-            int d = zydis_vec_idx(ops[0].reg.value, &vbytes);
-            int s = ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER
-                        ? zydis_vec_idx(ops[1].reg.value, NULL)
+            u8 vbytes = ex->op_bytes[0];
+            int d = ex->op_reg[0];
+            int s = ex->op_type[1] == EXT_OP_VEC
+                        ? ex->op_reg[1]
                         : (ext_vldst(vbytes == 32 ? 4 : 3, true, V_MEM, addr_prepare(in, vbytes == 32 ? 16 : 8)), V_MEM);
             int src = s;
             if (d == s) {
@@ -2580,9 +3479,9 @@ void emit_ext(const Insn *in, int live) {
             return;
         }
         case ZYDIS_MNEMONIC_VCVTPS2PH: {
-            u8 vbytes = 16;
-            int s = zydis_vec_idx(ops[1].reg.value, &vbytes);
-            int imm = (int)ops[2].imm.value.u;
+            u8 vbytes = ex->op_bytes[1];
+            int s = ex->op_reg[1];
+            int imm = (int)in->imm;
             bool mxcsr = (imm & 4) != 0;
             if (!mxcsr) {
                 int arm = (int[]){0, 2, 1, 3}[imm & 3];
@@ -2605,8 +3504,8 @@ void emit_ext(const Insn *in, int live) {
             }
             if (!mxcsr)
                 E(0xD51B4400u | S4);
-            if (ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER) {
-                int d = zydis_vec_idx(ops[0].reg.value, NULL);
+            if (ex->op_type[0] == EXT_OP_VEC) {
+                int d = ex->op_reg[0];
                 vmov128(d, packed);
                 ymm_zero_hi(d);
             } else {
@@ -2618,25 +3517,23 @@ void emit_ext(const Insn *in, int live) {
         // Approximate reciprocal / reciprocal-sqrt. Not bit-exact; one Newton step.
         case ZYDIS_MNEMONIC_VRSQRTSS:
         case ZYDIS_MNEMONIC_VRCPSS: {
-            // One Newton step, the same estimate the packed forms already use.
-            int d = zydis_vec_idx(ops[0].reg.value, NULL);
-            int n = zydis_vec_idx(ops[1].reg.value, NULL);
-            int s = ops[2].type == ZYDIS_OPERAND_TYPE_REGISTER
-                        ? zydis_vec_idx(ops[2].reg.value, NULL)
+            enum { T0 = 27, T1 = 28 };
+            int d = ex->op_reg[0], n = ex->op_reg[1];
+            int s = ex->op_type[2] == EXT_OP_VEC
+                        ? ex->op_reg[2]
                         : (ext_vldst(2, true, V_MEM, addr_prepare(in, 4)), V_MEM);
-            if (zi.mnemonic == ZYDIS_MNEMONIC_VRSQRTSS) {
-                RR(0x7EA1D800u, V_S0, s);           // frsqrte
-                RRR(0x1E200800u, V_S2, V_S0, V_S0); // y*y
-                RRR(0x5EA0FC00u, V_S2, s, V_S2);    // frsqrts
-                RRR(0x1E200800u, V_S0, V_S0, V_S2);
+            if (mnem == ZYDIS_MNEMONIC_VRSQRTSS) {
+                RR(0x7EA1D800u, T0, s);          // frsqrte
+                RRR(0x1E200800u, T1, T0, T0);    // y*y
+                RRR(0x5EA0FC00u, T1, s, T1);     // frsqrts
+                RRR(0x1E200800u, T0, T0, T1);
             } else {
-                RR(0x5EA1D800u, V_S0, s);           // frecpe
-                RRR(0x5E20FC00u, V_S2, s, V_S0);    // frecps
-                RRR(0x1E200800u, V_S0, V_S0, V_S2);
+                RR(0x5EA1D800u, T0, s);          // frecpe
+                RRR(0x5E20FC00u, T1, s, T0);     // frecps
+                RRR(0x1E200800u, T0, T0, T1);
             }
-            vmov128(V_S1, n);
-            ins_elem(V_S1, 0, V_S0, 0, 4);
-            vmov128(d, V_S1);
+            vmov128(d, n);
+            ins_elem(d, 0, T0, 0, 4);
             ymm_zero_hi(d);
             return;
         }
@@ -2647,29 +3544,32 @@ void emit_ext(const Insn *in, int live) {
         case ZYDIS_MNEMONIC_VMINSS:  case ZYDIS_MNEMONIC_VMINSD:
         case ZYDIS_MNEMONIC_VMAXSS:  case ZYDIS_MNEMONIC_VMAXSD:
         case ZYDIS_MNEMONIC_VSQRTSS: case ZYDIS_MNEMONIC_VSQRTSD: {
-            bool isd = zi.mnemonic == ZYDIS_MNEMONIC_VADDSD || zi.mnemonic == ZYDIS_MNEMONIC_VSUBSD ||
-                       zi.mnemonic == ZYDIS_MNEMONIC_VMULSD || zi.mnemonic == ZYDIS_MNEMONIC_VDIVSD ||
-                       zi.mnemonic == ZYDIS_MNEMONIC_VMINSD || zi.mnemonic == ZYDIS_MNEMONIC_VMAXSD ||
-                       zi.mnemonic == ZYDIS_MNEMONIC_VSQRTSD;
-            int d = zydis_vec_idx(ops[0].reg.value, NULL);
-            int n = zydis_vec_idx(ops[1].reg.value, NULL);
-            int s = ops[2].type == ZYDIS_OPERAND_TYPE_REGISTER
-                        ? zydis_vec_idx(ops[2].reg.value, NULL)
+            enum { T0 = 27 };
+            bool isd = mnem == ZYDIS_MNEMONIC_VADDSD || mnem == ZYDIS_MNEMONIC_VSUBSD ||
+                       mnem == ZYDIS_MNEMONIC_VMULSD || mnem == ZYDIS_MNEMONIC_VDIVSD ||
+                       mnem == ZYDIS_MNEMONIC_VMINSD || mnem == ZYDIS_MNEMONIC_VMAXSD ||
+                       mnem == ZYDIS_MNEMONIC_VSQRTSD;
+            int d = ex->op_reg[0], n = ex->op_reg[1];
+            int s = ex->op_type[2] == EXT_OP_VEC
+                        ? ex->op_reg[2]
                         : (ext_vldst(isd ? 3 : 2, true, V_MEM, addr_prepare(in, isd ? 8 : 4)), V_MEM);
             u32 fsz = isd ? 1u << 22 : 0;
-            if (zi.mnemonic == ZYDIS_MNEMONIC_VSQRTSS || zi.mnemonic == ZYDIS_MNEMONIC_VSQRTSD) {
-                RR(0x1E21C000u | fsz, V_S0, s);
+            bool direct_d = (d == n) && tr_fpcr_merges_scalar;
+            int res_v = direct_d ? d : T0;
+            if (mnem == ZYDIS_MNEMONIC_VSQRTSS || mnem == ZYDIS_MNEMONIC_VSQRTSD) {
+                RR(0x1E21C000u | fsz, res_v, s);
             } else {
-                u32 base = (zi.mnemonic == ZYDIS_MNEMONIC_VADDSS || zi.mnemonic == ZYDIS_MNEMONIC_VADDSD) ? 0x1E202800u :
-                           (zi.mnemonic == ZYDIS_MNEMONIC_VSUBSS || zi.mnemonic == ZYDIS_MNEMONIC_VSUBSD) ? 0x1E203800u :
-                           (zi.mnemonic == ZYDIS_MNEMONIC_VMULSS || zi.mnemonic == ZYDIS_MNEMONIC_VMULSD) ? 0x1E200800u :
-                           (zi.mnemonic == ZYDIS_MNEMONIC_VDIVSS || zi.mnemonic == ZYDIS_MNEMONIC_VDIVSD) ? 0x1E201800u :
-                           (zi.mnemonic == ZYDIS_MNEMONIC_VMINSS || zi.mnemonic == ZYDIS_MNEMONIC_VMINSD) ? 0x1E205800u : 0x1E204800u;
-                RRR(base | fsz, V_S0, n, s);
+                u32 base = (mnem == ZYDIS_MNEMONIC_VADDSS || mnem == ZYDIS_MNEMONIC_VADDSD) ? 0x1E202800u :
+                           (mnem == ZYDIS_MNEMONIC_VSUBSS || mnem == ZYDIS_MNEMONIC_VSUBSD) ? 0x1E203800u :
+                           (mnem == ZYDIS_MNEMONIC_VMULSS || mnem == ZYDIS_MNEMONIC_VMULSD) ? 0x1E200800u :
+                           (mnem == ZYDIS_MNEMONIC_VDIVSS || mnem == ZYDIS_MNEMONIC_VDIVSD) ? 0x1E201800u :
+                           (mnem == ZYDIS_MNEMONIC_VMINSS || mnem == ZYDIS_MNEMONIC_VMINSD) ? 0x1E205800u : 0x1E204800u;
+                RRR(base | fsz, res_v, n, s);
             }
-            vmov128(V_S1, n);
-            ins_elem(V_S1, 0, V_S0, 0, isd ? 8 : 4);
-            vmov128(d, V_S1);
+            if (!direct_d) {
+                vmov128(d, n);
+                ins_elem(d, 0, T0, 0, isd ? 8 : 4);
+            }
             ymm_zero_hi(d);
             return;
         }
@@ -2677,15 +3577,17 @@ void emit_ext(const Insn *in, int live) {
         // Scalar FP conversions & comparisons
         case ZYDIS_MNEMONIC_VCVTSI2SS:
         case ZYDIS_MNEMONIC_VCVTSI2SD: {
-            bool isd = zi.mnemonic == ZYDIS_MNEMONIC_VCVTSI2SD;
-            int d = zydis_vec_idx(ops[0].reg.value, NULL);
-            int n = zydis_vec_idx(ops[1].reg.value, NULL);
-            int sz = ops[2].size == 64 ? 8 : 4;
-            int sr = ext_gpr_src(in, &ops[2], sz, S0);
-            RR((sz == 8 ? 0x9E220000u : 0x1E220000u) | (isd ? 1u << 22 : 0), V_S0, sr);
-            vmov128(V_S1, n);
-            ins_elem(V_S1, 0, V_S0, 0, isd ? 8 : 4);
-            vmov128(d, V_S1);
+            enum { T0 = 27 };
+            bool isd = mnem == ZYDIS_MNEMONIC_VCVTSI2SD;
+            int d = ex->op_reg[0], n = ex->op_reg[1];
+            int sz = ex->op_bytes[2] == 8 ? 8 : 4;
+            int sr = ext_gpr_src(in, 2, sz, S0);
+            bool direct_d = (d == n) && tr_fpcr_merges_scalar;
+            RR((sz == 8 ? 0x9E220000u : 0x1E220000u) | (isd ? 1u << 22 : 0), direct_d ? d : T0, sr);
+            if (!direct_d) {
+                vmov128(d, n);
+                ins_elem(d, 0, T0, 0, isd ? 8 : 4);
+            }
             ymm_zero_hi(d);
             return;
         }
@@ -2693,44 +3595,47 @@ void emit_ext(const Insn *in, int live) {
         case ZYDIS_MNEMONIC_VCVTTSS2SI:
         case ZYDIS_MNEMONIC_VCVTSD2SI:
         case ZYDIS_MNEMONIC_VCVTTSD2SI: {
-            bool isd = zi.mnemonic == ZYDIS_MNEMONIC_VCVTSD2SI || zi.mnemonic == ZYDIS_MNEMONIC_VCVTTSD2SI;
-            bool trunc = zi.mnemonic == ZYDIS_MNEMONIC_VCVTTSS2SI || zi.mnemonic == ZYDIS_MNEMONIC_VCVTTSD2SI;
-            u8 gsz = 4;
-            int gd = zydis_gpr_idx(ops[0].reg.value, &gsz, NULL);
-            int s = ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER
-                        ? zydis_vec_idx(ops[1].reg.value, NULL)
+            enum { T0 = 27 };
+            bool isd = mnem == ZYDIS_MNEMONIC_VCVTSD2SI || mnem == ZYDIS_MNEMONIC_VCVTTSD2SI;
+            bool trunc = mnem == ZYDIS_MNEMONIC_VCVTTSS2SI || mnem == ZYDIS_MNEMONIC_VCVTTSD2SI;
+            u8 gsz = ex->op_bytes[0];
+            int gd = ex->op_reg[0];
+            int s = ex->op_type[1] == EXT_OP_VEC
+                        ? ex->op_reg[1]
                         : (ext_vldst(isd ? 3 : 2, true, V_MEM, addr_prepare(in, isd ? 8 : 4)), V_MEM);
             if (trunc) {
                 RR((gsz == 8 ? 0x9E380000u : 0x1E380000u) | (isd ? 1u << 22 : 0), gd, s);
             } else {
-                RR(isd ? 0x1E67C000u : 0x1E27C000u, V_S0, s);
-                RR((gsz == 8 ? 0x9E380000u : 0x1E380000u) | (isd ? 1u << 22 : 0), gd, V_S0);
+                RR(isd ? 0x1E67C000u : 0x1E27C000u, T0, s);
+                RR((gsz == 8 ? 0x9E380000u : 0x1E380000u) | (isd ? 1u << 22 : 0), gd, T0);
             }
             return;
         }
         case ZYDIS_MNEMONIC_VCVTSS2SD:
         case ZYDIS_MNEMONIC_VCVTSD2SS: {
-            bool to_dbl = zi.mnemonic == ZYDIS_MNEMONIC_VCVTSS2SD;
-            int d = zydis_vec_idx(ops[0].reg.value, NULL);
-            int n = zydis_vec_idx(ops[1].reg.value, NULL);
-            int s = ops[2].type == ZYDIS_OPERAND_TYPE_REGISTER
-                        ? zydis_vec_idx(ops[2].reg.value, NULL)
+            enum { T0 = 27 };
+            bool to_dbl = mnem == ZYDIS_MNEMONIC_VCVTSS2SD;
+            int d = ex->op_reg[0], n = ex->op_reg[1];
+            int s = ex->op_type[2] == EXT_OP_VEC
+                        ? ex->op_reg[2]
                         : (ext_vldst(to_dbl ? 2 : 3, true, V_MEM, addr_prepare(in, to_dbl ? 4 : 8)), V_MEM);
-            RR(to_dbl ? 0x1E22C000u : 0x1E624000u, V_S0, s);
-            vmov128(V_S1, n);
-            ins_elem(V_S1, 0, V_S0, 0, to_dbl ? 8 : 4);
-            vmov128(d, V_S1);
+            bool direct_d = (d == n) && tr_fpcr_merges_scalar;
+            RR(to_dbl ? 0x1E22C000u : 0x1E624000u, direct_d ? d : T0, s);
+            if (!direct_d) {
+                vmov128(d, n);
+                ins_elem(d, 0, T0, 0, to_dbl ? 8 : 4);
+            }
             ymm_zero_hi(d);
             return;
         }
         case ZYDIS_MNEMONIC_VCVTPS2PD:
         case ZYDIS_MNEMONIC_VCVTDQ2PD: {
-            bool is_int = zi.mnemonic == ZYDIS_MNEMONIC_VCVTDQ2PD;
-            u8 vbytes = 16;
-            int d = zydis_vec_idx(ops[0].reg.value, &vbytes);
+            bool is_int = mnem == ZYDIS_MNEMONIC_VCVTDQ2PD;
+            u8 vbytes = ex->op_bytes[0];
+            int d = ex->op_reg[0];
             if (vbytes == 16) {
-                int s = ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER
-                            ? zydis_vec_idx(ops[1].reg.value, NULL)
+                int s = ex->op_type[1] == EXT_OP_VEC
+                            ? ex->op_reg[1]
                             : (ext_vldst(3, true, V_MEM, addr_prepare(in, 8)), V_MEM);
                 if (is_int) {
                     E(0x0F20A400u | (u32)s << 5 | V_S0); // sshll vS0.2d, vS.2s, #0
@@ -2740,8 +3645,8 @@ void emit_ext(const Insn *in, int live) {
                 }
                 ymm_zero_hi(d);
             } else {
-                int s = ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER
-                            ? zydis_vec_idx(ops[1].reg.value, NULL)
+                int s = ex->op_type[1] == EXT_OP_VEC
+                            ? ex->op_reg[1]
                             : (ext_vldst(4, true, V_MEM, addr_prepare(in, 16)), V_MEM);
                 vmov128(V_S0, s);
                 if (is_int) {
@@ -2760,13 +3665,13 @@ void emit_ext(const Insn *in, int live) {
         case ZYDIS_MNEMONIC_VCVTPD2PS:
         case ZYDIS_MNEMONIC_VCVTPD2DQ:
         case ZYDIS_MNEMONIC_VCVTTPD2DQ: {
-            bool is_ps = zi.mnemonic == ZYDIS_MNEMONIC_VCVTPD2PS;
-            bool trunc = zi.mnemonic == ZYDIS_MNEMONIC_VCVTTPD2DQ;
-            int d = zydis_vec_idx(ops[0].reg.value, NULL);
-            u8 sbytes = ops[1].size == 256 ? 32 : 16;
+            bool is_ps = mnem == ZYDIS_MNEMONIC_VCVTPD2PS;
+            bool trunc = mnem == ZYDIS_MNEMONIC_VCVTTPD2DQ;
+            int d = ex->op_reg[0];
+            u8 sbytes = ex->op_bytes[1] == 32 ? 32 : 16;
             if (sbytes == 16) {
-                int s = ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER
-                            ? zydis_vec_idx(ops[1].reg.value, NULL)
+                int s = ex->op_type[1] == EXT_OP_VEC
+                            ? ex->op_reg[1]
                             : (ext_vldst(4, true, V_MEM, addr_prepare(in, 16)), V_MEM);
                 if (is_ps) {
                     RR(0x0E616800u, d, s); // fcvtn vD.2s, vS.2d
@@ -2786,8 +3691,8 @@ void emit_ext(const Insn *in, int live) {
                 }
             } else {
                 int s_lo = V_MEM, s_hi = V_S2;
-                if (ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER) {
-                    int sr = zydis_vec_idx(ops[1].reg.value, NULL);
+                if (ex->op_type[1] == EXT_OP_VEC) {
+                    int sr = ex->op_reg[1];
                     vmov128(V_MEM, sr);
                     ymm_load_hi(V_S2, sr);
                 } else {
@@ -2824,12 +3729,12 @@ void emit_ext(const Insn *in, int live) {
         case ZYDIS_MNEMONIC_VCVTPS2DQ:
         case ZYDIS_MNEMONIC_VCVTTPS2DQ: {
             enum { T0 = 27, T1 = 28 };
-            u8 vbytes = 16;
-            int d = zydis_vec_idx(ops[0].reg.value, &vbytes);
+            u8 vbytes = ex->op_bytes[0];
+            int d = ex->op_reg[0];
             u8 pin = 0;
             int s_lo = V_MEM, s_hi = V_S2;
-            if (ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER) {
-                int sr = zydis_vec_idx(ops[1].reg.value, NULL);
+            if (ex->op_type[1] == EXT_OP_VEC) {
+                int sr = ex->op_reg[1];
                 s_lo = sr;
                 if (vbytes == 32) {
                     int sh = tr_opt_ymm_cache ? ymm_cache_get(sr, true, false, &pin) : ymm_resident(sr);
@@ -2853,17 +3758,17 @@ void emit_ext(const Insn *in, int live) {
             for (int lane = 0; lane < (vbytes == 32 ? 2 : 1); lane++) {
                 int src = lane == 0 ? s_lo : s_hi;
                 int dst = lane == 0 ? d : d_hi;
-                if (zi.mnemonic == ZYDIS_MNEMONIC_VCVTDQ2PS) {
+                if (mnem == ZYDIS_MNEMONIC_VCVTDQ2PS) {
                     RR(0x4E21D800u, dst, src);
                 } else if (!tr_precise_flags) {
-                    if (zi.mnemonic == ZYDIS_MNEMONIC_VCVTTPS2DQ) {
+                    if (mnem == ZYDIS_MNEMONIC_VCVTTPS2DQ) {
                         RR(0x4EA1B800u, dst, src);
                     } else {
                         RR(0x6EA19800u, T0, src);
                         RR(0x4EA1B800u, dst, T0);
                     }
                 } else {
-                    RR(zi.mnemonic == ZYDIS_MNEMONIC_VCVTPS2DQ ? 0x6E21E800u : 0x4E21E800u, T0, src);
+                    RR(mnem == ZYDIS_MNEMONIC_VCVTPS2DQ ? 0x6E21E800u : 0x4E21E800u, T0, src);
                     RR(0x4EA1B800u, dst, T0);
                 }
             }
@@ -2881,11 +3786,11 @@ void emit_ext(const Insn *in, int live) {
         }
         case ZYDIS_MNEMONIC_VUCOMISS: case ZYDIS_MNEMONIC_VUCOMISD:
         case ZYDIS_MNEMONIC_VCOMISS:  case ZYDIS_MNEMONIC_VCOMISD: {
-            bool isd = zi.mnemonic == ZYDIS_MNEMONIC_VUCOMISD || zi.mnemonic == ZYDIS_MNEMONIC_VCOMISD;
-            bool sig = zi.mnemonic == ZYDIS_MNEMONIC_VCOMISS || zi.mnemonic == ZYDIS_MNEMONIC_VCOMISD;
-            int d = zydis_vec_idx(ops[0].reg.value, NULL);
-            int s = ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER
-                        ? zydis_vec_idx(ops[1].reg.value, NULL)
+            bool isd = mnem == ZYDIS_MNEMONIC_VUCOMISD || mnem == ZYDIS_MNEMONIC_VCOMISD;
+            bool sig = mnem == ZYDIS_MNEMONIC_VCOMISS || mnem == ZYDIS_MNEMONIC_VCOMISD;
+            int d = ex->op_reg[0];
+            int s = ex->op_type[1] == EXT_OP_VEC
+                        ? ex->op_reg[1]
                         : (ext_vldst(isd ? 3 : 2, true, V_MEM, addr_prepare(in, isd ? 8 : 4)), V_MEM);
             E((sig ? 0x1E202010u : 0x1E202000u) | (isd ? 1u << 22 : 0) | (u32)s << 16 | (u32)d << 5);
             if (live & F_P)
@@ -2899,7 +3804,7 @@ void emit_ext(const Insn *in, int live) {
         // Broadcasts
         case ZYDIS_MNEMONIC_VBROADCASTF128:
         case ZYDIS_MNEMONIC_VBROADCASTI128: {
-            int d = zydis_vec_idx(ops[0].reg.value, NULL);
+            int d = ex->op_reg[0];
             ext_vldst(4, true, d, addr_prepare(in, 16));
             if (tr_opt_ymm_cache) {
                 u8 pin = 0;
@@ -2918,14 +3823,14 @@ void emit_ext(const Insn *in, int live) {
         case ZYDIS_MNEMONIC_VPBROADCASTW:
         case ZYDIS_MNEMONIC_VPBROADCASTD:
         case ZYDIS_MNEMONIC_VPBROADCASTQ: {
-            u8 vbytes = 16;
-            int d = zydis_vec_idx(ops[0].reg.value, &vbytes);
-            int ebytes = zi.mnemonic == ZYDIS_MNEMONIC_VPBROADCASTB ? 1 :
-                         zi.mnemonic == ZYDIS_MNEMONIC_VPBROADCASTW ? 2 :
-                         (zi.mnemonic == ZYDIS_MNEMONIC_VBROADCASTSD || zi.mnemonic == ZYDIS_MNEMONIC_VPBROADCASTQ) ? 8 : 4;
+            u8 vbytes = ex->op_bytes[0];
+            int d = ex->op_reg[0];
+            int ebytes = mnem == ZYDIS_MNEMONIC_VPBROADCASTB ? 1 :
+                         mnem == ZYDIS_MNEMONIC_VPBROADCASTW ? 2 :
+                         (mnem == ZYDIS_MNEMONIC_VBROADCASTSD || mnem == ZYDIS_MNEMONIC_VPBROADCASTQ) ? 8 : 4;
             int s = V_MEM;
-            if (ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER) {
-                s = zydis_vec_idx(ops[1].reg.value, NULL);
+            if (ex->op_type[1] == EXT_OP_VEC) {
+                s = ex->op_reg[1];
             } else {
                 ext_vldst(log2sz(ebytes), true, V_MEM, addr_prepare(in, ebytes));
             }
@@ -2953,10 +3858,9 @@ void emit_ext(const Insn *in, int live) {
         case ZYDIS_MNEMONIC_VINSERTF128:
         case ZYDIS_MNEMONIC_VINSERTI128: {
             enum { T0 = 27, T1 = 28 };
-            int d = zydis_vec_idx(ops[0].reg.value, NULL);
-            int n = zydis_vec_idx(ops[1].reg.value, NULL);
-            int s = ext_vec_src128(in, &ops[2], V_MEM);
-            int lane = (int)(ops[3].imm.value.u & 1);
+            int d = ex->op_reg[0], n = ex->op_reg[1];
+            int s = ext_vec_src128(in, 2, V_MEM);
+            int lane = (int)((u64)in->imm & 1);
             u8 pin = 0;
             if (lane == 0) {
                 int nh = tr_opt_ymm_cache ? ymm_cache_get(n, true, false, &pin) : ymm_resident(n);
@@ -2987,8 +3891,8 @@ void emit_ext(const Insn *in, int live) {
         case ZYDIS_MNEMONIC_VEXTRACTF128:
         case ZYDIS_MNEMONIC_VEXTRACTI128: {
             enum { T0 = 27 };
-            int s = zydis_vec_idx(ops[1].reg.value, NULL);
-            int lane = (int)(ops[2].imm.value.u & 1);
+            int s = ex->op_reg[1];
+            int lane = (int)((u64)in->imm & 1);
             int src = s;
             if (lane == 1) {
                 u8 pin = 0;
@@ -3000,8 +3904,8 @@ void emit_ext(const Insn *in, int live) {
                     src = T0;
                 }
             }
-            if (ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER) {
-                int d = zydis_vec_idx(ops[0].reg.value, NULL);
+            if (ex->op_type[0] == EXT_OP_VEC) {
+                int d = ex->op_reg[0];
                 vmov128(d, src);
                 ymm_zero_hi(d);
             } else {
@@ -3014,13 +3918,12 @@ void emit_ext(const Insn *in, int live) {
         case ZYDIS_MNEMONIC_VPERM2F128:
         case ZYDIS_MNEMONIC_VPERM2I128: {
             enum { T0 = 27, T1 = 28 };
-            int d = zydis_vec_idx(ops[0].reg.value, NULL);
-            int n = zydis_vec_idx(ops[1].reg.value, NULL);
-            int imm = (int)(ops[3].imm.value.u & 0xff);
+            int d = ex->op_reg[0], n = ex->op_reg[1];
+            int imm = (int)((u64)in->imm & 0xff);
             u8 pin = 0;
             int s_lo = V_MEM, s_hi = V_S2;
-            if (ops[2].type == ZYDIS_OPERAND_TYPE_REGISTER) {
-                int sr = zydis_vec_idx(ops[2].reg.value, NULL);
+            if (ex->op_type[2] == EXT_OP_VEC) {
+                int sr = ex->op_reg[2];
                 s_lo = sr;
                 int sh = tr_opt_ymm_cache ? ymm_cache_get(sr, true, false, &pin) : ymm_resident(sr);
                 if (sh >= 0) s_hi = sh;
@@ -3031,8 +3934,7 @@ void emit_ext(const Insn *in, int live) {
             int nh = tr_opt_ymm_cache ? ymm_cache_get(n, true, false, &pin) : ymm_resident(n);
             int n_hi = nh;
             if (n_hi < 0) {
-                // V_S2 may hold s_hi, so use V_MEM if ops[2] is reg, else reload into T0/T1 carefully
-                if (ops[2].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+                if (ex->op_type[2] == EXT_OP_VEC) {
                     ymm_load_hi(V_MEM, n);
                     n_hi = V_MEM;
                 } else {
@@ -3059,12 +3961,12 @@ void emit_ext(const Insn *in, int live) {
         case ZYDIS_MNEMONIC_VPERMQ:
         case ZYDIS_MNEMONIC_VPERMPD: {
             enum { T0 = 27, T1 = 28 };
-            int d = zydis_vec_idx(ops[0].reg.value, NULL);
-            int imm = (int)(ops[2].imm.value.u & 0xff);
+            int d = ex->op_reg[0];
+            int imm = (int)((u64)in->imm & 0xff);
             u8 pin = 0;
             int s_lo = V_MEM, s_hi = V_S2;
-            if (ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER) {
-                int sr = zydis_vec_idx(ops[1].reg.value, NULL);
+            if (ex->op_type[1] == EXT_OP_VEC) {
+                int sr = ex->op_reg[1];
                 s_lo = sr;
                 int sh = tr_opt_ymm_cache ? ymm_cache_get(sr, true, false, &pin) : ymm_resident(sr);
                 if (sh >= 0) s_hi = sh;
@@ -3094,12 +3996,11 @@ void emit_ext(const Insn *in, int live) {
         }
         case ZYDIS_MNEMONIC_VPERMD:
         case ZYDIS_MNEMONIC_VPERMPS: {
-            // 8x32-bit cross-lane permutation using pure-C VPERMD index construction + 32-byte TBL2 on {V_S0(v24), V_S1(v25)}.
             enum { T0 = 27, T1 = 28, T2 = 29 };
-            int d = zydis_vec_idx(ops[0].reg.value, NULL);
-            int idx_r = zydis_vec_idx(ops[1].reg.value, NULL);
-            if (ops[2].type == ZYDIS_OPERAND_TYPE_REGISTER) {
-                int sr = zydis_vec_idx(ops[2].reg.value, NULL);
+            int d = ex->op_reg[0];
+            int idx_r = ex->op_reg[1];
+            if (ex->op_type[2] == EXT_OP_VEC) {
+                int sr = ex->op_reg[2];
                 vmov128(V_S0, sr);
                 ymm_load_hi(V_S1, sr);
             } else {
@@ -3122,19 +4023,18 @@ void emit_ext(const Insn *in, int live) {
             return;
         }
         case ZYDIS_MNEMONIC_VPBLENDD: {
-            u8 vbytes = 16;
-            int d = zydis_vec_idx(ops[0].reg.value, &vbytes);
-            int n = zydis_vec_idx(ops[1].reg.value, NULL);
-            int imm = (int)(ops[3].imm.value.u & 0xff);
+            u8 vbytes = ex->op_bytes[0];
+            int d = ex->op_reg[0], n = ex->op_reg[1];
+            int imm = (int)((u64)in->imm & 0xff);
             if (vbytes == 16) {
-                int s = ext_vec_src128(in, &ops[2], V_MEM);
+                int s = ext_vec_src128(in, 2, V_MEM);
                 ext_emit_vblend32_128(d, n, s, (u8)(imm & 0xf), 27);
                 ymm_zero_hi(d);
             } else if (tr_opt_ymm_cache) {
                 u8 pin = 0;
                 int s_lo = V_MEM, s_hi = V_S2;
-                if (ops[2].type == ZYDIS_OPERAND_TYPE_REGISTER) {
-                    int sr = zydis_vec_idx(ops[2].reg.value, NULL);
+                if (ex->op_type[2] == EXT_OP_VEC) {
+                    int sr = ex->op_reg[2];
                     s_lo = sr;
                     s_hi = ymm_cache_get(sr, true, false, &pin);
                 } else {
@@ -3148,8 +4048,8 @@ void emit_ext(const Insn *in, int live) {
                     ymm_dirty_run_cnt++;
             } else {
                 int s_lo = V_MEM, s_hi = V_S2;
-                if (ops[2].type == ZYDIS_OPERAND_TYPE_REGISTER) {
-                    int sr = zydis_vec_idx(ops[2].reg.value, NULL);
+                if (ex->op_type[2] == EXT_OP_VEC) {
+                    int sr = ex->op_reg[2];
                     s_lo = sr;
                     int sh = ymm_resident(sr);
                     if (sh >= 0) s_hi = sh;
@@ -3176,15 +4076,14 @@ void emit_ext(const Insn *in, int live) {
         case ZYDIS_MNEMONIC_VPEXTRW:
         case ZYDIS_MNEMONIC_VPEXTRD:
         case ZYDIS_MNEMONIC_VPEXTRQ: {
-            int bytes = zi.mnemonic == ZYDIS_MNEMONIC_VPEXTRB ? 1 :
-                        zi.mnemonic == ZYDIS_MNEMONIC_VPEXTRW ? 2 :
-                        zi.mnemonic == ZYDIS_MNEMONIC_VPEXTRD ? 4 : 8;
-            int s = zydis_vec_idx(ops[1].reg.value, NULL);
-            int lane = (int)(ops[2].imm.value.u & (16 / bytes - 1));
+            int bytes = mnem == ZYDIS_MNEMONIC_VPEXTRB ? 1 :
+                        mnem == ZYDIS_MNEMONIC_VPEXTRW ? 2 :
+                        mnem == ZYDIS_MNEMONIC_VPEXTRD ? 4 : 8;
+            int s = ex->op_reg[1];
+            int lane = (int)((u64)in->imm & (u64)(16 / bytes - 1));
             u32 umov = (bytes == 8 ? 0x4E003C00u : 0x0E003C00u) | (u32)(lane << (log2sz(bytes) + 1) | bytes) << 16 | (u32)s << 5;
-            if (ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER) {
-                int gd = zydis_gpr_idx(ops[0].reg.value, NULL, NULL);
-                E(umov | (u32)gd);
+            if (ex->op_type[0] == EXT_OP_GPR) {
+                E(umov | (u32)ex->op_reg[0]);
             } else {
                 Addr a = addr_prepare(in, bytes);
                 E(umov | S0);
@@ -3196,16 +4095,14 @@ void emit_ext(const Insn *in, int live) {
         case ZYDIS_MNEMONIC_VPINSRW:
         case ZYDIS_MNEMONIC_VPINSRD:
         case ZYDIS_MNEMONIC_VPINSRQ: {
-            int bytes = zi.mnemonic == ZYDIS_MNEMONIC_VPINSRB ? 1 :
-                        zi.mnemonic == ZYDIS_MNEMONIC_VPINSRW ? 2 :
-                        zi.mnemonic == ZYDIS_MNEMONIC_VPINSRD ? 4 : 8;
-            int d = zydis_vec_idx(ops[0].reg.value, NULL);
-            int n = zydis_vec_idx(ops[1].reg.value, NULL);
-            int sr = ext_gpr_src(in, &ops[2], bytes, S0);
-            int lane = (int)(ops[3].imm.value.u & (16 / bytes - 1));
-            vmov128(V_S0, n);
-            E(0x4E001C00u | (u32)(lane << (log2sz(bytes) + 1) | bytes) << 16 | (u32)sr << 5 | V_S0);
-            vmov128(d, V_S0);
+            int bytes = mnem == ZYDIS_MNEMONIC_VPINSRB ? 1 :
+                        mnem == ZYDIS_MNEMONIC_VPINSRW ? 2 :
+                        mnem == ZYDIS_MNEMONIC_VPINSRD ? 4 : 8;
+            int d = ex->op_reg[0], n = ex->op_reg[1];
+            int sr = ext_gpr_src(in, 2, bytes, S0);
+            int lane = (int)((u64)in->imm & (u64)(16 / bytes - 1));
+            vmov128(d, n);
+            E(0x4E001C00u | (u32)(lane << (log2sz(bytes) + 1) | bytes) << 16 | (u32)sr << 5 | (u32)d);
             ymm_zero_hi(d);
             return;
         }
@@ -3216,32 +4113,31 @@ void emit_ext(const Insn *in, int live) {
         case ZYDIS_MNEMONIC_VPMOVZXBW: case ZYDIS_MNEMONIC_VPMOVZXBD: case ZYDIS_MNEMONIC_VPMOVZXBQ:
         case ZYDIS_MNEMONIC_VPMOVZXWD: case ZYDIS_MNEMONIC_VPMOVZXWQ: case ZYDIS_MNEMONIC_VPMOVZXDQ: {
             enum { T0 = 27, T1 = 28 };
-            u8 vbytes = 16;
-            int d = zydis_vec_idx(ops[0].reg.value, &vbytes);
-            bool sx = zi.mnemonic >= ZYDIS_MNEMONIC_VPMOVSXBD && zi.mnemonic <= ZYDIS_MNEMONIC_VPMOVSXWQ;
-            int from = (zi.mnemonic == ZYDIS_MNEMONIC_VPMOVSXBW || zi.mnemonic == ZYDIS_MNEMONIC_VPMOVSXBD ||
-                        zi.mnemonic == ZYDIS_MNEMONIC_VPMOVSXBQ || zi.mnemonic == ZYDIS_MNEMONIC_VPMOVZXBW ||
-                        zi.mnemonic == ZYDIS_MNEMONIC_VPMOVZXBD || zi.mnemonic == ZYDIS_MNEMONIC_VPMOVZXBQ) ? 0 :
-                       (zi.mnemonic == ZYDIS_MNEMONIC_VPMOVSXDQ || zi.mnemonic == ZYDIS_MNEMONIC_VPMOVZXDQ) ? 2 : 1;
-            int to = (zi.mnemonic == ZYDIS_MNEMONIC_VPMOVSXBW || zi.mnemonic == ZYDIS_MNEMONIC_VPMOVZXBW) ? 1 :
-                     (zi.mnemonic == ZYDIS_MNEMONIC_VPMOVSXBD || zi.mnemonic == ZYDIS_MNEMONIC_VPMOVSXWD ||
-                      zi.mnemonic == ZYDIS_MNEMONIC_VPMOVZXBD || zi.mnemonic == ZYDIS_MNEMONIC_VPMOVZXWD) ? 2 : 3;
-            int half_bytes = 16 >> (to - from); // bytes consumed per 128-bit output half (8, 4, or 2)
+            u8 vbytes = ex->op_bytes[0];
+            int d = ex->op_reg[0];
+            bool sx = mnem >= ZYDIS_MNEMONIC_VPMOVSXBD && mnem <= ZYDIS_MNEMONIC_VPMOVSXWQ;
+            int from = (mnem == ZYDIS_MNEMONIC_VPMOVSXBW || mnem == ZYDIS_MNEMONIC_VPMOVSXBD ||
+                        mnem == ZYDIS_MNEMONIC_VPMOVSXBQ || mnem == ZYDIS_MNEMONIC_VPMOVZXBW ||
+                        mnem == ZYDIS_MNEMONIC_VPMOVZXBD || mnem == ZYDIS_MNEMONIC_VPMOVZXBQ) ? 0 :
+                       (mnem == ZYDIS_MNEMONIC_VPMOVSXDQ || mnem == ZYDIS_MNEMONIC_VPMOVZXDQ) ? 2 : 1;
+            int to = (mnem == ZYDIS_MNEMONIC_VPMOVSXBW || mnem == ZYDIS_MNEMONIC_VPMOVZXBW) ? 1 :
+                     (mnem == ZYDIS_MNEMONIC_VPMOVSXBD || mnem == ZYDIS_MNEMONIC_VPMOVSXWD ||
+                      mnem == ZYDIS_MNEMONIC_VPMOVZXBD || mnem == ZYDIS_MNEMONIC_VPMOVZXWD) ? 2 : 3;
+            int half_bytes = 16 >> (to - from);
             int s = V_MEM;
-            if (ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER) {
-                s = zydis_vec_idx(ops[1].reg.value, NULL);
+            if (ex->op_type[1] == EXT_OP_VEC) {
+                s = ex->op_reg[1];
             } else {
                 int load_bytes = vbytes == 32 ? half_bytes * 2 : half_bytes;
                 ext_vldst(log2sz(load_bytes), true, V_MEM, addr_prepare(in, load_bytes));
             }
             u32 base = sx ? 0x0F00A400u : 0x2F00A400u;
             if (vbytes == 32 && to - from == 1) {
-                // Fast 2-instruction UXTL2/SXTL2 + UXTL/SXTL path (high half first so d == s is safe).
                 u8 pin = 0;
                 int dh = tr_opt_ymm_cache ? ymm_cache_get(d, false, true, &pin) : ymm_resident(d);
                 int hi_dst = dh >= 0 ? dh : T1;
-                RR((base | 0x40000000u) | (1u << (19 + from)), hi_dst, s); // sxtl2 / uxtl2
-                RR(base | (1u << (19 + from)), d, s);                      // sxtl / uxtl
+                RR((base | 0x40000000u) | (1u << (19 + from)), hi_dst, s);
+                RR(base | (1u << (19 + from)), d, s);
                 if (dh >= 0) {
                     if (d >= 8) ymm_dirty_run_cnt++;
                     else ymm_zero_mask &= (u16)~(1u << d);
@@ -3273,14 +4169,12 @@ void emit_ext(const Insn *in, int live) {
             return;
         }
 
-        // VPMOVMSKB (YMM cache-aware + fused single-UMOV 256-bit path) / VMOVMSKPS / VMOVMSKPD
+        // VPMOVMSKB / VMOVMSKPS / VMOVMSKPD (zero-constant USHR+USRA+XTN, single FMOV/UMOV, YMM cache-aware)
         case ZYDIS_MNEMONIC_VPMOVMSKB: {
             enum { T0 = 27, T1 = 28 };
-            int gd = zydis_gpr_idx(ops[0].reg.value, NULL, NULL);
-            u8 vbytes = 16;
-            int s = zydis_vec_idx(ops[1].reg.value, &vbytes);
-            movimm(S0, 0x8040201008040201ULL);
-            VDUPQD(V_S2, S0);
+            int gd = ex->op_reg[0];
+            u8 vbytes = ex->op_bytes[1];
+            int s = ex->op_reg[1];
             if (vbytes == 32) {
                 u8 pin = 0;
                 int sh = tr_opt_ymm_cache ? ymm_cache_get(s, true, false, &pin) : ymm_resident(s);
@@ -3288,95 +4182,200 @@ void emit_ext(const Insn *in, int live) {
                     ymm_load_hi(T1, s);
                     sh = T1;
                 }
-                ext_emit_vpmovmskb256(gd, s, sh, V_S2, T0, T1);
+                ext_emit_vpmovmskb256(gd, s, sh, T0, T1);
             } else {
-                ext_emit_pmovmskb128(gd, s, V_S2, T0);
+                ext_emit_pmovmskb128(gd, s, T0);
             }
             return;
         }
         case ZYDIS_MNEMONIC_VMOVMSKPS:
         case ZYDIS_MNEMONIC_VMOVMSKPD: {
-            bool isd = zi.mnemonic == ZYDIS_MNEMONIC_VMOVMSKPD;
-            int gd = zydis_gpr_idx(ops[0].reg.value, NULL, NULL);
-            u8 vbytes = 16;
-            int s = zydis_vec_idx(ops[1].reg.value, &vbytes);
-            // Extract sign bits of 32-bit or 64-bit lanes
-            for (int half = 0; half < (vbytes == 32 ? 2 : 1); half++) {
-                int vsrc = half == 0 ? s : (ymm_load_hi(V_S0, s), V_S0);
-                int dst_r = half == 0 ? gd : S3;
-                umov_d(S0, vsrc, 0);
-                umov_d(S1, vsrc, 1);
+            enum { T0 = 27, T1 = 28 };
+            bool isd = mnem == ZYDIS_MNEMONIC_VMOVMSKPD;
+            int gd = ex->op_reg[0];
+            u8 vbytes = ex->op_bytes[1];
+            int s = ex->op_reg[1];
+            if (vbytes == 16) {
                 if (!isd) {
-                    ubfx(1, S2, S0, 31, 1);
-                    lsr_imm(1, S0, S0, 63);
-                    logic_sh(1, 1, 0, S2, S2, S0, 0, 1);
-                    ubfx(1, S0, S1, 31, 1);
-                    logic_sh(1, 1, 0, S2, S2, S0, 0, 2);
-                    lsr_imm(1, S1, S1, 63);
-                    logic_sh(1, 1, 0, dst_r, S2, S1, 0, 3);
+                    RR(0x6F210400u, T0, s);    // ushr T0.4s, s.4s, #31
+                    RR(0x6F611400u, T0, T0);   // usra T0.2d, T0.2d, #31
+                    RR(0x0EA12800u, T0, T0);   // xtn T0.2s, T0.2d
+                    RR(0x7F621400u, T0, T0);   // usra dT0, dT0, #30
+                    RR(0x1E260000u, gd, T0);   // fmov w_gd, sT0
                 } else {
-                    lsr_imm(1, S0, S0, 63);
-                    lsr_imm(1, S1, S1, 63);
-                    logic_sh(1, 1, 0, dst_r, S0, S1, 0, 1);
+                    RR(0x6F410400u, T0, s);    // ushr T0.2d, s.2d, #63
+                    RR(0x0EA12800u, T0, T0);   // xtn T0.2s, T0.2d
+                    RR(0x7F611400u, T0, T0);   // usra dT0, dT0, #31
+                    RR(0x1E260000u, gd, T0);   // fmov w_gd, sT0
                 }
-                if (half == 1)
-                    bfi(1, gd, S3, isd ? 2 : 4, isd ? 2 : 4);
+                return;
+            }
+            u8 pin = 0;
+            int sh = tr_opt_ymm_cache ? ymm_cache_get(s, true, false, &pin) : ymm_resident(s);
+            if (sh < 0) {
+                ymm_load_hi(T1, s);
+                sh = T1;
+            }
+            if (!isd) {
+                RR(0x6F210400u, T0, s);    // ushr T0.4s, s.4s, #31
+                RR(0x6F210400u, T1, sh);   // ushr T1.4s, sh.4s, #31
+                RR(0x6F611400u, T0, T0);   // usra T0.2d, #31
+                RR(0x6F611400u, T1, T1);   // usra T1.2d, #31
+                RR(0x0EA12800u, T0, T0);   // xtn T0.2s, T0.2d
+                RR(0x4EA12800u, T0, T1);   // xtn2 T0.4s, T1.2d
+                RR(0x6F621400u, T0, T0);   // usra T0.2d, #30
+                RR(0x0EA12800u, T0, T0);   // xtn T0.2s, T0.2d
+                RR(0x7F641400u, T0, T0);   // usra dT0, dT0, #28
+                RR(0x1E260000u, gd, T0);   // fmov w_gd, sT0
+            } else {
+                RR(0x6F410400u, T0, s);    // ushr T0.2d, s.2d, #63
+                RR(0x6F410400u, T1, sh);   // ushr T1.2d, sh.2d, #63
+                RR(0x0EA12800u, T0, T0);   // xtn T0.2s, T0.2d
+                RR(0x4EA12800u, T0, T1);   // xtn2 T0.4s, T1.2d
+                RR(0x6F611400u, T0, T0);   // usra T0.2d, #31
+                RR(0x0EA12800u, T0, T0);   // xtn T0.2s, T0.2d
+                RR(0x7F621400u, T0, T0);   // usra dT0, dT0, #30
+                RR(0x1E260000u, gd, T0);   // fmov w_gd, sT0
             }
             return;
         }
 
-        // VPTEST / VTESTPS / VTESTPD
-        case ZYDIS_MNEMONIC_VPTEST:
+        // VPTEST (YMM cache-aware + UMAXP + d==s & live==F_Z/F_C fast paths) / VTESTPS / VTESTPD
+        case ZYDIS_MNEMONIC_VPTEST: {
+            enum { T0 = 27, T1 = 28 };
+            u8 vbytes = ex->op_bytes[0];
+            int d = ex->op_reg[0];
+            u8 pin = 0;
+            bool same_reg = (ex->op_type[1] == EXT_OP_VEC && ex->op_reg[1] == (u8)d);
+            int s_lo = V_MEM, s_hi = V_S2;
+            if (ex->op_type[1] == EXT_OP_VEC) {
+                int sr = ex->op_reg[1];
+                s_lo = sr;
+                if (vbytes == 32) {
+                    int sh = tr_opt_ymm_cache ? ymm_cache_get(sr, true, false, &pin) : ymm_resident(sr);
+                    if (sh >= 0) s_hi = sh;
+                    else ymm_load_hi(V_S2, sr);
+                }
+            } else if (vbytes == 32) {
+                ext_load256_pair(in, V_MEM, V_S2);
+            } else {
+                s_lo = ext_vec_src128(in, 1, V_MEM);
+            }
+            if (!live)
+                return;
+            int d_hi = -1;
+            if (vbytes == 32) {
+                if (same_reg) {
+                    d_hi = s_hi;
+                } else {
+                    int dh = tr_opt_ymm_cache ? ymm_cache_get(d, true, false, &pin) : ymm_resident(d);
+                    if (dh >= 0) d_hi = dh;
+                    else { ymm_load_hi(T1, d); d_hi = T1; }
+                }
+            }
+            if (live == F_Z) {
+                int av;
+                if (same_reg) {
+                    if (vbytes == 32) { VORRQ(T0, d, d_hi); av = T0; }
+                    else av = d;
+                } else {
+                    VANDQ(T0, d, s_lo);
+                    if (vbytes == 32) {
+                        VANDQ(V_MEM, d_hi, s_hi);
+                        VORRQ(T0, T0, V_MEM);
+                    }
+                    av = T0;
+                }
+                RRR(0x6EA0A400u, T0, av, av); // umaxp .4s
+                RR(0x9E660000u, S0, T0);      // fmov xS0, d27
+                add_imm(1, 1, 1, XZR, S0, 0); // cmp xS0, #0 -> Z=(S0==0)
+                return;
+            }
+            if (live == F_C) {
+                if (same_reg) {
+                    rmif(XZR, 0, 2); // ~d & d == 0 -> CF=1 -> Arm64 C=0
+                    return;
+                }
+                VBICQ(T0, s_lo, d);
+                if (vbytes == 32) {
+                    VBICQ(V_MEM, s_hi, d_hi);
+                    VORRQ(T0, T0, V_MEM);
+                }
+                RRR(0x6EA0A400u, T0, T0, T0);
+                RR(0x9E660000u, S1, T0);
+                add_imm(1, 1, 1, XZR, S1, 1); // cmp xS1, #1 -> C=(S1!=0)=!CF
+                return;
+            }
+            if (same_reg) {
+                int av = d;
+                if (vbytes == 32) { VORRQ(T0, d, d_hi); av = T0; }
+                RRR(0x6EA0A400u, T0, av, av);
+                RR(0x9E660000u, S0, T0);
+                add_imm(1, 1, 1, XZR, S0, 0);
+                cset(S0, 0);
+                lsl_imm(1, S0, S0, 30);
+                msr_nzcv(S0);
+            } else {
+                VANDQ(T0, d, s_lo);
+                if (vbytes == 32) {
+                    VANDQ(V_MEM, d_hi, s_hi);
+                    VORRQ(T0, T0, V_MEM);
+                }
+                VBICQ(V_MEM, s_lo, d);
+                if (vbytes == 32) {
+                    VBICQ(T1, s_hi, d_hi);
+                    VORRQ(V_MEM, V_MEM, T1);
+                }
+                RRR(0x6EA0A400u, T0, T0, V_MEM); // d[0]=any(a), d[1]=any(b)
+                RR(0x9E660000u, S0, T0);
+                umov_d(S1, T0, 1);
+                add_imm(1, 1, 1, XZR, S0, 0);
+                cset(S0, 0);
+                add_imm(1, 1, 1, XZR, S1, 0);
+                cset(S1, 1);
+                lsl_imm(1, S0, S0, 30);
+                logic_sh(1, 1, 0, S0, S0, S1, 0, 29);
+                msr_nzcv(S0);
+            }
+            if (live & (F_P | F_A)) {
+                movimm(R_PF, 1);
+                mov_reg(1, R_AF, R_PF);
+            }
+            return;
+        }
         case ZYDIS_MNEMONIC_VTESTPS:
         case ZYDIS_MNEMONIC_VTESTPD: {
-            u8 vbytes = 16;
-            int d = zydis_vec_idx(ops[0].reg.value, &vbytes);
+            u8 vbytes = ex->op_bytes[0];
+            int d = ex->op_reg[0];
             int s_lo = V_MEM, s_hi = V_S2;
-            if (ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER) {
-                int sr = zydis_vec_idx(ops[1].reg.value, NULL);
+            if (ex->op_type[1] == EXT_OP_VEC) {
+                int sr = ex->op_reg[1];
                 s_lo = sr;
                 if (vbytes == 32)
                     ymm_load_hi(V_S2, sr);
             } else if (vbytes == 32) {
                 ext_load256_pair(in, V_MEM, V_S2);
             } else {
-                s_lo = ext_vec_src128(in, &ops[1], V_MEM);
+                s_lo = ext_vec_src128(in, 1, V_MEM);
             }
-            if (zi.mnemonic == ZYDIS_MNEMONIC_VPTEST) {
-                VANDQ(V_S0, d, s_lo);
-                VBICQ(V_S1, s_lo, d);
-                if (vbytes == 32) {
-                    enum { T0 = 27, T1 = 28 };
-                    ymm_load_hi(T0, d);
-                    VANDQ(T1, T0, s_hi);
-                    VORRQ(V_S0, V_S0, T1);
-                    VBICQ(T1, s_hi, T0);
-                    VORRQ(V_S1, V_S1, T1);
-                }
-            } else {
-                // VTESTPS/PD tests only the sign bit (bit 31 or 63) of each element!
-                u32 cmlt = zi.mnemonic == ZYDIS_MNEMONIC_VTESTPD ? 0x4EE0A800u : 0x4EA0A800u;
-                enum { T0 = 27, T1 = 28, T2 = 29 };
-                RR(cmlt, T0, d);
-                RR(cmlt, T1, s_lo);
-                VANDQ(V_S0, T0, T1);
-                VBICQ(V_S1, T1, T0);
-                if (vbytes == 32) {
-                    ymm_load_hi(T0, d);
-                    RR(cmlt, T0, T0);
-                    RR(cmlt, T1, s_hi);
-                    VANDQ(T2, T0, T1);
-                    VORRQ(V_S0, V_S0, T2);
-                    VBICQ(T2, T1, T0);
-                    VORRQ(V_S1, V_S1, T2);
-                }
+            u32 cmlt = mnem == ZYDIS_MNEMONIC_VTESTPD ? 0x4EE0A800u : 0x4EA0A800u;
+            enum { T0 = 27, T1 = 28, T2 = 29 };
+            RR(cmlt, T0, d);
+            RR(cmlt, T1, s_lo);
+            VANDQ(V_S0, T0, T1);
+            VBICQ(V_S1, T1, T0);
+            if (vbytes == 32) {
+                ymm_load_hi(T0, d);
+                RR(cmlt, T0, T0);
+                RR(cmlt, T1, s_hi);
+                VANDQ(T2, T0, T1);
+                VORRQ(V_S0, V_S0, T2);
+                VBICQ(T2, T1, T0);
+                VORRQ(V_S1, V_S1, T2);
             }
-            umov_d(S0, V_S0, 0);
+            RRR(0x6EA0A400u, V_S0, V_S0, V_S1);
+            RR(0x9E660000u, S0, V_S0);
             umov_d(S1, V_S0, 1);
-            logic_reg(1, 1, 0, S0, S0, S1);
-            umov_d(S1, V_S1, 0);
-            umov_d(S2, V_S1, 1);
-            logic_reg(1, 1, 0, S1, S1, S2);
             add_imm(1, 1, 1, XZR, S0, 0);
             cset(S0, 0);
             add_imm(1, 1, 1, XZR, S1, 0);
@@ -3393,78 +4392,75 @@ void emit_ext(const Insn *in, int live) {
 
         case ZYDIS_MNEMONIC_VROUNDSS:
         case ZYDIS_MNEMONIC_VROUNDSD: {
-            bool dbl = zi.mnemonic == ZYDIS_MNEMONIC_VROUNDSD;
+            enum { T0 = 27 };
+            bool dbl = mnem == ZYDIS_MNEMONIC_VROUNDSD;
             int bytes = dbl ? 8 : 4;
-            int d = zydis_vec_idx(ops[0].reg.value, NULL);
-            int src2 = zydis_vec_idx(ops[1].reg.value, NULL);
-            int imm = (int)ops[3].imm.value.u;
+            int d = ex->op_reg[0], src2 = ex->op_reg[1];
+            int imm = (int)in->imm;
             int scalar = V_MEM;
-            if (ops[2].type == ZYDIS_OPERAND_TYPE_REGISTER)
-                scalar = zydis_vec_idx(ops[2].reg.value, NULL);
+            if (ex->op_type[2] == EXT_OP_VEC)
+                scalar = ex->op_reg[2];
             else
                 ext_vldst(dbl ? 3 : 2, true, V_MEM, addr_prepare(in, bytes));
             static const u32 fixed[4] = {0, 2, 1, 3};
             u32 rmode = (imm & 4) ? ((imm & 8) ? 7 : 6) : fixed[imm & 3];
             bool report = !(imm & 4) && !(imm & 8);
             if (report)
-                E(0x1E244000u | (dbl ? 1u << 22 : 0) | 6u << 15 | (u32)scalar << 5 | V_S0);
-            E(0x1E244000u | (dbl ? 1u << 22 : 0) | rmode << 15 | (u32)scalar << 5 | V_S0);
-            vmov128(V_S1, src2);
-            ins_elem(V_S1, 0, V_S0, 0, bytes);
-            vmov128(d, V_S1);
+                E(0x1E244000u | (dbl ? 1u << 22 : 0) | 6u << 15 | (u32)scalar << 5 | T0);
+            E(0x1E244000u | (dbl ? 1u << 22 : 0) | rmode << 15 | (u32)scalar << 5 | T0);
+            vmov128(d, src2);
+            ins_elem(d, 0, T0, 0, bytes);
             ymm_zero_hi(d);
             return;
         }
 
         case ZYDIS_MNEMONIC_VCMPSS:
         case ZYDIS_MNEMONIC_VCMPSD: {
-            bool dbl = zi.mnemonic == ZYDIS_MNEMONIC_VCMPSD;
+            enum { T0 = 27, T1 = 28 };
+            bool dbl = mnem == ZYDIS_MNEMONIC_VCMPSD;
             int bytes = dbl ? 8 : 4;
-            int d = zydis_vec_idx(ops[0].reg.value, NULL);
-            int src1 = zydis_vec_idx(ops[1].reg.value, NULL);
-            int imm = (int)ops[3].imm.value.u;
+            int d = ex->op_reg[0], src1 = ex->op_reg[1];
+            int imm = (int)in->imm;
             int scalar = V_MEM;
-            if (ops[2].type == ZYDIS_OPERAND_TYPE_REGISTER)
-                scalar = zydis_vec_idx(ops[2].reg.value, NULL);
+            if (ex->op_type[2] == EXT_OP_VEC)
+                scalar = ex->op_reg[2];
             else
                 ext_vldst(dbl ? 3 : 2, true, V_MEM, addr_prepare(in, bytes));
-            emit_vcmp_mask(V_S0, src1, scalar, imm, dbl);
-            vmov128(V_S1, src1);
-            ins_elem(V_S1, 0, V_S0, 0, bytes);
-            vmov128(d, V_S1);
+            emit_vcmp_mask(V_S2, src1, scalar, imm, dbl);
+            vmov128(d, src1);
+            ins_elem(d, 0, V_S2, 0, bytes);
             ymm_zero_hi(d);
             return;
         }
 
         case ZYDIS_MNEMONIC_VINSERTPS: {
-            int d = zydis_vec_idx(ops[0].reg.value, NULL);
-            int src2 = zydis_vec_idx(ops[1].reg.value, NULL);
-            int imm = (int)ops[3].imm.value.u;
+            enum { T0 = 27 };
+            int d = ex->op_reg[0], src2 = ex->op_reg[1];
+            int imm = (int)in->imm;
             int lane = 0;
-            if (ops[2].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+            int src3 = V_MEM;
+            if (ex->op_type[2] == EXT_OP_VEC) {
                 lane = (imm >> 6) & 3;
-                vmov128(V_MEM, zydis_vec_idx(ops[2].reg.value, NULL));
+                src3 = ex->op_reg[2];
             } else {
                 ext_vldst(2, true, V_MEM, addr_prepare(in, 4));
             }
-            vmov128(V_S0, src2);
-            ins_elem(V_S0, (imm >> 4) & 3, V_MEM, lane, 4);
+            int dst = (d == src3 && d != src2) ? T0 : d;
+            vmov128(dst, src2);
+            ins_elem(dst, (imm >> 4) & 3, src3, lane, 4);
             for (int i = 0; i < 4; i++)
                 if ((imm >> i) & 1)
-                    ins_gpr(V_S0, i, XZR, 4);
-            vmov128(d, V_S0);
+                    ins_gpr(dst, i, XZR, 4);
+            vmov128(d, dst);
             ymm_zero_hi(d);
             return;
         }
 
         case ZYDIS_MNEMONIC_VEXTRACTPS: {
-            int src = zydis_vec_idx(ops[1].reg.value, NULL);
-            int lane = (int)ops[2].imm.value.u & 3;
-            if (ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER) {
-                u8 gsz = 4;
-                int gd = zydis_gpr_idx(ops[0].reg.value, &gsz, NULL);
-                umov_w(S0, src, lane, 4);
-                mov_reg(0, gd, S0);
+            int src = ex->op_reg[1];
+            int lane = (int)((u64)in->imm & 3);
+            if (ex->op_type[0] == EXT_OP_GPR) {
+                umov_w(ex->op_reg[0], src, lane, 4);
             } else {
                 Addr a = addr_prepare(in, 4);
                 umov_w(S0, src, lane, 4);
@@ -3485,8 +4481,8 @@ void emit_ext(const Insn *in, int live) {
         }
 
         case ZYDIS_MNEMONIC_VPHMINPOSUW: {
-            int d = zydis_vec_idx(ops[0].reg.value, NULL);
-            int src = ext_vec_src128(in, &ops[1], V_MEM);
+            int d = ex->op_reg[0];
+            int src = ext_vec_src128(in, 1, V_MEM);
             mrs_nzcv(S4);
             RR(0x6E71A800u, V_S0, src); // uminv h0, v.8h: lowest unsigned word
             umov_w(S0, V_S0, 0, 2);
@@ -3521,24 +4517,21 @@ void emit_ext(const Insn *in, int live) {
         case ZYDIS_MNEMONIC_VPGATHERDQ:
         case ZYDIS_MNEMONIC_VPGATHERQD:
         case ZYDIS_MNEMONIC_VPGATHERQQ: {
-            // Masked-off destination lanes stay as they were. The mask register,
-            // including its YMM high half, is cleared after every lane is done,
-            // so a faulting element load retries with the original mask.
-            ZydisMnemonic gm = zi.mnemonic;
+            ZydisMnemonic gm = mnem;
             bool qindex = gm == ZYDIS_MNEMONIC_VGATHERQPS || gm == ZYDIS_MNEMONIC_VGATHERQPD ||
                           gm == ZYDIS_MNEMONIC_VPGATHERQD || gm == ZYDIS_MNEMONIC_VPGATHERQQ;
             bool qdata = gm == ZYDIS_MNEMONIC_VGATHERDPD || gm == ZYDIS_MNEMONIC_VGATHERQPD ||
                          gm == ZYDIS_MNEMONIC_VPGATHERDQ || gm == ZYDIS_MNEMONIC_VPGATHERQQ;
             int idx_sz = qindex ? 8 : 4;
             int data_sz = qdata ? 8 : 4;
-            u8 db = 16;
-            int dest = zydis_vec_idx(ops[0].reg.value, &db);
-            int mask = zydis_vec_idx(ops[2].reg.value, NULL);
+            u8 db = ex->op_bytes[0];
+            int dest = ex->op_reg[0];
+            int mask = ex->op_reg[2];
             int idx = in->index;
             int nlanes = (int)db / data_sz;
             int index_bytes = nlanes * idx_sz;
             int sign = data_sz * 8 - 1;
-            if (!in->vsib || dest < 0 || mask < 0) {
+            if (!in->vsib) {
                 emit_stop(in->rip, "ext: gather operand");
                 return;
             }
@@ -3597,16 +4590,14 @@ void emit_ext(const Insn *in, int live) {
         case ZYDIS_MNEMONIC_VPMASKMOVQ:
         case ZYDIS_MNEMONIC_VMASKMOVPS:
         case ZYDIS_MNEMONIC_VMASKMOVPD: {
-            bool qword = zi.mnemonic == ZYDIS_MNEMONIC_VPMASKMOVQ ||
-                         zi.mnemonic == ZYDIS_MNEMONIC_VMASKMOVPD;
+            bool qword = mnem == ZYDIS_MNEMONIC_VPMASKMOVQ || mnem == ZYDIS_MNEMONIC_VMASKMOVPD;
             int esize = qword ? 8 : 4;
             int per = 16 / esize;
             int sign = esize * 8 - 1;
-            bool load = ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER;
-            u8 vbytes = 16;
-            int mask = zydis_vec_idx(ops[1].reg.value, NULL);
-            int data = load ? zydis_vec_idx(ops[0].reg.value, &vbytes)
-                            : zydis_vec_idx(ops[2].reg.value, &vbytes);
+            bool load = ex->op_type[0] == EXT_OP_VEC;
+            u8 vbytes = load ? ex->op_bytes[0] : ex->op_bytes[2];
+            int mask = ex->op_reg[1];
+            int data = load ? ex->op_reg[0] : ex->op_reg[2];
             int nlanes = (int)vbytes / esize;
             int base = addr_reg(in);
             if (base != S3)
@@ -3623,13 +4614,11 @@ void emit_ext(const Insn *in, int live) {
                 }
             }
 
-            // Expand sign bit across each lane using CMLT #0 (does not touch NZCV).
             u32 cmlt = qword ? 0x4EE0A800u : 0x4EA0A800u;
             RR(cmlt, 28, mask);
             if (vbytes == 32)
                 RR(cmlt, 29, m_hi);
 
-            // Fast path 1: all mask sign bits are 0 -> skip memory access cleanly.
             u16 saved_zmask = ymm_zero_mask;
             int any_vec = 28;
             if (vbytes == 32) {
@@ -3640,7 +4629,7 @@ void emit_ext(const Insn *in, int live) {
             umov_d(S1, any_vec, 1);
             logic_reg(1, 1, 0, S0, S0, S1);
             u32 *not_all_zero = tr_cc;
-            cbz(1, 1, S0, 0); // cbnz xS0, not_all_zero
+            cbz(1, 1, S0, 0);
             if (load) {
                 VEORQ(data, data, data);
                 ymm_zero_hi(data);
@@ -3651,7 +4640,6 @@ void emit_ext(const Insn *in, int live) {
             *not_all_zero |= ((u32)(tr_cc - not_all_zero) & 0x7ffffu) << 5;
             ymm_zero_mask = saved_zmask;
 
-            // Fast path 2: all mask sign bits are 1 -> full vector load/store (LDP/STP for 256-bit).
             int all_vec = 28;
             if (vbytes == 32) {
                 VANDQ(V_MEM, 28, 29);
@@ -3660,9 +4648,9 @@ void emit_ext(const Insn *in, int live) {
             umov_d(S0, all_vec, 0);
             umov_d(S1, all_vec, 1);
             logic_reg(1, 0, 0, S0, S0, S1);
-            E(0xAA2003E0u | (u32)S0 << 16 | (u32)S0); // mvn xS0, xS0
+            E(0xAA2003E0u | (u32)S0 << 16 | (u32)S0);
             u32 *to_partial = tr_cc;
-            cbz(1, 1, S0, 0); // cbnz xS0, partial
+            cbz(1, 1, S0, 0);
             if (load) {
                 if (vbytes == 32) {
                     int dh = ymm_resident(data);
@@ -3692,7 +4680,6 @@ void emit_ext(const Insn *in, int live) {
             u32 *done_ones = tr_cc;
             b_rel(0);
 
-            // Partial mask fallback: exact per-lane fault semantics.
             *to_partial |= ((u32)(tr_cc - to_partial) & 0x7ffffu) << 5;
             ymm_zero_mask = saved_zmask;
             int d_hi = V_S1;
@@ -3751,33 +4738,32 @@ void emit_ext(const Insn *in, int live) {
         }
 
         case ZYDIS_MNEMONIC_VPCMPISTRI: {
-            int d = zydis_vec_idx(ops[0].reg.value, NULL);
-            int s = ext_vec_src128(in, &ops[1], V_MEM);
-            u8 imm = (u8)ops[2].imm.value.u;
+            int d = ex->op_reg[0];
+            int s = ext_vec_src128(in, 1, V_MEM);
+            u8 imm = (u8)in->imm;
             emit_pcmpistri_el0(d, s, imm, live);
             return;
         }
 
         case ZYDIS_MNEMONIC_MPSADBW:
         case ZYDIS_MNEMONIC_VMPSADBW: {
-            bool is_vex = zi.mnemonic == ZYDIS_MNEMONIC_VMPSADBW;
-            u8 vbytes = 16;
-            int d = zydis_vec_idx(ops[0].reg.value, &vbytes);
-            int n = is_vex ? zydis_vec_idx(ops[1].reg.value, NULL) : d;
+            bool is_vex = mnem == ZYDIS_MNEMONIC_VMPSADBW;
+            u8 vbytes = ex->op_bytes[0];
+            int d = ex->op_reg[0];
+            int n = is_vex ? ex->op_reg[1] : d;
             int s_idx = is_vex ? 2 : 1;
-            int imm_idx = is_vex ? 3 : 2;
-            u8 imm = (u8)ops[imm_idx].imm.value.u;
+            u8 imm = (u8)in->imm;
 
             if (vbytes == 16) {
-                int s = ext_vec_src128(in, &ops[s_idx], V_MEM);
+                int s = ext_vec_src128(in, s_idx, V_MEM);
                 emit_mpsadbw_lane(d, n, s, imm & 7);
                 if (is_vex)
                     ymm_zero_hi(d);
                 return;
             }
             int s_lo = V_MEM, s_hi = V_S0;
-            if (ops[s_idx].type == ZYDIS_OPERAND_TYPE_REGISTER) {
-                int sr = zydis_vec_idx(ops[s_idx].reg.value, NULL);
+            if (ex->op_type[s_idx] == EXT_OP_VEC) {
+                int sr = ex->op_reg[s_idx];
                 s_lo = sr;
                 int home = ymm_resident(sr);
                 if (home >= 0)
@@ -3802,8 +4788,8 @@ void emit_ext(const Insn *in, int live) {
 
         case ZYDIS_MNEMONIC_MASKMOVDQU:
         case ZYDIS_MNEMONIC_VMASKMOVDQU: {
-            int src = zydis_vec_idx(ops[0].reg.value, NULL);
-            int mask = zydis_vec_idx(ops[1].reg.value, NULL);
+            int src = ex->op_reg[0];
+            int mask = ex->op_reg[1];
             int base = 7; // RDI
             if (tr_compat) {
                 mov_reg(0, S2, 7);

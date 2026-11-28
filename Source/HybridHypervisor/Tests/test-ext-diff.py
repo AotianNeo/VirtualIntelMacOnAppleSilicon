@@ -966,6 +966,286 @@ BASELINE_TESTS = [
         pshuflw xmm0, xmm1, 0x1b
         pshufhw xmm0, xmm0, 0xaa
     """),
+    ("box64_int_shd_cl_bt_peep", """
+        lea rbx, [rel scratch_buf]
+        mov qword [rbx + 0], 0x1122334455667788
+        mov qword [rbx + 8], 0x99aabbccddeeff00
+        mov qword [rbx + 16], 0xfedcba9876543210
+        mov qword [rbx + 24], 0x0123456789abcdef
+        ; Inline EL0 SHLD/SHRD by CL (64-bit & 32-bit, reg & mem, cl=0/1/17/31/33/63/64, live & dead flags)
+        mov r8, 0x0123456789abcdef
+        mov r9, 0xfedcba9876543210
+        xor ecx, ecx
+        shld r8, r9, cl                 ; cl=0 -> untouched, flags untouched
+        pushfq
+        pop r10
+        mov ecx, 1
+        shld r8, r9, cl                 ; cl=1 (OF defined!)
+        pushfq
+        pop r11
+        mov ecx, 17
+        shrd r8, r9, cl                 ; cl=17 live flags (OF/AF undefined for cnt>1)
+        pushfq
+        pop r12
+        and r12, 0x0c5
+        mov ecx, 63
+        shld r9, r8, cl                 ; dead flags
+        mov ecx, 33
+        shrd r9d, r8d, cl               ; 32-bit cl&31 == 1 (OF defined!)
+        pushfq
+        pop r13
+        and r13, 0x8c5
+        mov ecx, 19
+        shld dword [rbx + 0], r8d, cl   ; mem32 live flags (OF/AF undefined for cnt>1)
+        pushfq
+        pop r14
+        and r14, 0x0c5
+        mov ecx, 29
+        shrd qword [rbx + 8], r9, cl    ; mem64 dead flags
+        ; Aliasing: rcx as dest and as src
+        mov rcx, 0x1234567800000007
+        shld rcx, r8, cl
+        mov r15, rcx
+        mov rcx, 0x876543210000000d
+        shrd r8, rcx, cl
+
+        ; Fast BT/BTS/BTR/BTC imm + BT+JC/JNC TBZ/TBNZ fusion
+        mov rax, 0x8000000100010005
+        bt rax, 63
+        jc .bt_hi_set
+        xor eax, eax
+    .bt_hi_set:
+        bt eax, 31
+        jnc .bt_31_clr
+        or r15, 0x100
+    .bt_31_clr:
+        bts rax, 5
+        btr rax, 0
+        btc rax, 32
+        bts dword [rbx + 16], 3
+        btr qword [rbx + 24], 40
+        btc qword [rbx + 24], 63
+
+        ; SETcc + MOVZX fusion + XOR r,r live flags
+        cmp r8, r9
+        setb dl
+        movzx edx, dl
+        shl r15, 1
+        or r15, rdx
+        cmp r8, r8
+        sete sil
+        movzx rsi, sil
+        shl r15, 1
+        or r15, rsi
+        xor rdi, rdi
+        pushfq
+        pop rdx
+        xor r10, rdx
+
+        ; Adjacent MOV LDP/STP pairing (forward, reverse, 32/64, base-overwrite guard)
+        mov [rbx + 32], r8
+        mov [rbx + 40], r9
+        mov [rbx + 56], r11
+        mov [rbx + 48], r10
+        mov r8, [rbx + 32]
+        mov r9, [rbx + 40]
+        mov r11, [rbx + 56]
+        mov r10, [rbx + 48]
+        mov eax, [rbx + 32]
+        mov edx, [rbx + 36]
+        ; Base overwrite safety: dst1 == base must NOT fuse erroneously
+        mov rcx, rbx
+        mov rcx, [rcx + 32]
+        mov rdi, [rbx + 40]
+        xor rax, rcx
+        xor rax, rdi
+        xor rax, [rbx + 0]
+        xor rax, [rbx + 8]
+        xor rax, [rbx + 16]
+        xor rax, [rbx + 24]
+    """),
+    ("box64_sse_shuf_mskb_addsub_blend_dp_ptest", """
+        lea rbx, [rel scratch_buf]
+        ; Prepare finite FP32/FP64 test vectors
+        mov rax, 0x402000003fc00000     ; 1.5f, 2.5f
+        movq xmm0, rax
+        mov rax, 0xc060000040600000     ; 3.5f, -3.5f
+        movq xmm1, rax
+        punpcklqdq xmm0, xmm1
+        mov rax, 0x3f000000bf800000     ; -1.0f, 0.5f
+        movq xmm1, rax
+        mov rax, 0x40800000c0000000     ; -2.0f, 4.0f
+        movq xmm2, rax
+        punpcklqdq xmm1, xmm2
+        mov rax, 0x3ff8000000000000     ; 1.5
+        movq xmm2, rax
+        mov rax, 0xc004000000000000     ; -2.5
+        movq xmm3, rax
+        punpcklqdq xmm2, xmm3
+        mov rax, 0x400c000000000000     ; 3.5
+        movq xmm3, rax
+        mov rax, 0x3fe0000000000000     ; 0.5
+        movq xmm4, rax
+        punpcklqdq xmm3, xmm4
+        movdqu [rbx + 0], xmm0
+        movdqu [rbx + 16], xmm1
+        movdqu [rbx + 32], xmm2
+        movdqu [rbx + 48], xmm3
+
+        ; Fast PMOVMSKB, MOVMSKPS, MOVMSKPD
+        pmovmskb r8d, xmm0
+        movmskps r9d, xmm1
+        movmskpd r10d, xmm2
+        movdqa xmm5, xmm0
+        movdqa xmm6, xmm1
+        movdqa xmm7, xmm2
+        movdqa xmm8, xmm3
+
+        ; Fast ADDSUBPS / ADDSUBPD (reg, self-alias, mem)
+        addsubps xmm5, xmm1
+        addsubps xmm6, xmm6
+        addsubpd xmm7, xmm3
+        addsubpd xmm8, [rbx + 48]
+
+        ; Exhaustive SHUFPS fast-table coverage
+        movdqa xmm9, xmm0
+        shufps xmm9, xmm1, 0x88
+        shufps xmm9, xmm1, 0xdd
+        shufps xmm9, xmm0, 0x44
+        shufps xmm9, xmm1, 0xee
+        shufps xmm9, xmm9, 0xb1
+        shufps xmm9, xmm9, 0x4e
+        shufps xmm9, xmm9, 0x39
+        shufps xmm9, xmm9, 0x93
+        shufps xmm9, xmm0, 0x22
+        shufps xmm9, xmm1, 0x77
+        shufps xmm9, xmm0, 0x99
+        shufps xmm9, xmm9, 0x1b
+        shufps xmm9, xmm1, 0x33
+        shufps xmm9, xmm0, 0x14
+        shufps xmm9, xmm1, 0xe2
+
+        ; Fast PBLENDW / BLENDPS / BLENDPD
+        movdqa xmm10, xmm0
+        pblendw xmm10, xmm1, 0x0f
+        pblendw xmm10, xmm5, 0xf0
+        pblendw xmm10, xmm6, 0x55
+        pblendw xmm10, xmm7, 0xaa
+        pblendw xmm10, xmm8, 0x33
+        pblendw xmm10, xmm9, 0xcc
+        pblendw xmm10, xmm2, 0x03
+        blendps xmm10, xmm0, 0x05
+        blendps xmm10, xmm1, 0x0a
+        blendpd xmm10, xmm3, 0x01
+
+        ; Fast DPPS / DPPD
+        movdqa xmm11, xmm0
+        dpps xmm11, xmm1, 0x71
+        movdqa xmm12, xmm0
+        dpps xmm12, xmm1, 0x7f
+        movdqa xmm13, xmm0
+        dpps xmm13, xmm1, 0xcf
+        movdqa xmm14, xmm2
+        dppd xmm14, xmm3, 0x31
+        movdqa xmm15, xmm2
+        dppd xmm15, xmm3, 0x33
+
+        ; Fast PTEST (d==s zero/nonzero, d!=s, JZ/JC fast path & full flags)
+        xor r11, r11
+        pxor xmm4, xmm4
+        ptest xmm4, xmm4
+        jz .pt_z1
+        or r11, 1
+    .pt_z1:
+        ptest xmm0, xmm0
+        jnz .pt_nz1
+        or r11, 2
+    .pt_nz1:
+        ptest xmm0, xmm1
+        jc .pt_c1
+        or r11, 4
+    .pt_c1:
+        ptest xmm0, xmm0
+        pushfq
+        pop r12
+        ptest xmm0, xmm1
+        pushfq
+        pop r13
+    """),
+    ("box64_avx2_fast_vex_scalar_ymm_cache", """
+        lea rbx, [rel scratch_buf]
+        ; Load clean finite FP32/FP64 into ymm0..ymm15 (exercising ymm8..15 cache!)
+        mov rax, 0x3ff4000000000000     ; 1.25
+        vmovq xmm0, rax
+        vpbroadcastq ymm8, xmm0
+        mov rax, 0x4004000000000000     ; 2.5
+        vmovq xmm1, rax
+        vpbroadcastq ymm9, xmm1
+        mov rax, 0xbfd0000000000000     ; -0.25
+        vmovq xmm2, rax
+        vpbroadcastq ymm10, xmm2
+        mov rax, 0x4010000000000000     ; 4.0
+        vmovq xmm3, rax
+        vpbroadcastq ymm11, xmm3
+
+        ; Keep ymm8..11 dirty in cache while running scalar VEX instructions!
+        vaddpd ymm12, ymm8, ymm9
+        vmulpd ymm13, ymm10, ymm11
+        vaddsd xmm0, xmm0, xmm1         ; d == n scalar merge
+        vmulsd xmm0, xmm0, xmm2
+        vsubsd xmm1, xmm0, xmm3
+        vdivsd xmm2, xmm1, xmm3
+        vminsd xmm3, xmm2, xmm0
+        vmaxsd xmm4, xmm3, xmm1
+        vsqrtsd xmm4, xmm4, xmm3
+        mov eax, 42
+        vcvtsi2sd xmm5, xmm4, eax
+        vcvtsd2si r8, xmm5
+        vcvtss2sd xmm5, xmm5, xmm0
+        vcvtsd2ss xmm5, xmm5, xmm5
+        vroundsd xmm6, xmm5, xmm1, 0x01
+        vcmpsd xmm6, xmm6, xmm0, 0x01
+        vucomisd xmm0, xmm1
+        pushfq
+        pop r9
+        vpinsrd xmm7, xmm6, eax, 2
+        vpextrd r10d, xmm7, 2
+        vinsertps xmm7, xmm7, xmm0, 0x10
+        vmovd r11d, xmm7
+        vmovq r12, xmm6
+        ; Now use dirty ymm12/ymm13 + ymm8..11 to verify scalar VEX preserved cache!
+        vaddsubpd ymm14, ymm12, ymm13
+        vaddsubps ymm15, ymm12, ymm12
+        vfmaddsub132pd ymm12, ymm8, ymm9
+        vfmsubadd213pd ymm13, ymm10, ymm11
+        vfmaddsub231ps ymm14, ymm8, ymm9
+        vfmsubadd132ps ymm15, ymm10, ymm11
+
+        ; Fast VSHUFPS / VPBLENDW / VDPPS / VPMOVMSKB / VMOVMSKPS / VMOVMSKPD / VPTEST
+        vshufps ymm0, ymm12, ymm13, 0x88
+        vshufps ymm1, ymm14, ymm15, 0xdd
+        vshufps ymm2, ymm0, ymm1, 0x22
+        vshufps ymm3, ymm1, ymm2, 0x77
+        vshufps ymm4, ymm2, ymm3, 0x99
+        vpblendw ymm5, ymm12, ymm13, 0xaa
+        vpblendw ymm6, ymm14, ymm15, 0x33
+        vdpps ymm7, ymm8, ymm9, 0x71
+        vpmovmskb r13d, ymm12
+        vmovmskps r14d, ymm14
+        vmovmskpd r15d, ymm13
+        vptest ymm12, ymm12
+        pushfq
+        pop rcx
+        vptest ymm12, ymm13
+        pushfq
+        pop rdx
+        xor r15, rcx
+        xor r15, rdx
+        vmovdqu [rbx + 0], ymm12
+        vmovdqu [rbx + 32], ymm13
+        vmovdqu [rbx + 64], ymm14
+        vmovdqu [rbx + 96], ymm15
+    """),
 ]
 
 
