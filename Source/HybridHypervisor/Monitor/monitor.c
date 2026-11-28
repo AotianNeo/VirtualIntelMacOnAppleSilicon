@@ -507,9 +507,43 @@ static BlockEntry *find_block(u64 pc) {
     if ((pc < cc || pc >= cc + CC_SIZE) && (pc < PRIV_VA + OFF_CC2 || pc >= PRIV_VA + OFF_CC2 + CC_SIZE))
         return 0;
     u32 word = (u32)((pc - cc) >> 2);
+    // Tier-2 mid-cache islands (part 0: [CC_T2_WORD0..+CC_T2_WORDS), part 1: [CC_T2_WORD1..+CC_T2_WORDS)).
+    if ((word >= CC_T2_WORD0 && word < CC_T2_WORD0 + CC_T2_WORDS) ||
+        (word >= CC_T2_WORD1 && word < CC_T2_WORD1 + CC_T2_WORDS)) {
+        u32 part = word >= CC_PART2_WORD ? 1U : 0U;
+        BlockEntry *t2 = (BlockEntry *)PRIV(OFF_BLOCKS_T2);
+        u64 first = (u64)part * T2_BLOCKS_MAX;
+        u64 lo = first, hi = first + __atomic_load_n(&c0->t2_block_count[part], __ATOMIC_ACQUIRE);
+        while (lo < hi) {
+            u64 mid = (lo + hi) / 2;
+            if (t2[mid].arm_off <= word)
+                lo = mid + 1;
+            else
+                hi = mid;
+        }
+        if (lo > first) {
+            BlockEntry *b = &t2[lo - 1];
+            if (word < b->arm_off + b->arm_words)
+                return b;
+        }
+    }
     BlockEntry *t = (BlockEntry *)PRIV(OFF_BLOCKS);
     bool private_part = word >= CC_PART2_WORD; // two tables, each sorted
-    u64 first = private_part ? (OFF_BLOCKS2 - OFF_BLOCKS) / sizeof(BlockEntry) : 0, lo = first, hi = first + (private_part ? c0->block_count_private : c0->block_count);
+    u64 first, count;
+    if (private_part) {
+        first = (OFF_BLOCKS2 - OFF_BLOCKS) / sizeof(BlockEntry);
+        count = __atomic_load_n(&c0->block_count_private, __ATOMIC_ACQUIRE);
+    } else if (c0->p0_ring_active) {
+        int slot = engine_p0_slot_of_word(word);
+        if (slot < 0)
+            return 0;
+        first = (u64)slot * P0_BLOCKS_PER_SLOT;
+        count = __atomic_load_n(&c0->p0_slot_block_count[slot], __ATOMIC_ACQUIRE);
+    } else {
+        first = 0;
+        count = __atomic_load_n(&c0->block_count, __ATOMIC_ACQUIRE);
+    }
+    u64 lo = first, hi = first + count;
     while (lo < hi) {
         u64 mid = (lo + hi) / 2;
         if (t[mid].arm_off <= word)
@@ -563,7 +597,8 @@ static u64 rip_of_pc(u64 pc, bool *exact, bool *found) {
     *found = b != 0;
     if (!b)
         return 0;
-    PcMap *m = (PcMap *)PRIV(OFF_PCMAP) + b->map_off;
+    bool is_t2 = (u64)b >= PRIV_VA + OFF_BLOCKS_T2 && (u64)b < PRIV_VA + OFF_PCMAP_T2;
+    PcMap *m = (PcMap *)PRIV(is_t2 ? OFF_PCMAP_T2 : OFF_PCMAP) + b->map_off;
     u32 word = (u32)((pc - (PRIV_VA + OFF_CC)) >> 2) - b->arm_off;
     u32 best = 0;
     for (u32 i = 0; i < b->map_count; i++) {
@@ -1104,23 +1139,46 @@ static inline void code_changed(u32 *word) {
     __asm__ volatile("dc cvau, %0\n dsb ish\n ic ivau, %0\n dsb ish\n isb" : : "r"(word) : "memory");
 }
 
+// In Part 0 4-slot ring mode, a newer slot must never permanently direct-branch into an older slot
+// (otherwise recycling the older slot leaves dangling direct B/BL/B.cond instructions in surviving slots).
+static inline bool bad_ring_link(u64 site, u64 arm) {
+    if (!c0->p0_ring_active)
+        return false;
+    u64 cc = PRIV_VA + OFF_CC;
+    if (site < cc || site >= cc + CC_SIZE || arm < cc || arm >= cc + CC_SIZE)
+        return false;
+    int fs = engine_p0_slot_of_word((u32)((site - cc) >> 2));
+    int ts = engine_p0_slot_of_word((u32)((arm - cc) >> 2));
+    if (fs < 0 || ts < 0)
+        return true;
+    return __atomic_load_n(&c0->p0_slot_gen[fs], __ATOMIC_ACQUIRE) >
+           __atomic_load_n(&c0->p0_slot_gen[ts], __ATOMIC_ACQUIRE);
+}
+
 // tr_link, for a target this view already knows, with no way out of the VM. Half of all host calls in a fork loop did only this.
 static void link_here(u64 site, u32 kind, u64 arm) {
     BlockEntry *from = find_block(site), *to = find_block(arm);
-    if (from && to && from->key != to->key && (kind == SVC_CALL || kind == SVC_DIRECT || kind == SVC_JCC)) {
+    bool bad_ring = bad_ring_link(site, arm);
+    if (from && to && (from->key != to->key || bad_ring) && (kind == SVC_CALL || kind == SVC_DIRECT || kind == SVC_JCC)) {
         c->req_a[0] = site;
         c->req_a[1] = to->rip;
         hostcall(HC_CALL_TAIL);
         return;
     }
-    if (!from || !to || from->key != to->key)
-        return; // a link is forever, so it may only join blocks of one domain
+    if (!from || !to || from->key != to->key || bad_ring)
+        return; // a link is forever, so it may only join blocks of one domain and safe ring generation order
     u32 *s = (u32 *)site, was = *s;
     if (site == arm || (kind != SVC_CALL && (was & 0xFFE0001Fu) != 0xD4000001u)) // as in tr_link: a dead block's entry may have come back
         return;
     i64 d = ((i64)arm - (i64)site) >> 2;
-    if (d < -(1 << 25) || d >= (1 << 25)) // the parts of the cache are out of reach of each other
+    if (d < -(1 << 25) || d >= (1 << 25)) { // out of ±128 MiB reach: install inline lookup tail instead of trapping forever
+        if (kind == SVC_CALL || kind == SVC_DIRECT || kind == SVC_JCC) {
+            c->req_a[0] = site;
+            c->req_a[1] = to->rip;
+            hostcall(HC_CALL_TAIL);
+        }
         return;
+    }
     if (!__atomic_compare_exchange_n(s, &was, (kind == SVC_CALL ? 0x94000000u : 0x14000000u) | ((u32)d & 0x3ffffff), false, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
         return;
     code_changed(s);
@@ -4718,7 +4776,7 @@ void mon_sync(void) {
                 if (from_fex && !event_delivered && !code_cache_reset && arm && arm != entry - 12 &&
                     *(const u32 *)(arm + 4) == 0x10000050u) {
                     BlockEntry *from = find_block(entry), *to = find_block(arm);
-                    if (from && to && from->key == to->key) {
+                    if (from && to && from->key == to->key && !bad_ring_link(entry, arm)) {
                         i64 d3 = ((i64)(arm + 12) - (i64)entry) >> 2;
                         i64 d0 = ((i64)arm - (i64)(entry - 12)) >> 2;
                         if (d3 >= -(1 << 25) && d3 < (1 << 25) && d0 >= -(1 << 25) && d0 < (1 << 25)) {
@@ -4783,7 +4841,7 @@ void mon_sync(void) {
                     break;
                 }
                 BlockEntry *from = find_block(site), *to = find_block(arm);
-                if (from && to && from->key == to->key && *(const u32 *)(arm + 4) == 0x10000050u) {
+                if (from && to && from->key == to->key && !bad_ring_link(site, arm) && *(const u32 *)(arm + 4) == 0x10000050u) {
                     i64 d = ((i64)(arm + 12) - (i64)site) >> 2;
                     if (d >= -(1 << 25) && d < (1 << 25)) {
                         u32 *s = (u32 *)site, was = *s;
@@ -5231,6 +5289,13 @@ void mon_sync(void) {
 void mon_irq(void) {
     if (me->smc_held)
         __atomic_store_n(&me->smc_held, 0, __ATOMIC_RELEASE);
+    // Lockless 4-instruction Tier-2 hot-loop PC sample (zero EL0 instrumentation, zero false sharing).
+    u64 sample_pc = c->elr;
+    if (sample_pc >= PRIV_VA + OFF_CC && sample_pc < PRIV_VA + OFF_CC2 + CC_SIZE) {
+        u32 sh = c->t2_sample_head;
+        c->t2_sample_ring[sh & (T2_SAMPLE_RING - 1U)] = sample_pc;
+        __atomic_store_n(&c->t2_sample_head, sh + 1U, __ATOMIC_RELEASE);
+    }
     // The host raised the virtual IRQ line: a timer expiry, new vectors in the host IRR, an ExtINT, or a request to stop.
     // The timer rearms first, because the host unmasks the virtual timer in this call and an expired compare would fire again.
     // Always exit via HC_IRQ in hybrid mode so Hypervisor.framework drops the level-asserted virtual IRQ line before ERET.

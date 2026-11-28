@@ -167,30 +167,60 @@ int tr_fetch(u64 va, u8 *out, int n);
 void x86_decode(u64 rip, Insn *in);
 bool insn_is_terminator(const Insn *in);
 
-// ---- emit state ----
-extern u32 *tr_cc; // write cursor
+// ---- emit state (thread-local so Tier-2 background compiler runs concurrently with Tier-1) ----
+extern _Thread_local u32 *tr_cc; // write cursor
 extern bool tr_precise_flags, tr_has_tzcnt, tr_hybrid, tr_no_bulk_rep;
 extern bool tr_fpcr_merges_scalar;
-extern u64 tr_ad_page;
-extern u16 tr_zext8, tr_zext16;
+extern _Thread_local u64 tr_ad_page;
+extern _Thread_local u16 tr_zext8, tr_zext16;
 extern bool tr_opt_peep, tr_opt_ymm_cache;
-extern u16 tr_aes_mask;
-extern u8 tr_aes_key[16];
+extern _Thread_local u16 tr_aes_mask;
+extern _Thread_local u8 tr_aes_key[16];
 void sse_aes_flush_all(void);
 void ext_ymm_cache_reset(void);
+void ext_ymm_cache_reset_unpinned(void);
 void ext_ymm_cache_flush_dirty(void);
 void ext_ymm_cache_flush_and_drop(void);
+void ext_ymm_cache_pin_ro(int xreg);
+void ext_ymm_cache_preload_clean(int xreg);
+void ext_ymm_set_dirty_limit(int limit);
 bool ext_ymm_cache_has_dirty(void);
 int ext_ymm_cache_dirty_run(void);
+int ext_ymm_cache_snapshot_dirty(u8 vregs[4], u8 xregs[4]);
+void ext_ymm_emit_flush_list(int cnt, const u8 vregs[4], const u8 xregs[4]);
+bool ext_insn_keeps_ymm_cache(const Insn *in);
+void ext_insn_ymm_rw(const Insn *in, u16 *out_read_256, u16 *out_write_any);
 extern bool tr_profile_shift_helpers;
 extern bool tr_inline_shr8;
 extern bool tr_page_rep;
-extern int tr_cpl;
-extern bool tr_compat; // the block being built is 32-bit user code
+extern _Thread_local int tr_cpl;
+extern _Thread_local bool tr_compat; // the block being built is 32-bit user code
+extern _Thread_local bool tr_t2_mode; // true on Tier-2 background optimizer thread
 static inline void E(u32 v) { *tr_cc++ = v; }
 
 // Global to the block being built.
 u64 tr_cc_va(const u32 *p);
+
+// Tier-2 hot-loop optimizer hooks (implemented in tier2.c / translate.c).
+void t2_init(const TrConfig *cfg, EngineCtx *ctx, u32 *cc_base_p);
+void t2_register_loop(u32 t1_idx, u32 part, u32 p0_slot, u32 entry_word, u32 arm_words,
+                      u32 patch_word, u64 entry_rip, u64 head_rip, u64 frame0,
+                      u16 min_off, u16 span_bytes, u32 key, u8 cpl, bool compat, u64 epoch);
+void t2_on_kill(u32 t1_idx);
+void t2_on_flush(bool everything, int evicted_p0_slot, u64 new_epoch0, u64 new_epoch1);
+bool t2_enabled(void);
+bool t2_eager_mode(void);
+void t2_eager_promote_now(u32 t1_idx);
+void tr_t2_set_snapshot(u64 base_va, const u8 *bytes, u32 len);
+void tr_t2_clear_snapshot(void);
+bool tr_t2_publish(u32 t1_idx, u32 part, u32 p0_slot, u64 start_epoch, u64 head_rip,
+                   u32 key, u8 cpl, bool compat, u32 patch_word, u64 frame0,
+                   u16 snap_off, u16 snap_len, const u8 *snap_bytes,
+                   const u32 *code, u32 code_words, const PcMap *pcm, u32 pcm_count);
+u8 tr_insn_reads(const Insn *in);
+void tr_update_zext(const Insn *in);
+bool tr_ad_page_safe_op(u8 op);
+bool tr_is_monitor_or_stop_op(u8 op);
 
 // ---- AArch64 encoders, integer ----
 static inline void add_imm(int sf, int sub, int s, int rd, int rn, u32 imm) {
@@ -335,7 +365,7 @@ void emit_pcmpistri_el0(int d, int s, u8 imm, int live);
 
 // Stub entry points, relative to the stubs region. Filled in by the Swift loader from the monitor image's symbols.
 extern u64 tr_stub_lookup, tr_stub_ret_miss, tr_stub_pushf, tr_stub_sahf;
-extern int cur_part;
+extern _Thread_local int cur_part;
 #ifdef OFF_STUBS_HI
 #define STUB(address) ((address) + ((tr_cc_va(tr_cc) >= PRIV_VA + (cur_part ? OFF_CC2 : OFF_CC) + (124ULL << 20)) \
     ? (cur_part ? (OFF_STUBS2_HI - OFF_STUBS) : (OFF_STUBS_HI - OFF_STUBS)) \

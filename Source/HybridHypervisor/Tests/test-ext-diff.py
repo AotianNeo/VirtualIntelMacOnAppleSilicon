@@ -1246,6 +1246,78 @@ BASELINE_TESTS = [
         vmovdqu [rbx + 64], ymm14
         vmovdqu [rbx + 96], ymm15
     """),
+    ("tier2_hot_loop_unroll_ymm_licm_flags", """
+        ; 1) Odd-iter (7) AVX2 FMA3 + integer YMM8..11 loop (RO ymm8/ymm9, RW ymm10/ymm11)
+        lea rbx, [rel scratch_buf]
+        vmovdqu ymm8,  [rbx + 0]
+        vmovdqu ymm9,  [rbx + 32]
+        vmovdqu ymm10, [rbx + 64]
+        vmovdqu ymm11, [rbx + 96]
+        mov ecx, 7
+    .t2_fma_odd:
+        vfmadd231ps ymm10, ymm9, ymm8
+        vpaddd ymm11, ymm11, ymm8
+        dec ecx
+        jnz .t2_fma_odd
+
+        ; 2) Even-iter (8) with mid-body early exit & live dirty ymm10/ymm11
+        mov ecx, 8
+    .t2_early_loop:
+        vpaddq ymm10, ymm10, ymm9
+        cmp ecx, 5
+        je .t2_early_done
+        vpxor ymm11, ymm11, ymm10
+        dec ecx
+        jnz .t2_early_loop
+    .t2_early_done:
+
+        ; 3) Live-out CF preservation across dec rcx; jnz backedge (t2_peek_exit_flags)
+        xor eax, eax
+        stc
+        mov ecx, 9
+    .t2_cf_live:
+        add rdx, 3
+        dec ecx
+        jnz .t2_cf_live
+        ; CF MUST still be 0 (Wait: add rdx,3 overwrote CF; test stc before a pure dec loop!)
+        mov r8, 0x1234
+        stc
+        mov ecx, 5
+    .t2_pure_dec:
+        lea r8, [r8 + rcx*2 + 1]
+        dec ecx
+        jnz .t2_pure_dec
+        adc rax, 0x100
+
+        ; 4) RIP-relative LICM + head_i > 0 OSR loop
+        mov r9, 0x55
+        mov ecx, 6
+    .t2_riprel_loop:
+        add r9, [rel scratch_buf + 8]
+        xor r9, [rel scratch_buf + 16]
+        dec ecx
+        jnz .t2_riprel_loop
+
+        ; 5) Multi-branch inner loop (forward branch inside loop + backedge)
+        mov r10, 0
+        mov ecx, 11
+    .t2_branch_loop:
+        test ecx, 1
+        jz .t2_even
+        add r10, rcx
+        jmp .t2_next
+    .t2_even:
+        sub r10, 3
+    .t2_next:
+        dec ecx
+        jnz .t2_branch_loop
+
+        ; Verify final ymm10/ymm11 spilled accurately to memory too
+        vmovdqu [rbx + 128], ymm10
+        vmovdqu [rbx + 160], ymm11
+        add rax, [rbx + 128]
+        xor rax, [rbx + 160]
+    """),
 ]
 
 
@@ -1593,6 +1665,12 @@ def main():
                 for line in edge_fb:
                     print("  " + line)
                 diffs += len(edge_fb)
+
+        if os.environ.get("LC_HVDBT_T2_LOG"):
+            t2_lines = [l for l in dut_err.splitlines() if "[hvdbt-t2]" in l]
+            print(f"Tier-2 promoted logs ({len(t2_lines)}):")
+            for l in t2_lines[:20]:
+                print("  " + l)
 
         if diffs:
             sys.exit(1)

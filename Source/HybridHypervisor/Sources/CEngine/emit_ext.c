@@ -18,8 +18,8 @@ int convert_bitmask(uint64_t bitmask) {
     return logimm(bitmask, 1, &enc) ? (int)enc : 0;
 }
 
-static ZydisDecoder dec64, dec32;
-static bool dec_inited;
+static _Thread_local ZydisDecoder dec64, dec32;
+static _Thread_local bool dec_inited;
 
 static void ensure_decoders(void) {
     if (__builtin_expect(dec_inited, 1))
@@ -92,10 +92,12 @@ typedef struct {
     bool dirty;
     u32 age;
 } YmmCacheSlot;
-static YmmCacheSlot ymm_cache[YMM_CACHE_SLOTS];
-static u32 ymm_cache_clk;
-static u16 ymm_zero_mask; // bit r (0..15): architectural ymm_hi[r] is known all-zero
-static int ymm_dirty_run_cnt;
+static _Thread_local YmmCacheSlot ymm_cache[YMM_CACHE_SLOTS];
+static _Thread_local u32 ymm_cache_clk;
+static _Thread_local u16 ymm_zero_mask; // bit r (0..15): architectural ymm_hi[r] is known all-zero
+static _Thread_local int ymm_dirty_run_cnt;
+static _Thread_local u8 ymm_pinned_mask; // bit s (0..3): read-only Preheader-pinned slot (never evicted/dropped inside loop)
+static _Thread_local int ymm_dirty_run_limit = 8;
 
 void ext_ymm_cache_reset(void) {
     for (int s = 0; s < YMM_CACHE_SLOTS; s++) {
@@ -105,6 +107,64 @@ void ext_ymm_cache_reset(void) {
     }
     ymm_zero_mask = 0;
     ymm_dirty_run_cnt = 0;
+    ymm_pinned_mask = 0;
+    ymm_dirty_run_limit = 8;
+}
+
+void ext_ymm_cache_reset_unpinned(void) {
+    for (int s = 0; s < YMM_CACHE_SLOTS; s++) {
+        if (ymm_pinned_mask & (1u << s))
+            continue;
+        ymm_cache[s].xreg = -1;
+        ymm_cache[s].dirty = false;
+        ymm_cache[s].age = 0;
+    }
+    ymm_zero_mask = 0;
+    ymm_dirty_run_cnt = 0;
+}
+
+void ext_ymm_set_dirty_limit(int limit) {
+    ymm_dirty_run_limit = limit > 0 ? limit : 8;
+}
+
+void ext_ymm_cache_pin_ro(int xreg) {
+    if (!tr_opt_ymm_cache || xreg < 8 || xreg > 15)
+        return;
+    for (int s = 0; s < YMM_CACHE_SLOTS; s++) {
+        if (ymm_cache[s].xreg == (int8_t)xreg) {
+            ymm_pinned_mask |= (u8)(1u << s);
+            return;
+        }
+    }
+    for (int s = 0; s < YMM_CACHE_SLOTS; s++) {
+        if (!(ymm_pinned_mask & (1u << s)) && ymm_cache[s].xreg < 0) {
+            int vreg = ymm_pool_vreg[s];
+            VLDR128_U12(vreg, CTX, ymm_hi_off(xreg));
+            ymm_cache[s].xreg = (int8_t)xreg;
+            ymm_cache[s].dirty = false;
+            ymm_cache[s].age = ++ymm_cache_clk;
+            ymm_pinned_mask |= (u8)(1u << s);
+            return;
+        }
+    }
+}
+
+void ext_ymm_cache_preload_clean(int xreg) {
+    if (!tr_opt_ymm_cache || xreg < 8 || xreg > 15)
+        return;
+    for (int s = 0; s < YMM_CACHE_SLOTS; s++)
+        if (ymm_cache[s].xreg == (int8_t)xreg)
+            return;
+    for (int s = 0; s < YMM_CACHE_SLOTS; s++) {
+        if (!(ymm_pinned_mask & (1u << s)) && ymm_cache[s].xreg < 0) {
+            int vreg = ymm_pool_vreg[s];
+            VLDR128_U12(vreg, CTX, ymm_hi_off(xreg));
+            ymm_cache[s].xreg = (int8_t)xreg;
+            ymm_cache[s].dirty = false;
+            ymm_cache[s].age = ++ymm_cache_clk;
+            return;
+        }
+    }
 }
 
 bool ext_ymm_cache_has_dirty(void) {
@@ -116,6 +176,23 @@ bool ext_ymm_cache_has_dirty(void) {
 
 int ext_ymm_cache_dirty_run(void) {
     return ymm_dirty_run_cnt;
+}
+
+int ext_ymm_cache_snapshot_dirty(u8 vregs[4], u8 xregs[4]) {
+    int n = 0;
+    for (int s = 0; s < YMM_CACHE_SLOTS; s++) {
+        if (ymm_cache[s].xreg >= 8 && ymm_cache[s].dirty) {
+            vregs[n] = ymm_pool_vreg[s];
+            xregs[n] = (u8)ymm_cache[s].xreg;
+            n++;
+        }
+    }
+    return n;
+}
+
+void ext_ymm_emit_flush_list(int cnt, const u8 vregs[4], const u8 xregs[4]) {
+    for (int i = 0; i < cnt; i++)
+        VSTR128_U12(vregs[i], CTX, ymm_hi_off(xregs[i]));
 }
 
 void ext_ymm_cache_flush_dirty(void) {
@@ -136,6 +213,7 @@ void ext_ymm_cache_flush_and_drop(void) {
         ymm_cache[s].dirty = false;
     }
     ymm_dirty_run_cnt = 0;
+    ymm_pinned_mask = 0;
 }
 
 static void ymm_cache_evict_vreg(int vreg) {
@@ -145,6 +223,7 @@ static void ymm_cache_evict_vreg(int vreg) {
                 VSTR128_U12(vreg, CTX, ymm_hi_off(ymm_cache[s].xreg));
             ymm_cache[s].xreg = -1;
             ymm_cache[s].dirty = false;
+            ymm_pinned_mask &= (u8)~(1u << s);
             return;
         }
     }
@@ -155,6 +234,7 @@ static void ymm_cache_drop_xreg(int reg) {
         if (ymm_cache[s].xreg == (int8_t)reg) {
             ymm_cache[s].xreg = -1;
             ymm_cache[s].dirty = false;
+            ymm_pinned_mask &= (u8)~(1u << s);
             return;
         }
     }
@@ -177,6 +257,7 @@ static int ymm_cache_get(int reg, bool load_if_miss, bool will_write, u8 *pin_ma
             if (will_write) {
                 ymm_cache[s].dirty = true;
                 ymm_zero_mask &= (u16)~(1u << reg);
+                ymm_pinned_mask &= (u8)~(1u << s);
             }
             if (pin_mask)
                 *pin_mask |= (u8)(1u << s);
@@ -185,6 +266,8 @@ static int ymm_cache_get(int reg, bool load_if_miss, bool will_write, u8 *pin_ma
     }
     int pick = -1;
     for (int s = 0; s < YMM_CACHE_SLOTS; s++) {
+        if (ymm_pinned_mask & (1u << s))
+            continue;
         if (pin_mask && (*pin_mask & (1u << s)))
             continue;
         if (ymm_cache[s].xreg < 0) {
@@ -2635,6 +2718,130 @@ static void emit_mpsadbw_lane(int vd, int vs1, int vs2, u8 lane_imm) {
             E(0x2E205000u | ((u32)V_S2 << 16) | ((u32)V_S1 << 5) | acc); // UABAL acc.8H, V_S1.8B, V_S2.8B
     }
     vmov128(vd, acc);
+}
+
+bool ext_insn_keeps_ymm_cache(const Insn *in) {
+    if (in->op != OP_EXT)
+        return false;
+    const ExtDecoded *ex = &in->ext;
+    ZydisMnemonic mnem = (ZydisMnemonic)ex->mnem;
+    int fma_ord = 0, fma_kind = 0;
+    bool fma_sc = false, fma_dbl = false;
+    if (is_fma_mnemonic(mnem, &fma_ord, &fma_kind, &fma_sc, &fma_dbl))
+        return true;
+    if (is_lanewise_vex(mnem)) {
+        bool has_imm = false;
+        for (u8 i = 0; i < ex->op_cnt; i++)
+            if (ex->op_type[i] == EXT_OP_IMM)
+                has_imm = true;
+        bool uses_t2 = mnem == ZYDIS_MNEMONIC_VPSIGNB || mnem == ZYDIS_MNEMONIC_VPSIGNW ||
+                       mnem == ZYDIS_MNEMONIC_VPSIGND || mnem == ZYDIS_MNEMONIC_VPMADDUBSW ||
+                       (tr_precise_flags && (mnem == ZYDIS_MNEMONIC_VADDSUBPS || mnem == ZYDIS_MNEMONIC_VADDSUBPD)) ||
+                       (mnem == ZYDIS_MNEMONIC_VPERMILPS && !has_imm) ||
+                       mnem == ZYDIS_MNEMONIC_VAESKEYGENASSIST;
+        return !uses_t2;
+    }
+    switch (mnem) {
+        case ZYDIS_MNEMONIC_ANDN: case ZYDIS_MNEMONIC_BEXTR: case ZYDIS_MNEMONIC_BLSI:
+        case ZYDIS_MNEMONIC_BLSMSK: case ZYDIS_MNEMONIC_BLSR: case ZYDIS_MNEMONIC_BZHI:
+        case ZYDIS_MNEMONIC_MULX: case ZYDIS_MNEMONIC_RORX: case ZYDIS_MNEMONIC_SARX:
+        case ZYDIS_MNEMONIC_SHLX: case ZYDIS_MNEMONIC_SHRX: case ZYDIS_MNEMONIC_PDEP:
+        case ZYDIS_MNEMONIC_PEXT: case ZYDIS_MNEMONIC_ADCX: case ZYDIS_MNEMONIC_ADOX:
+        case ZYDIS_MNEMONIC_VMOVAPS: case ZYDIS_MNEMONIC_VMOVAPD:
+        case ZYDIS_MNEMONIC_VMOVUPS: case ZYDIS_MNEMONIC_VMOVUPD:
+        case ZYDIS_MNEMONIC_VMOVDQA: case ZYDIS_MNEMONIC_VMOVDQU:
+        case ZYDIS_MNEMONIC_VMOVNTDQ: case ZYDIS_MNEMONIC_VMOVNTDQA:
+        case ZYDIS_MNEMONIC_VMOVNTPS: case ZYDIS_MNEMONIC_VMOVNTPD:
+        case ZYDIS_MNEMONIC_VLDDQU:
+        case ZYDIS_MNEMONIC_VMOVSS: case ZYDIS_MNEMONIC_VMOVSD:
+        case ZYDIS_MNEMONIC_VMOVD: case ZYDIS_MNEMONIC_VMOVQ:
+        case ZYDIS_MNEMONIC_VMOVLPS: case ZYDIS_MNEMONIC_VMOVLPD:
+        case ZYDIS_MNEMONIC_VMOVHPS: case ZYDIS_MNEMONIC_VMOVHPD:
+        case ZYDIS_MNEMONIC_VMOVLHPS: case ZYDIS_MNEMONIC_VMOVHLPS:
+        case ZYDIS_MNEMONIC_VADDSS: case ZYDIS_MNEMONIC_VADDSD:
+        case ZYDIS_MNEMONIC_VSUBSS: case ZYDIS_MNEMONIC_VSUBSD:
+        case ZYDIS_MNEMONIC_VMULSS: case ZYDIS_MNEMONIC_VMULSD:
+        case ZYDIS_MNEMONIC_VDIVSS: case ZYDIS_MNEMONIC_VDIVSD:
+        case ZYDIS_MNEMONIC_VMINSS: case ZYDIS_MNEMONIC_VMINSD:
+        case ZYDIS_MNEMONIC_VMAXSS: case ZYDIS_MNEMONIC_VMAXSD:
+        case ZYDIS_MNEMONIC_VSQRTSS: case ZYDIS_MNEMONIC_VSQRTSD:
+        case ZYDIS_MNEMONIC_VRSQRTSS: case ZYDIS_MNEMONIC_VRCPSS:
+        case ZYDIS_MNEMONIC_VCVTSI2SS: case ZYDIS_MNEMONIC_VCVTSI2SD:
+        case ZYDIS_MNEMONIC_VCVTSS2SI: case ZYDIS_MNEMONIC_VCVTTSS2SI:
+        case ZYDIS_MNEMONIC_VCVTSD2SI: case ZYDIS_MNEMONIC_VCVTTSD2SI:
+        case ZYDIS_MNEMONIC_VCVTSS2SD: case ZYDIS_MNEMONIC_VCVTSD2SS:
+        case ZYDIS_MNEMONIC_VUCOMISS: case ZYDIS_MNEMONIC_VUCOMISD:
+        case ZYDIS_MNEMONIC_VCOMISS: case ZYDIS_MNEMONIC_VCOMISD:
+        case ZYDIS_MNEMONIC_VBROADCASTF128: case ZYDIS_MNEMONIC_VBROADCASTI128:
+        case ZYDIS_MNEMONIC_VBROADCASTSS: case ZYDIS_MNEMONIC_VBROADCASTSD:
+        case ZYDIS_MNEMONIC_VPBROADCASTB: case ZYDIS_MNEMONIC_VPBROADCASTW:
+        case ZYDIS_MNEMONIC_VPBROADCASTD: case ZYDIS_MNEMONIC_VPBROADCASTQ:
+        case ZYDIS_MNEMONIC_VPBLENDD:
+        case ZYDIS_MNEMONIC_VINSERTF128: case ZYDIS_MNEMONIC_VINSERTI128:
+        case ZYDIS_MNEMONIC_VEXTRACTF128: case ZYDIS_MNEMONIC_VEXTRACTI128:
+        case ZYDIS_MNEMONIC_VPERM2F128: case ZYDIS_MNEMONIC_VPERM2I128:
+        case ZYDIS_MNEMONIC_VPERMQ: case ZYDIS_MNEMONIC_VPERMPD:
+        case ZYDIS_MNEMONIC_VPEXTRB: case ZYDIS_MNEMONIC_VPEXTRW:
+        case ZYDIS_MNEMONIC_VPEXTRD: case ZYDIS_MNEMONIC_VPEXTRQ:
+        case ZYDIS_MNEMONIC_VPINSRB: case ZYDIS_MNEMONIC_VPINSRW:
+        case ZYDIS_MNEMONIC_VPINSRD: case ZYDIS_MNEMONIC_VPINSRQ:
+        case ZYDIS_MNEMONIC_VINSERTPS: case ZYDIS_MNEMONIC_VEXTRACTPS:
+        case ZYDIS_MNEMONIC_VROUNDSS: case ZYDIS_MNEMONIC_VROUNDSD:
+        case ZYDIS_MNEMONIC_VCMPSS: case ZYDIS_MNEMONIC_VCMPSD:
+        case ZYDIS_MNEMONIC_VPMOVSXBW: case ZYDIS_MNEMONIC_VPMOVSXBD: case ZYDIS_MNEMONIC_VPMOVSXBQ:
+        case ZYDIS_MNEMONIC_VPMOVSXWD: case ZYDIS_MNEMONIC_VPMOVSXWQ: case ZYDIS_MNEMONIC_VPMOVSXDQ:
+        case ZYDIS_MNEMONIC_VPMOVZXBW: case ZYDIS_MNEMONIC_VPMOVZXBD: case ZYDIS_MNEMONIC_VPMOVZXBQ:
+        case ZYDIS_MNEMONIC_VPMOVZXWD: case ZYDIS_MNEMONIC_VPMOVZXWQ: case ZYDIS_MNEMONIC_VPMOVZXDQ:
+        case ZYDIS_MNEMONIC_VPMOVMSKB: case ZYDIS_MNEMONIC_VMOVMSKPS: case ZYDIS_MNEMONIC_VMOVMSKPD:
+        case ZYDIS_MNEMONIC_VPTEST:
+        case ZYDIS_MNEMONIC_VCVTDQ2PS: case ZYDIS_MNEMONIC_VCVTPS2DQ: case ZYDIS_MNEMONIC_VCVTTPS2DQ:
+            return true;
+        default:
+            return false;
+    }
+}
+
+void ext_insn_ymm_rw(const Insn *in, u16 *out_read_256, u16 *out_write_any) {
+    u16 rd = 0, wr = 0;
+    if (in->op != OP_EXT) {
+        *out_read_256 = 0;
+        *out_write_any = 0;
+        return;
+    }
+    const ExtDecoded *ex = &in->ext;
+    ZydisMnemonic mnem = (ZydisMnemonic)ex->mnem;
+    if (mnem == ZYDIS_MNEMONIC_VZEROUPPER || mnem == ZYDIS_MNEMONIC_VZEROALL) {
+        *out_read_256 = 0;
+        *out_write_any = 0xFFFFu;
+        return;
+    }
+    bool op0_read_only = (mnem == ZYDIS_MNEMONIC_VPTEST || mnem == ZYDIS_MNEMONIC_VTESTPS ||
+                          mnem == ZYDIS_MNEMONIC_VTESTPD || mnem == ZYDIS_MNEMONIC_VUCOMISS ||
+                          mnem == ZYDIS_MNEMONIC_VUCOMISD || mnem == ZYDIS_MNEMONIC_VCOMISS ||
+                          mnem == ZYDIS_MNEMONIC_VCOMISD || mnem == ZYDIS_MNEMONIC_VPCMPISTRI);
+    int fma_ord = 0, fma_kind = 0;
+    bool fma_sc = false, fma_dbl = false;
+    bool op0_is_rw = is_fma_mnemonic(mnem, &fma_ord, &fma_kind, &fma_sc, &fma_dbl);
+    for (u8 i = 0; i < ex->op_cnt; i++) {
+        if (ex->op_type[i] != EXT_OP_VEC)
+            continue;
+        u16 bit = (u16)(1u << ex->op_reg[i]);
+        if (i == 0) {
+            if (op0_read_only) {
+                if (ex->op_bytes[0] == 32)
+                    rd |= bit;
+            } else {
+                wr |= bit;
+                if (op0_is_rw && ex->op_bytes[0] == 32)
+                    rd |= bit;
+            }
+        } else {
+            if (ex->op_bytes[i] == 32)
+                rd |= bit;
+        }
+    }
+    *out_read_256 = rd;
+    *out_write_any = wr;
 }
 
 void emit_ext(const Insn *in, int live) {

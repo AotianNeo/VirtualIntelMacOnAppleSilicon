@@ -79,6 +79,39 @@ static inline uint64_t engine_shared_compat_domain(uint64_t rip, uint64_t table)
 #define OFF_BLOCKS2 (1660ULL << 20) // 16 MB (1660..1676 MB)
 #define OFF_PCMAP2 (1676ULL << 20) // 128 MB (1676..1804 MB < 2048 MB PRIV_SIZE)
 #define CC_PART2_WORD ((OFF_CC2 - OFF_CC) / 4)
+
+// Part 0 4-slot chronological ring-generation layout + mid-cache 4 MiB Tier-2 islands:
+//   Slot 0: [0..61 MiB), Slot 1: [61..122 MiB), CC_T2: [122..126 MiB), Slot 2: [126..187 MiB), Slot 3: [187..248 MiB).
+//   Every slot word is within ±126 MiB of CC_T2 and ±126 MiB of OFF_STUBS / OFF_STUBS_HI.
+#define P0_SLOTS 4U
+#define P0_SLOT_BYTES (61ULL << 20)
+#define P0_SLOT_WORDS ((uint32_t)(P0_SLOT_BYTES / 4ULL))
+#define P0_BLOCKS_PER_SLOT ((uint32_t)(BLOCKS_MAX / P0_SLOTS))
+#define P0_PCMAP_PER_SLOT ((uint32_t)((PCMAP_BYTES / sizeof(uint32_t)) / P0_SLOTS))
+#define CC_T2_OFF (122ULL << 20)
+#define CC_T2_SIZE (4ULL << 20)
+#define CC_T2_WORDS ((uint32_t)(CC_T2_SIZE / 4ULL))
+#define CC_T2_WORD0 ((uint32_t)(CC_T2_OFF / 4ULL))
+#define CC_T2_WORD1 ((uint32_t)(CC_PART2_WORD + CC_T2_WORD0))
+#define OFF_BLOCKS_T2 (952ULL << 20) // 512 KiB in unused 952..1024 MiB (EL1 rw): 8192 BlockEntries per partition
+#define T2_BLOCKS_MAX 8192U
+#define OFF_PCMAP_T2 (954ULL << 20) // 8 MiB in unused 952..1024 MiB (EL1 rw): 1M PcMaps per partition
+#define T2_PCMAP_ENTRIES (1U << 20)
+#define T2_SAMPLE_RING 64U
+
+static inline uint32_t engine_p0_slot_word_base(uint32_t slot) {
+    return slot < 2U ? slot * P0_SLOT_WORDS : (CC_T2_WORD0 + CC_T2_WORDS + (slot - 2U) * P0_SLOT_WORDS);
+}
+static inline int engine_p0_slot_of_word(uint32_t word) {
+    if (word < P0_SLOT_WORDS) return 0;
+    if (word < P0_SLOT_WORDS * 2U) return 1;
+    if (word >= CC_T2_WORD0 + CC_T2_WORDS && word < CC_T2_WORD0 + CC_T2_WORDS + P0_SLOT_WORDS) return 2;
+    if (word >= CC_T2_WORD0 + CC_T2_WORDS + P0_SLOT_WORDS && word < CC_T2_WORD0 + CC_T2_WORDS + P0_SLOT_WORDS * 2U) return 3;
+    return -1;
+}
+_Static_assert(CC_T2_OFF + CC_T2_SIZE + 2ULL * P0_SLOT_BYTES <= CC_SIZE, "P0 ring slots + CC_T2 exceed CC_SIZE");
+_Static_assert(OFF_BLOCKS_T2 + 2ULL * T2_BLOCKS_MAX * 32ULL <= OFF_PCMAP_T2, "OFF_BLOCKS_T2 runs past OFF_PCMAP_T2");
+_Static_assert(OFF_PCMAP_T2 + 2ULL * T2_PCMAP_ENTRIES * 4ULL <= OFF_HASH, "OFF_PCMAP_T2 runs past OFF_HASH");
 _Static_assert(OFF_FEX_L1 - OFF_CTX == (4ULL << 20), "OFF_FEX_L1 must remain exactly 4 MiB past OFF_CTX for vectors.s and L1 inline probes");
 _Static_assert(OFF_STUBS_HI + (2ULL << 20) <= OFF_PT, "part 0 code cache + high stubs run past OFF_PT");
 _Static_assert(OFF_PCMAP + PCMAP_BYTES <= OFF_HASH, "part 0 pcmap runs past OFF_HASH");
@@ -419,6 +452,15 @@ typedef struct {
     int64_t hpet_fast_offset_ns;
     uint64_t hpet_fast_expire_ns;
     uint64_t hpet_fast_floor_tick;
+    // Part 0 ring-generation block counts + Tier-2 hot-loop tables & IRQ sampling ring. Append-only.
+    uint32_t p0_ring_active;
+    uint32_t p0_ring_pad;
+    uint64_t p0_slot_block_count[P0_SLOTS];
+    uint64_t p0_slot_gen[P0_SLOTS];
+    uint64_t t2_block_count[2];
+    uint32_t t2_sample_head;
+    uint32_t t2_sample_pad;
+    uint64_t t2_sample_ring[T2_SAMPLE_RING];
 } EngineCtx;
 _Static_assert(sizeof(EngineCtx) <= 32768, "EngineCtx must stay below the +32 KB per-vCPU scratch region");
 _Static_assert(sizeof(EngineCtx) <= CTX_SLOT, "EngineCtx must fit its existing per-vCPU slot");

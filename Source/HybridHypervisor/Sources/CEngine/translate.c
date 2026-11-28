@@ -2,18 +2,20 @@
 #include <dlfcn.h>
 #include <libkern/OSCacheControl.h>
 #include <mach/mach_time.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
 #include "tr_internal.h"
 
-u64 tr_ad_page = ~0ULL;
-u16 tr_zext8 = 0, tr_zext16 = 0;
+_Thread_local u64 tr_ad_page = ~0ULL;
+_Thread_local u16 tr_zext8 = 0, tr_zext16 = 0;
 bool tr_opt_peep = true, tr_opt_ymm_cache = true;
 static bool native_dag = true, native_l1 = true;
-u16 tr_aes_mask = 0;
-u8 tr_aes_key[16];
+static bool p0_ring_enabled = false;
+_Thread_local u16 tr_aes_mask = 0;
+_Thread_local u8 tr_aes_key[16];
 
 typedef struct {
     void (*x86_decode)(u64 rip, Insn *in);
@@ -91,14 +93,15 @@ bool tr_reload_backend(const char *dylib_path) {
 #define MAP_BITS 22
 #define MAP_SIZE (1u << MAP_BITS)
 
-u32 *tr_cc;
+_Thread_local u32 *tr_cc;
 bool tr_precise_flags, tr_has_tzcnt, tr_hybrid, tr_no_bulk_rep;
 bool tr_fpcr_merges_scalar;
 bool tr_profile_shift_helpers;
 bool tr_inline_shr8;
 bool tr_page_rep;
-int tr_cpl;
-bool tr_compat;
+_Thread_local int tr_cpl;
+_Thread_local bool tr_compat;
+_Thread_local bool tr_t2_mode;
 u64 tr_stub_lookup, tr_stub_ret_miss, tr_stub_pushf, tr_stub_sahf;
 
 static TrConfig cfg;
@@ -106,15 +109,46 @@ static u32 *cc_base;
 static u64 cc_limit;
 static BlockEntry *block_table;
 static PcMap *pc_map;
+static BlockEntry *t2_block_table;
+static PcMap *t2_pc_map;
 // The code cache has two parts, each with its share of the block table and pc maps. Shared domains go in the first: the kernel and system libraries, which every
 // process needs and which live long. Blocks of one view go in the second, and most die with their process, unusable until a reset. Links join blocks of one key, so
 // none crosses between the parts, and the second can reset alone without taking the first with it.
 #define PCMAP_ENTRIES (PCMAP_BYTES / sizeof(PcMap))
 static u32 pc_map_used[2] = {0, (OFF_PCMAP2 - OFF_PCMAP) / sizeof(PcMap)};
 static u32 *cc_cursor[2];
-int cur_part;
+_Thread_local int cur_part;
 static EngineCtx *ctx_ptr;
 static void code_published(void);
+
+// Part 0 4-slot ring-generation state (active when p0_ring_enabled == true).
+static u32 *p0_cc_cursor[P0_SLOTS];
+static u32 p0_block_count[P0_SLOTS];
+static u32 p0_pcmap_used[P0_SLOTS];
+static u64 p0_slot_gen[P0_SLOTS];
+static u64 p0_gen_seq;
+static u32 p0_cur_slot;
+static bool p0_ring_need_evict;
+static u64 p0_ring_evictions;
+
+// Tier-2 code cache state (CC_T2 mid-cache islands at +120..+124 MiB of part 0 and part 1).
+typedef struct {
+    u64 rip;
+    u32 view;
+    u32 entry_word;
+    u32 arm_words;
+    u32 t1_idx;
+    u8 cpl;
+    u8 p0_slot;
+    bool compat;
+    bool dead;
+} T2BlockMeta;
+static pthread_mutex_t t2_pub_lock = PTHREAD_MUTEX_INITIALIZER;
+static u32 *cc_t2_cursor[2];
+static u32 t2_block_cnt[2];
+static u32 t2_pcmap_used[2];
+static u64 t2_epoch[2];
+static T2BlockMeta *t2_meta[2];
 
 typedef struct {
     u64 rip;
@@ -128,9 +162,14 @@ typedef struct {
     // For reuse. Only a block on one frame is ever reused, so the chains here are its first ones.
     bool on_frame, on_page, on_view, compat;
     u8 cpl;
+    u8 p0_slot;
+    bool t2_has_loop;
     u16 read_off, read_bytes; // what translating it read of its frame, a copy of which is at read_copy. 0 bytes: never reused
     u32 read_copy;
     u32 first_word; // its entry word, which a kill overwrites
+    u32 t2_patch_word; // word holding WORD_NOP OSR anchor (may equal entry_word)
+    u32 t2_entry_word; // nonzero if promoted into CC_T2
+    u32 t2_meta_idx;   // index into t2_meta[part] + 1
 } HostBlock;
 static HostBlock *hblocks;
 static u32 hblock_count[2];
@@ -524,7 +563,30 @@ static void compile_inputs_finish(void) {
 }
 // ---- End inert analyzed-input recurrence census ----
 
+static _Thread_local u64 t2_snap_base;
+static _Thread_local const u8 *t2_snap_ptr;
+static _Thread_local u32 t2_snap_len;
+
+void tr_t2_set_snapshot(u64 base_va, const u8 *bytes, u32 len) {
+    t2_snap_base = base_va;
+    t2_snap_ptr = bytes;
+    t2_snap_len = len;
+}
+
+void tr_t2_clear_snapshot(void) {
+    t2_snap_ptr = NULL;
+    t2_snap_len = 0;
+}
+
 int tr_fetch(u64 va, u8 *out, int n) {
+    if (__builtin_expect(tr_t2_mode, 0)) {
+        if (!t2_snap_ptr || va < t2_snap_base || va >= t2_snap_base + t2_snap_len)
+            return 0;
+        u64 avail = (t2_snap_base + t2_snap_len) - va;
+        int got = (u64)n < avail ? n : (int)avail;
+        memcpy(out, t2_snap_ptr + (va - t2_snap_base), (size_t)got);
+        return got;
+    }
     int got = 0;
     if (cfg.profile_compile_inputs)
         compile_inputs_request(va, n);
@@ -700,6 +762,8 @@ static u32 *try_direct_link_target(int key, u64 entry_rip, u64 page, u64 target,
     HostBlock *hb = &hblocks[hit - 1];
     if (hb->dead || hb->view != (u32)key || hb->cpl != (u8)tr_cpl || hb->compat != tr_compat)
         return NULL;
+    if (p0_ring_enabled && cur_part == 0 && p0_slot_gen[p0_cur_slot] > p0_slot_gen[hb->p0_slot])
+        return NULL; // never directly link newer ring slot -> older slot (prevents dangling links on ring recycle)
     return cc_base + hb->entry_word;
 }
 
@@ -991,10 +1055,49 @@ static void fix(u32 *site, int form, u32 *to) {
         *site = (*site & 0xFC000000u) | ((u32)d & 0x3ffffff);
 }
 
+static bool p0_slot_full(u32 s) {
+    u32 *base = cc_base + engine_p0_slot_word_base(s);
+    // Reserve 2 MiB (~43k lookup tails) per slot so cross-slot tr_lookup_tail never starves.
+    return (u8 *)p0_cc_cursor[s] - (u8 *)base > (long)(P0_SLOT_BYTES - (2ULL << 20)) ||
+           p0_block_count[s] >= P0_BLOCKS_PER_SLOT - 32 ||
+           p0_pcmap_used[s] + MAX_INSNS + 1024 >= (s + 1U) * P0_PCMAP_PER_SLOT;
+}
+
+// Chronological 4-slot ring (0 -> 1 -> 2 -> 3 -> 0): older slots can permanently direct-link into newer slots;
+// newer slots linking into older slots use fast inline L1 lookup tails (tr_lookup_tail).
+static inline u32 p0_next_ring_slot(u32 cur) {
+    return (cur + 1U) & (P0_SLOTS - 1U);
+}
+
+static bool p0_try_advance_empty_slot(void) {
+    if (!p0_ring_enabled || !p0_slot_full(p0_cur_slot))
+        return true;
+    u32 next = p0_next_ring_slot(p0_cur_slot);
+    if (p0_block_count[next] == 0) {
+        p0_cur_slot = next;
+        p0_slot_gen[next] = ++p0_gen_seq;
+        __atomic_store_n(&ctx_ptr->p0_slot_gen[next], p0_slot_gen[next], __ATOMIC_RELEASE);
+        p0_ring_need_evict = false;
+        return true;
+    }
+    p0_ring_need_evict = true;
+    return false;
+}
+
 static bool part_full(int part) {
+    if (part == 0 && p0_ring_enabled) {
+        if (!p0_slot_full(p0_cur_slot))
+            return false;
+        u32 next = p0_next_ring_slot(p0_cur_slot);
+        if (p0_block_count[next] == 0)
+            return false; // can advance to empty ring slot inline without parking
+        p0_ring_need_evict = true;
+        return true;
+    }
     u32 *start = cc_base + part * CC_PART2_WORD;
     u32 first_map = part ? (OFF_PCMAP2 - OFF_PCMAP) / sizeof(PcMap) : 0;
-    return (u8 *)cc_cursor[part] - (u8 *)start > (long)(cc_limit - 0x80000) ||
+    u64 lim = part == 1 && cc_limit >= CC_SIZE ? CC_SIZE - (4ULL << 20) : cc_limit;
+    return (u8 *)cc_cursor[part] - (u8 *)start > (long)(lim - 0x80000) ||
            hblock_count[part] >= PART_BLOCKS_MAX(part) - 32 ||
            pc_map_used[part] + MAX_INSNS + 1024 >= first_map + PCMAP_ENTRIES;
 }
@@ -1076,6 +1179,8 @@ static bool reuse_dead_block(u32 key, int cpl, u64 rip, TrResult *res) {
     if (hb->compat != tr_compat) return reuse_rejected(TR_REUSE_COMPAT);
     if (!fetch_walk(rip, &gpa)) return reuse_rejected(TR_REUSE_FETCH);
     if ((gpa & ~0xfffULL) != hb->frame[0]) return reuse_rejected(TR_REUSE_FRAME);
+    if (hb->t2_has_loop && hb->t2_patch_word != hb->entry_word)
+        return reuse_rejected(TR_REUSE_SMP_ENTRY);
     if (ctx_ptr->vcpu_count > 1 && hb->first_word != WORD_NOP) // only a nop can come back under a peer running it
         return reuse_rejected(TR_REUSE_SMP_ENTRY);
     if (memcmp(ram_at(hb->frame[0] + hb->read_off), read_copies + hb->read_copy, hb->read_bytes))
@@ -1083,6 +1188,8 @@ static bool reuse_dead_block(u32 key, int cpl, u64 rip, TrResult *res) {
     u32 *entry = cc_base + hb->entry_word, dead = WORD_DEAD;
     if (!__atomic_compare_exchange_n(entry, &dead, hb->first_word, false, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
         return reuse_rejected(TR_REUSE_ENTRY_CAS); // something that ran into it has since been sent on to a newer block, for good
+    hb->t2_entry_word = 0;
+    hb->t2_meta_idx = 0;
     sys_icache_invalidate(entry, 4);
     if (entry[1] == 0x10000050u) {
         entry[3] = WORD_NOP;
@@ -1201,6 +1308,15 @@ static int est_insn_words(const Insn *in) {
 
 static void expand_forward_dag(Insn *list, int *count_p, int key, u64 entry_rip, u64 page) {
     int count = *count_p;
+    bool has_backedge = false;
+    for (int i = 0; i < count; i++) {
+        u8 op = list[i].op;
+        if ((op == OP_JCC || op == OP_JRCXZ || op == OP_JMP) &&
+            list[i].target >= entry_rip && list[i].target <= list[i].rip) {
+            has_backedge = true;
+            break;
+        }
+    }
     int max_dag_blocks = tr_cpl == 0 ? 4 : 6;
     int max_dag_insns = tr_cpl == 0 ? 96 : 144;
     u64 max_dag_span = tr_cpl == 0 ? 384 : 512;
@@ -1219,6 +1335,7 @@ static void expand_forward_dag(Insn *list, int *count_p, int key, u64 entry_rip,
     if (est_words >= max_est_words)
         return;
 
+    u64 loop_end = has_backedge ? list[count - 1].next : ~0ULL;
     u64 q[MAX_DAG_BLOCKS * 2];
     int qh = 0, qt = 0;
     for (int i = 0; i < count; i++) {
@@ -1226,7 +1343,7 @@ static void expand_forward_dag(Insn *list, int *count_p, int key, u64 entry_rip,
         if (op != OP_JCC && op != OP_JRCXZ && op != OP_JMP)
             continue;
         u64 t = list[i].target;
-        if (t <= list[i].rip || t < entry_rip || t >= entry_rip + max_dag_span)
+        if (t <= list[i].rip || t < entry_rip || t >= entry_rip + max_dag_span || t >= loop_end)
             continue;
         if ((t & ~0xfffULL) != page || (t & 0xfffULL) > 4096 - 16)
             continue;
@@ -1274,7 +1391,9 @@ static void expand_forward_dag(Insn *list, int *count_p, int key, u64 entry_rip,
             test_w += est_insn_words(in);
             spc = in->next;
             tc++;
-            if (insn_is_terminator(in))
+            if (insn_is_terminator(in) ||
+                (t2_enabled() && (in->op == OP_JCC || in->op == OP_JRCXZ) &&
+                 in->target >= entry_rip && in->target < in->rip))
                 break;
         }
         if (!ok || tc == 0)
@@ -1487,6 +1606,66 @@ static void update_zext(const Insn *in) {
     }
 }
 
+u8 tr_insn_reads(const Insn *in) { return (u8)insn_reads(in); }
+void tr_update_zext(const Insn *in) { update_zext(in); }
+bool tr_ad_page_safe_op(u8 op) { return ad_page_safe_op(op); }
+bool tr_is_monitor_or_stop_op(u8 op) { return is_monitor_or_stop_op(op); }
+
+static bool t2_loop_op_forbidden(const Insn *in) {
+    if (in->lock || is_monitor_or_stop_op(in->op))
+        return true;
+    switch (in->op) {
+        case OP_BAD: case OP_UD:
+        case OP_POPF: case OP_PUSHF: case OP_LAHF: case OP_SAHF:
+        case OP_X87: case OP_STRING:
+        case OP_CALL: case OP_CALLI: case OP_JMPI: case OP_RET:
+        case OP_ENTER: case OP_LEAVE: case OP_FAR:
+        case OP_PUSHA: case OP_XLAT:
+        case OP_CMPXCHG: case OP_XADD:
+            return true;
+        case OP_XCHG:
+            return in->memop;
+        default:
+            return false;
+    }
+}
+
+// Identify the innermost clean single-entry loop [head_i .. tail_i] eligible for Tier-2 OSR.
+static int t2_find_clean_loop(const Insn *list, int count, const int *tgt_idx) {
+    if (!t2_enabled() || count < 2)
+        return -1;
+    int best_head = -1, best_len = 9999;
+    for (int i = 0; i < count; i++) {
+        u8 op = list[i].op;
+        if (op != OP_JCC && op != OP_JRCXZ && op != OP_JMP)
+            continue;
+        int h = tgt_idx[i];
+        if (h < 0 || h > i)
+            continue;
+        int len = i - h + 1;
+        if (len < 2 || len > 64 || len >= best_len)
+            continue;
+        bool ok = true;
+        for (int j = h; j <= i; j++) {
+            if (t2_loop_op_forbidden(&list[j])) { ok = false; break; }
+            int tj = tgt_idx[j];
+            if (tj >= 0 && tj < h) { ok = false; break; }
+            if (tj > h && tj <= j) { ok = false; break; } // nested inner backedge
+        }
+        // Single-entry check: no instruction before h may jump strictly inside (h..i].
+        for (int j = 0; ok && j < h; j++) {
+            int tj = tgt_idx[j];
+            if (tj > h && tj <= i)
+                ok = false;
+        }
+        if (ok) {
+            best_head = h;
+            best_len = len;
+        }
+    }
+    return best_head;
+}
+
 static TrResult do_translate(int key, int view, u64 cr3, int cpl, u64 rip, bool single) {
     (void)view;
     u64 t0 = mach_absolute_time();
@@ -1506,7 +1685,29 @@ static TrResult do_translate(int key, int view, u64 cr3, int cpl, u64 rip, bool 
         res.flushed = true;
     }
     cur_part = KEY_PART(key);
-    tr_cc = cc_cursor[cur_part];
+    u32 alloc_slot = 0;
+    if (cur_part == 0 && p0_ring_enabled) {
+        if (!p0_try_advance_empty_slot()) {
+            if (ctx_ptr->vcpu_count > 1) {
+                res.needs_flush = true;
+                return res;
+            }
+            flush_everything();
+            res.flushed = true;
+        }
+        alloc_slot = p0_cur_slot;
+        tr_cc = p0_cc_cursor[alloc_slot];
+    } else {
+        // Linear mode: skip over CC_T2 mid-cache island when Tier-2 is enabled so T1 never collides with CC_T2.
+        if (t2_enabled()) {
+            u32 t2w = cur_part == 1 ? CC_T2_WORD1 : CC_T2_WORD0;
+            if (cc_cursor[cur_part] + 4096 >= cc_base + t2w &&
+                cc_cursor[cur_part] < cc_base + t2w + CC_T2_WORDS) {
+                cc_cursor[cur_part] = cc_base + t2w + CC_T2_WORDS;
+            }
+        }
+        tr_cc = cc_cursor[cur_part];
+    }
     int count = 0;
     u64 pc = rip, page = rip & ~0xfffULL, frame;
     if (!single) {
@@ -1560,6 +1761,9 @@ static TrResult do_translate(int key, int view, u64 cr3, int cpl, u64 rip, bool 
                 res.frames[1] = gpa1 & ~0xfffULL;
             break;
         }
+        if (!single && t2_enabled() && (in->op == OP_JCC || in->op == OP_JRCXZ) &&
+            in->target >= rip && in->target < in->rip)
+            break;
     } while (!single && count < MAX_INSNS && !insn_is_terminator(&list[count - 1]) && (pc & ~0xfffULL) == page);
 
     Insn *last = &list[count - 1];
@@ -1573,9 +1777,8 @@ static TrResult do_translate(int key, int view, u64 cr3, int cpl, u64 rip, bool 
     tr_aes_mask = 0;
     u32 *start = tr_cc;
     u32 *tail = tr_cc;
-    if (ctx_ptr->vcpu_count > 1) // a kill patches the entry word under peers running it: nop to svc is a change the architecture allows, an arbitrary word isn't
-        E(0xD503201Fu);
-    u32 map0 = pc_map_used[cur_part];
+    u32 *pcm_cursor_p = (cur_part == 0 && p0_ring_enabled) ? &p0_pcmap_used[alloc_slot] : &pc_map_used[cur_part];
+    u32 map0 = *pcm_cursor_p;
     if (native_dag && !single && count > 0 && count < MAX_INSNS && res.frames[1] == ~0ULL) {
         expand_forward_dag(list, &count, key, rip, page);
         insn_total = count;
@@ -1670,6 +1873,17 @@ static TrResult do_translate(int key, int view, u64 cr3, int cpl, u64 rip, bool 
         }
     }
 
+    int t2_head_i = (!single && (cpl == 3 || t2_eager_mode()) &&
+                     res.frames[1] == ~0ULL && res.frames[0] != ~0ULL && res.frames[0] < cfg.ram_size &&
+                     !tr_precise_flags && !cfg.all_flags_live && !cfg.profile_compile_inputs)
+                        ? t2_find_clean_loop(list, count, tgt_idx)
+                        : -1;
+    u32 t2_patch_word = ~0U;
+    if (ctx_ptr->vcpu_count > 1 || t2_head_i == 0) // a kill or Tier-2 OSR patches the entry NOP atomically
+        E(WORD_NOP);
+    if (t2_head_i == 0)
+        t2_patch_word = (u32)(start - cc_base);
+
     for (int i = 0; i < count; i++) {
         const Insn *in = &list[i];
         bool prev_fell_through = i > 0 && !is_uncond_term_op(list[i - 1].op) && list[i - 1].next == in->rip;
@@ -1698,14 +1912,24 @@ static TrResult do_translate(int key, int view, u64 cr3, int cpl, u64 rip, bool 
         }
         if (in->op != OP_SSE && tr_aes_mask)
             sse_aes_flush_all();
-        insn_arm[i] = tr_cc;
+        // Loop header OSR anchor: for head==0, backedges jump to start[0] (WORD_NOP);
+        // for head>0, emit WORD_NOP right at insn_arm[head] (canonical flushed state).
+        if (i == 0 && t2_head_i == 0) {
+            insn_arm[0] = start;
+        } else {
+            insn_arm[i] = tr_cc;
+        }
         if (i)
             stats.op_words[list[i - 1].op & 127] += (u64)(tr_cc - insn_arm[i - 1]);
         stats.op_insns[in->op & 127]++;
         if (!ext_ymm_cache_has_dirty()) {
-            pc_map[pc_map_used[cur_part]].arm_word = (u16)(tr_cc - start);
-            pc_map[pc_map_used[cur_part]].rip_off = (u16)(in->rip - rip);
-            pc_map_used[cur_part]++;
+            pc_map[*pcm_cursor_p].arm_word = (u16)(tr_cc - start);
+            pc_map[*pcm_cursor_p].rip_off = (u16)(in->rip - rip);
+            (*pcm_cursor_p)++;
+        }
+        if (i > 0 && i == t2_head_i) {
+            t2_patch_word = (u32)(tr_cc - cc_base);
+            E(WORD_NOP);
         }
         stats.insns++;
 
@@ -2151,12 +2375,22 @@ static TrResult do_translate(int key, int view, u64 cr3, int cpl, u64 rip, bool 
     }
 
     // Registers the block.
-    if (hblock_count[cur_part] >= PART_BLOCKS_MAX(cur_part)) {
-        fprintf(stderr, "engine stop: block table overflow part=%d count=%u max=%llu\n",
-                cur_part, hblock_count[cur_part], (unsigned long long)PART_BLOCKS_MAX(cur_part));
-        abort();
+    u32 idx;
+    if (cur_part == 0 && p0_ring_enabled) {
+        if (p0_block_count[alloc_slot] >= P0_BLOCKS_PER_SLOT) {
+            fprintf(stderr, "engine stop: p0 slot %u block table overflow count=%u max=%u\n",
+                    alloc_slot, p0_block_count[alloc_slot], P0_BLOCKS_PER_SLOT);
+            abort();
+        }
+        idx = alloc_slot * P0_BLOCKS_PER_SLOT + p0_block_count[alloc_slot]++;
+    } else {
+        if (hblock_count[cur_part] >= PART_BLOCKS_MAX(cur_part)) {
+            fprintf(stderr, "engine stop: block table overflow part=%d count=%u max=%llu\n",
+                    cur_part, hblock_count[cur_part], (unsigned long long)PART_BLOCKS_MAX(cur_part));
+            abort();
+        }
+        idx = BLOCK_BASE(cur_part) + hblock_count[cur_part]++;
     }
-    u32 idx = BLOCK_BASE(cur_part) + hblock_count[cur_part]++;
     HostBlock *hb = &hblocks[idx];
     memset(hb, 0, sizeof *hb);
     hb->rip = rip;
@@ -2165,8 +2399,11 @@ static TrResult do_translate(int key, int view, u64 cr3, int cpl, u64 rip, bool 
     hb->frame[0] = res.frames[0];
     hb->frame[1] = res.frames[1];
     hb->cpl = (u8)cpl;
+    hb->p0_slot = (u8)alloc_slot;
     hb->compat = tr_compat;
     hb->first_word = *start;
+    hb->t2_has_loop = t2_head_i >= 0;
+    hb->t2_patch_word = t2_patch_word;
     hb->on_frame = hb->on_page = hb->on_view = true;
     if (!single)
         remember_reads(hb, rip);
@@ -2177,17 +2414,47 @@ static TrResult do_translate(int key, int view, u64 cr3, int cpl, u64 rip, bool 
     be->arm_off = (u32)(start - cc_base);
     be->arm_words = (u32)(tr_cc - start);
     be->map_off = map0;
-    be->map_count = pc_map_used[cur_part] - map0;
+    be->map_count = *pcm_cursor_p - map0;
     if (!single) {
         map_insert((int)hb->view, rip, idx + 1);
         hb->registered = true;
     }
     __sync_synchronize();
-    ctx_ptr->block_count = hblock_count[0];
-    ctx_ptr->block_count_private = hblock_count[1];
-    cc_cursor[cur_part] = tr_cc;
+    if (cur_part == 0 && p0_ring_enabled) {
+        __atomic_store_n(&ctx_ptr->p0_slot_block_count[alloc_slot], (u64)p0_block_count[alloc_slot], __ATOMIC_RELEASE);
+        p0_cc_cursor[alloc_slot] = tr_cc;
+    } else {
+        if (cur_part == 0)
+            __atomic_store_n(&ctx_ptr->block_count, (u64)hblock_count[0], __ATOMIC_RELEASE);
+        else
+            __atomic_store_n(&ctx_ptr->block_count_private, (u64)hblock_count[1], __ATOMIC_RELEASE);
+        cc_cursor[cur_part] = tr_cc;
+    }
     sys_icache_invalidate(start, (u8 *)tr_cc - (u8 *)start);
     code_published();
+    if (t2_head_i >= 0 && t2_patch_word != ~0U) {
+        int t2_tail_i = t2_head_i;
+        for (int k = t2_head_i; k < count; k++) {
+            u8 op = list[k].op;
+            if ((op == OP_JCC || op == OP_JRCXZ || op == OP_JMP) && tgt_idx[k] == t2_head_i)
+                t2_tail_i = k;
+        }
+        u64 lo = list[t2_head_i].rip, hi = list[t2_head_i].next;
+        for (int k = t2_head_i; k <= t2_tail_i; k++) {
+            if (list[k].rip < lo) lo = list[k].rip;
+            if (list[k].next > hi) hi = list[k].next;
+        }
+        // Include up to 64 post-loop same-page bytes in the SMC-verified snapshot so Tier-2 can peek exit flag liveness!
+        u64 snap_hi = hi + 64 <= page + 4096 ? hi + 64 : page + 4096;
+        if ((lo & ~0xfffULL) == page && hi <= page + 4096 && hi > lo) {
+            u64 ep = __atomic_load_n(&t2_epoch[cur_part], __ATOMIC_RELAXED);
+            t2_register_loop(idx, (u32)cur_part, alloc_slot, hb->entry_word, be->arm_words,
+                             t2_patch_word, rip, list[t2_head_i].rip, res.frames[0],
+                             (u16)(lo & 0xfffULL), (u16)(snap_hi - lo), (u32)key, (u8)cpl, tr_compat, ep);
+            if (t2_eager_mode())
+                t2_eager_promote_now(idx);
+        }
+    }
     stats.blocks++;
     stats.words += tr_cc - start;
     stats.exit_words += (u64)(tr_cc - tail);
@@ -2598,6 +2865,7 @@ void tr_init(const TrConfig *config) {
     tr_opt_peep = !(no_peep && !strcmp(no_peep, "1"));
     const char *no_ymm = getenv("LC_HVDBT_NO_YMM_CACHE");
     tr_opt_ymm_cache = !(no_ymm && !strcmp(no_ymm, "1"));
+    const char *no_ring = getenv("LC_HVDBT_NO_P0_RING");
     cfg = *config;
     if (cfg.profile_invalidations && (mach_timebase_info(&invalidation_timebase) != KERN_SUCCESS || !invalidation_timebase.denom))
         cfg.profile_invalidations = false;
@@ -2608,6 +2876,8 @@ void tr_init(const TrConfig *config) {
     cc_cursor[1] = cc_base + CC_PART2_WORD;
     block_table = (BlockEntry *)(cfg.priv + OFF_BLOCKS);
     pc_map = (PcMap *)(cfg.priv + OFF_PCMAP);
+    t2_block_table = (BlockEntry *)(cfg.priv + OFF_BLOCKS_T2);
+    t2_pc_map = (PcMap *)(cfg.priv + OFF_PCMAP_T2);
     ctx_ptr = (EngineCtx *)(cfg.priv + OFF_CTX);
     compile_inputs_init();
     tr_precise_flags = cfg.precise_flags;
@@ -2622,6 +2892,31 @@ void tr_init(const TrConfig *config) {
     stats.retain_shared_dead_enabled = cfg.retain_shared_dead;
     stats.shared_dead_retained_hints = stats.shared_dead_cleared_hints = 0;
     cc_limit = cfg.code_cache_bytes ? cfg.code_cache_bytes : CC_SIZE;
+    p0_ring_enabled = !(no_ring && !strcmp(no_ring, "1")) && cc_limit >= CC_SIZE;
+    p0_cur_slot = 0;
+    p0_gen_seq = 1;
+    p0_ring_need_evict = false;
+    p0_ring_evictions = 0;
+    for (u32 s = 0; s < P0_SLOTS; s++) {
+        p0_cc_cursor[s] = cc_base + engine_p0_slot_word_base(s);
+        p0_block_count[s] = 0;
+        p0_pcmap_used[s] = s * P0_PCMAP_PER_SLOT;
+        p0_slot_gen[s] = s == 0 ? 1ULL : 0ULL;
+        ctx_ptr->p0_slot_gen[s] = p0_slot_gen[s];
+        ctx_ptr->p0_slot_block_count[s] = 0;
+    }
+    ctx_ptr->p0_ring_active = p0_ring_enabled ? 1U : 0U;
+    cc_t2_cursor[0] = cc_base + CC_T2_WORD0;
+    cc_t2_cursor[1] = cc_base + CC_T2_WORD1;
+    t2_block_cnt[0] = t2_block_cnt[1] = 0;
+    t2_pcmap_used[0] = 0;
+    t2_pcmap_used[1] = T2_PCMAP_ENTRIES;
+    t2_epoch[0] = t2_epoch[1] = 1;
+    ctx_ptr->t2_block_count[0] = ctx_ptr->t2_block_count[1] = 0;
+    free(t2_meta[0]);
+    free(t2_meta[1]);
+    t2_meta[0] = calloc(T2_BLOCKS_MAX, sizeof(T2BlockMeta));
+    t2_meta[1] = calloc(T2_BLOCKS_MAX, sizeof(T2BlockMeta));
     tr_stub_lookup = cfg.stub_lookup;
     tr_stub_ret_miss = cfg.stub_ret_miss;
     tr_stub_pushf = cfg.stub_pushf;
@@ -2644,6 +2939,87 @@ void tr_init(const TrConfig *config) {
     dead_slots = calloc(DEAD_SLOTS, sizeof(u32));
     read_copies = mmap(NULL, READ_COPY_BYTES, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
     page_head = calloc(PAGE_HEADS, sizeof(u32));
+    t2_init(&cfg, ctx_ptr, cc_base);
+}
+
+bool tr_t2_publish(u32 t1_idx, u32 part, u32 p0_slot, u64 start_epoch, u64 head_rip,
+                   u32 key, u8 cpl, bool compat, u32 patch_word, u64 frame0,
+                   u16 snap_off, u16 snap_len, const u8 *snap_bytes,
+                   const u32 *code, u32 code_words, const PcMap *pcm, u32 pcm_count) {
+    if (part > 1 || !code_words || !pcm_count || !t2_meta[part])
+        return false;
+    pthread_mutex_lock(&t2_pub_lock);
+    bool ok = false;
+    if (t2_epoch[part] != start_epoch)
+        goto out;
+    if (t1_idx >= BLOCKS_MAX + BLOCKS_MAX_PRIV)
+        goto out;
+    HostBlock *hb = &hblocks[t1_idx];
+    if (hb->dead || hb->t2_entry_word != 0 || hb->t2_patch_word != patch_word || hb->frame[0] != frame0)
+        goto out;
+    if (frame0 >= cfg.ram_size || memcmp(ram_at(frame0 + snap_off), snap_bytes, snap_len) != 0)
+        goto out;
+    u32 t2_word_base = part ? CC_T2_WORD1 : CC_T2_WORD0;
+    u32 *t2_end = cc_base + t2_word_base + CC_T2_WORDS;
+    u32 *t2_start = cc_t2_cursor[part];
+    u32 pcm_base = part ? T2_PCMAP_ENTRIES : 0;
+    if (t2_start + code_words > t2_end ||
+        t2_block_cnt[part] >= T2_BLOCKS_MAX ||
+        t2_pcmap_used[part] + pcm_count > pcm_base + T2_PCMAP_ENTRIES)
+        goto out;
+    u32 *t1_patch = cc_base + patch_word;
+    i64 dist = t2_start - t1_patch;
+    if (dist < -(1 << 25) || dist >= (1 << 25))
+        goto out;
+
+    memcpy(t2_start, code, (size_t)code_words * 4);
+    u32 map0 = t2_pcmap_used[part];
+    memcpy(&t2_pc_map[map0], pcm, (size_t)pcm_count * sizeof(PcMap));
+    t2_pcmap_used[part] = map0 + pcm_count;
+
+    u32 bi = t2_block_cnt[part];
+    BlockEntry *be = &t2_block_table[part * T2_BLOCKS_MAX + bi];
+    be->rip = head_rip;
+    be->key = key;
+    be->arm_off = (u32)(t2_start - cc_base);
+    be->arm_words = code_words;
+    be->map_off = map0;
+    be->map_count = pcm_count;
+    be->pad = 0;
+
+    T2BlockMeta *m = &t2_meta[part][bi];
+    m->rip = head_rip;
+    m->view = key;
+    m->entry_word = be->arm_off;
+    m->arm_words = code_words;
+    m->t1_idx = t1_idx;
+    m->cpl = cpl;
+    m->p0_slot = (u8)p0_slot;
+    m->compat = compat;
+    m->dead = false;
+
+    t2_block_cnt[part] = bi + 1U;
+    cc_t2_cursor[part] = t2_start + code_words;
+    __atomic_store_n(&ctx_ptr->t2_block_count[part], (u64)(bi + 1U), __ATOMIC_RELEASE);
+    sys_icache_invalidate(t2_start, (size_t)code_words * 4);
+    code_published();
+
+    u32 expected = WORD_NOP;
+    u32 branch = 0x14000000u | ((u32)dist & 0x3ffffffu);
+    if (__atomic_compare_exchange_n(t1_patch, &expected, branch, false, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
+        sys_icache_invalidate(t1_patch, 4);
+        hb->t2_entry_word = be->arm_off;
+        hb->t2_meta_idx = bi + 1U;
+        ok = true;
+    } else {
+        // Entry was killed concurrently; poison T2 entry so it stays dead.
+        *t2_start = WORD_DEAD;
+        sys_icache_invalidate(t2_start, 4);
+        m->dead = true;
+    }
+out:
+    pthread_mutex_unlock(&t2_pub_lock);
+    return ok;
 }
 
 static TrResult translate(int view, uint64_t cr3, int cpl, bool compat, uint64_t rip, bool single) {
@@ -2680,10 +3056,35 @@ TrResult tr_translate_native(int view, uint64_t cr3, int cpl, bool compat, uint6
     return translate(view, cr3, cpl, compat, rip, single);
 }
 
-// The block holding a code cache word. Blocks only grow upward, so the table is sorted.
+// The block holding a code cache word. Blocks only grow upward within each slot/part, so each slice is sorted.
 static HostBlock *block_at(u32 word) {
-    int part = word >= CC_PART2_WORD;
-    u32 first = BLOCK_BASE(part), lo = first, hi = first + hblock_count[part];
+    if (word >= CC_PART2_WORD) {
+        u32 first = BLOCK_BASE(1), lo = first, hi = first + hblock_count[1];
+        while (lo < hi) {
+            u32 mid = (lo + hi) / 2;
+            if (hblocks[mid].entry_word <= word)
+                lo = mid + 1;
+            else
+                hi = mid;
+        }
+        return lo != first ? &hblocks[lo - 1] : 0;
+    }
+    if (p0_ring_enabled) {
+        int slot = engine_p0_slot_of_word(word);
+        if (slot < 0)
+            return 0;
+        u32 first = (u32)slot * P0_BLOCKS_PER_SLOT;
+        u32 lo = first, hi = first + p0_block_count[slot];
+        while (lo < hi) {
+            u32 mid = (lo + hi) / 2;
+            if (hblocks[mid].entry_word <= word)
+                lo = mid + 1;
+            else
+                hi = mid;
+        }
+        return lo != first ? &hblocks[lo - 1] : 0;
+    }
+    u32 lo = 0, hi = hblock_count[0];
     while (lo < hi) {
         u32 mid = (lo + hi) / 2;
         if (hblocks[mid].entry_word <= word)
@@ -2691,32 +3092,113 @@ static HostBlock *block_at(u32 word) {
         else
             hi = mid;
     }
-    return lo != first ? &hblocks[lo - 1] : 0;
+    return lo != 0 ? &hblocks[lo - 1] : 0;
 }
 
-// A cross-key transfer cannot bind permanently to one view's ARM target. Give
-// calls AND jumps an ordinary view lookup instead of trapping on every visit.
-// The lookup preserves NZCV; keep LR too, whether the original site was BL or
-// a jump stub. Nothing else enters this tail: interrupted tails are stepped
-// through in the same way as the existing call and lookup stubs.
+typedef struct {
+    u64 rip;
+    u32 view;
+    u8 cpl;
+    u8 p0_slot;
+    u8 part;
+    bool compat;
+    bool valid;
+} BlockInfo;
+
+static BlockInfo block_info_at(u32 word) {
+    BlockInfo bi = {0};
+    if ((word >= CC_T2_WORD0 && word < CC_T2_WORD0 + CC_T2_WORDS) ||
+        (word >= CC_T2_WORD1 && word < CC_T2_WORD1 + CC_T2_WORDS)) {
+        u32 part = word >= CC_PART2_WORD ? 1U : 0U;
+        u32 cnt = (u32)__atomic_load_n(&ctx_ptr->t2_block_count[part], __ATOMIC_ACQUIRE);
+        T2BlockMeta *arr = t2_meta[part];
+        if (arr && cnt > 0) {
+            u32 lo = 0, hi = cnt;
+            while (lo < hi) {
+                u32 mid = (lo + hi) / 2;
+                if (arr[mid].entry_word <= word)
+                    lo = mid + 1;
+                else
+                    hi = mid;
+            }
+            if (lo > 0) {
+                T2BlockMeta *m = &arr[lo - 1];
+                if (word < m->entry_word + m->arm_words) {
+                    bi.rip = m->rip;
+                    bi.view = m->view;
+                    bi.cpl = m->cpl;
+                    bi.p0_slot = m->p0_slot;
+                    bi.part = (u8)part;
+                    bi.compat = m->compat;
+                    bi.valid = true;
+                    return bi;
+                }
+            }
+        }
+    }
+    HostBlock *hb = block_at(word);
+    if (!hb)
+        return bi;
+    bi.rip = hb->rip;
+    bi.view = hb->view;
+    bi.cpl = hb->cpl;
+    bi.p0_slot = hb->p0_slot;
+    bi.part = word >= CC_PART2_WORD ? 1U : 0U;
+    bi.compat = hb->compat;
+    bi.valid = true;
+    return bi;
+}
+
+// A cross-key or cross-generation transfer cannot bind permanently via direct B/BL.
+// Give calls AND jumps an inline L1 / view lookup tail instead of trapping on every visit.
 void tr_lookup_tail(uint64_t site, uint64_t target) {
     u32 *s = cc_host(site), was = *s;
     bool call = (was & 0xFC000000u) == 0x94000000u;
     bool jump = was == (0xD4000001u | SVC_DIRECT << 5) || was == (0xD4000001u | SVC_JCC << 5);
     if (!call && !jump)
         return;
-    HostBlock *from = block_at((u32)(s - cc_base));
-    cur_part = (u32)(s - cc_base) >= CC_PART2_WORD; // in reach of its site
-    i64 d_chk = (i64)(cc_cursor[cur_part] - s);
+    u32 s_word = (u32)(s - cc_base);
+    BlockInfo from = block_info_at(s_word);
+    cur_part = s_word >= CC_PART2_WORD; // in reach of its site
+    u32 **cursor_p;
+    u32 *limit_end;
+    if (cur_part == 0 && p0_ring_enabled) {
+        u32 slot = from.valid ? from.p0_slot : p0_cur_slot;
+        cursor_p = &p0_cc_cursor[slot];
+        limit_end = cc_base + engine_p0_slot_word_base(slot) + P0_SLOT_WORDS;
+        // Lifetime-safe overflow fallback: if from's own slot tail headroom filled up,
+        // spill into p0_cur_slot whenever p0_cur_slot outlives from and is within ±128 MiB of s.
+        if (*cursor_p + 32 > limit_end && p0_cur_slot != slot &&
+            p0_slot_gen[p0_cur_slot] >= p0_slot_gen[slot]) {
+            u32 *alt_lim = cc_base + engine_p0_slot_word_base(p0_cur_slot) + P0_SLOT_WORDS;
+            i64 alt_d = (i64)(p0_cc_cursor[p0_cur_slot] - s);
+            if (p0_cc_cursor[p0_cur_slot] + 32 <= alt_lim &&
+                alt_d >= -(1 << 25) && alt_d < (1 << 25)) {
+                cursor_p = &p0_cc_cursor[p0_cur_slot];
+                limit_end = alt_lim;
+            }
+        }
+    } else {
+        if (t2_enabled()) {
+            u32 t2w = cur_part == 1 ? CC_T2_WORD1 : CC_T2_WORD0;
+            if (cc_cursor[cur_part] + 64 >= cc_base + t2w &&
+                cc_cursor[cur_part] < cc_base + t2w + CC_T2_WORDS) {
+                cc_cursor[cur_part] = cc_base + t2w + CC_T2_WORDS;
+            }
+        }
+        cursor_p = &cc_cursor[cur_part];
+        u64 lim = cur_part == 1 && cc_limit >= CC_SIZE ? CC_SIZE - (4ULL << 20) : cc_limit;
+        limit_end = cc_base + cur_part * CC_PART2_WORD + (u32)(lim / 4ULL);
+    }
+    i64 d_chk = (i64)(*cursor_p - s);
     if (d_chk < -(1 << 25) || d_chk >= (1 << 25))
         return;
-    u32 *part_start = cc_base + cur_part * CC_PART2_WORD;
-    if ((u64)((u8 *)cc_cursor[cur_part] - (u8 *)part_start) + 128 > cc_limit)
+    if (*cursor_p + 32 > limit_end)
         return;
-    tr_cc = cc_cursor[cur_part];
+    tr_cc = *cursor_p;
     u32 *tail = tr_cc;
     movimm(S0, target);
-    if (from && use_native_l1(from->cpl, from->compat) && target != 0) {
+    if (from.valid && use_native_l1(from.cpl, from.compat) && target != 0) {
         // Constant-folded inline per-vCPU L1 probe: preserves NZCV and LR on hit.
         u32 slot = (u32)((target ^ (target >> 4)) & (FEX_L1_ENTRIES - 1));
         u32 byte_off = slot << 4;
@@ -2743,7 +3225,7 @@ void tr_lookup_tail(uint64_t site, uint64_t target) {
         mov_reg(1, LR, S4);
         br(S2);
     }
-    cc_cursor[cur_part] = tr_cc;
+    *cursor_p = tr_cc;
     sys_icache_invalidate(tail, (u8 *)tr_cc - (u8 *)tail);
     code_published();
     i64 d = tail - s;
@@ -2758,20 +3240,26 @@ void tr_lookup_tail(uint64_t site, uint64_t target) {
 
 void tr_link(uint64_t site, int kind, uint64_t arm, int key) {
     u32 *s = cc_host(site);
-    // A link is forever, so it may only join blocks of one domain: a chain from shared code into one view's code would be wrong in the next.
-    HostBlock *from = block_at((u32)(s - cc_base));
+    // A link is forever, so it may only join blocks of one domain and safe ring generation order.
+    BlockInfo from = block_info_at((u32)(s - cc_base));
     u32 was = *s;
-    if (from && (int)from->view != key && (kind == SVC_CALL || kind == SVC_DIRECT || kind == SVC_JCC)) {
-        HostBlock *to = block_at((u32)(cc_host(arm) - cc_base));
-        if (to)
-            tr_lookup_tail(site, to->rip);
+    BlockInfo to = block_info_at((u32)(cc_host(arm) - cc_base));
+    bool bad_ring_order = p0_ring_enabled && from.valid && to.valid && from.part == 0 && to.part == 0 &&
+                          p0_slot_gen[from.p0_slot] > p0_slot_gen[to.p0_slot];
+    if (from.valid && ((int)from.view != key || bad_ring_order) &&
+        (kind == SVC_CALL || kind == SVC_DIRECT || kind == SVC_JCC)) {
+        if (to.valid)
+            tr_lookup_tail(site, to.rip);
         return;
     }
-    if (!from || (int)from->view != key || site == arm || (kind != SVC_CALL && (was & 0xFFE0001Fu) != 0xD4000001u)) // a dead block's entry may have come back: that site runs on as it is
+    if (!from.valid || (int)from.view != key || site == arm || (kind != SVC_CALL && (was & 0xFFE0001Fu) != 0xD4000001u))
         return;
     i64 d = ((i64)arm - (i64)site) >> 2;
-    if (d < -(1 << 25) || d >= (1 << 25)) // the parts of the cache are out of reach of each other
+    if (d < -(1 << 25) || d >= (1 << 25)) {
+        if (to.valid && (kind == SVC_CALL || kind == SVC_DIRECT || kind == SVC_JCC))
+            tr_lookup_tail(site, to.rip);
         return;
+    }
     if (!__atomic_compare_exchange_n(s, &was, (kind == SVC_CALL ? 0x94000000u : 0x14000000u) | ((u32)d & 0x3ffffff), false, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
         return;
     sys_icache_invalidate(s, 4);
@@ -3004,21 +3492,45 @@ static void kill_block(u32 idx) {
         fex_l1_remove_rip(hb->rip);
     // Keep eager removal of every lookup to this entry and entry poisoning: SVC_DEAD starts with view_lookup,
     // and dead-block reuse can revive an entry. Conservative membership never makes lookup entries lazy.
+    bool has_t2 = hb->t2_has_loop || hb->t2_entry_word != 0;
+    if (has_t2)
+        pthread_mutex_lock(&t2_pub_lock);
     u32 *entry = cc_base + hb->entry_word;
     *entry = WORD_DEAD;
+    u32 *t1_patch = (hb->t2_has_loop && hb->t2_patch_word != ~0U && hb->t2_patch_word != hb->entry_word)
+                        ? (cc_base + hb->t2_patch_word) : NULL;
+    if (t1_patch)
+        *t1_patch = WORD_DEAD;
+    u32 *t2_entry = hb->t2_entry_word ? (cc_base + hb->t2_entry_word) : NULL;
+    if (t2_entry) {
+        *t2_entry = WORD_DEAD;
+        u32 part = idx >= BLOCK_BASE(1) ? 1U : 0U;
+        if (hb->t2_meta_idx && t2_meta[part] && hb->t2_meta_idx <= T2_BLOCKS_MAX)
+            t2_meta[part][hb->t2_meta_idx - 1].dead = true;
+        hb->t2_entry_word = 0;
+        hb->t2_meta_idx = 0;
+    }
     bool is_fex = entry[1] == 0x10000050u;
     if (is_fex)
         entry[3] = WORD_DEAD;
     if (sample) {
         u64 began = mach_absolute_time();
         sys_icache_invalidate(entry, 4);
+        if (t1_patch) sys_icache_invalidate(t1_patch, 4);
+        if (t2_entry) sys_icache_invalidate(t2_entry, 4);
         if (is_fex)
             sys_icache_invalidate(entry + 3, 4);
         stats.invalidation_icache_ns += invalidation_ns(mach_absolute_time() - began);
     } else {
         sys_icache_invalidate(entry, 4);
+        if (t1_patch) sys_icache_invalidate(t1_patch, 4);
+        if (t2_entry) sys_icache_invalidate(t2_entry, 4);
         if (is_fex)
             sys_icache_invalidate(entry + 3, 4);
+    }
+    if (has_t2) {
+        pthread_mutex_unlock(&t2_pub_lock);
+        t2_on_kill(idx);
     }
     stats.invalidated++;
     if (hb->read_bytes)
@@ -3149,10 +3661,10 @@ void tr_flush_all(void) {
 }
 
 // After new code is written and its cache maintenance done, before any lookup or
-// link can lead another vCPU there: see EngineCtx.code_gen. Under the translator lock.
+// link can lead another vCPU there: see EngineCtx.code_gen. Safe from Tier-1 & Tier-2.
 static void code_published(void) {
     static u64 generation;
-    u64 g = ++generation;
+    u64 g = __atomic_add_fetch(&generation, 1, __ATOMIC_RELAXED);
     u32 vc = ctx_ptr->vcpu_count ? ctx_ptr->vcpu_count : 1;
     if (vc > MAX_VCPUS)
         vc = MAX_VCPUS;
@@ -3169,14 +3681,138 @@ static void clear_code(u32 *from, u32 *to) {
 }
 
 void tr_flush_parked(bool everything) {
-    everything = everything || part_full(0);
-    fprintf(stderr, "[hvdbt-flush] all=%d p0(cc=%ld/%llu blk=%u/%llu pcm=%u/%zu) p1(cc=%ld/%llu blk=%u/%llu pcm=%u/%zu)\n",
+    bool ring_evict = p0_ring_enabled && p0_ring_need_evict;
+    if (ring_evict) {
+        // Part 0 4-slot ring wrap: recycle ONLY the oldest 61 MiB slot (25%), keeping 3 newest slots (183 MiB) + live T2 hot loops!
+        u32 victim = p0_next_ring_slot(p0_cur_slot);
+        bool reset_p1 = part_full(1);
+        pthread_mutex_lock(&t2_pub_lock);
+        t2_epoch[0]++;
+        if (reset_p1)
+            t2_epoch[1]++;
+
+        u32 v_word_base = engine_p0_slot_word_base(victim);
+        fprintf(stderr, "[hvdbt-ring-evict] victim=%u gen=%llu->%llu evictions=%llu slot_cc=%ld/%llu slot_blk=%u/%u reset_p1=%d\n",
+                victim, (unsigned long long)p0_slot_gen[victim], (unsigned long long)(p0_gen_seq + 1),
+                (unsigned long long)(p0_ring_evictions + 1),
+                (long)((u8 *)p0_cc_cursor[victim] - (u8 *)(cc_base + v_word_base)), (unsigned long long)P0_SLOT_BYTES,
+                p0_block_count[victim], P0_BLOCKS_PER_SLOT, reset_p1 ? 1 : 0);
+
+        ctx_ptr->tr_flushed = 1;
+        memset(frame_head, 0, (cfg.ram_size >> 12) * sizeof(u32));
+        memset(page_head, 0, PAGE_HEADS * sizeof(u32));
+        memset(view_head, 0, sizeof view_head);
+        memset(block_map, 0, MAP_SIZE * sizeof(MapEntry));
+        memset(dead_slots, 0, DEAD_SLOTS * sizeof(u32));
+        for (int v = 0; v <= view_high; v++)
+            memset(hash_table(v), 0, HASH_BYTES);
+        memset(cfg.priv + OFF_FEX_L1, 0, MAX_VCPUS * FEX_L1_BYTES);
+        memset(hash_slots_used, 0, sizeof hash_slots_used);
+        membership_clear_all();
+
+        // Poison only CC_T2 part 0 entries belonging to the evicted victim slot; surviving slots' T2 loops stay hot.
+        if (t2_meta[0]) {
+            for (u32 k = 0; k < t2_block_cnt[0]; k++) {
+                if (!t2_meta[0][k].dead && t2_meta[0][k].p0_slot == victim) {
+                    u32 *e = cc_base + t2_meta[0][k].entry_word;
+                    *e = WORD_DEAD;
+                    sys_icache_invalidate(e, 4);
+                    t2_meta[0][k].dead = true;
+                }
+            }
+        }
+
+        clear_code(cc_base + v_word_base, p0_cc_cursor[victim]);
+        p0_cc_cursor[victim] = cc_base + v_word_base;
+        p0_block_count[victim] = 0;
+        p0_pcmap_used[victim] = victim * P0_PCMAP_PER_SLOT;
+        __atomic_store_n(&ctx_ptr->p0_slot_block_count[victim], 0ULL, __ATOMIC_RELEASE);
+
+        if (reset_p1) {
+            clear_code(cc_base + CC_PART2_WORD, cc_cursor[1]);
+            clear_code(cc_base + CC_T2_WORD1, cc_t2_cursor[1]);
+            cc_cursor[1] = cc_base + CC_PART2_WORD;
+            hblock_count[1] = 0;
+            pc_map_used[1] = (OFF_PCMAP2 - OFF_PCMAP) / sizeof(PcMap);
+            read_copied[1] = READ_COPY_BYTES / 2;
+            __atomic_store_n(&ctx_ptr->block_count_private, 0ULL, __ATOMIC_RELEASE);
+            cc_t2_cursor[1] = cc_base + CC_T2_WORD1;
+            t2_block_cnt[1] = 0;
+            t2_pcmap_used[1] = T2_PCMAP_ENTRIES;
+            __atomic_store_n(&ctx_ptr->t2_block_count[1], 0ULL, __ATOMIC_RELEASE);
+            stats.cache_private_resets++;
+        } else {
+            for (u32 i = 0; i < hblock_count[1]; i++) {
+                u32 idx = BLOCK_BASE(1) + i;
+                HostBlock *hb = &hblocks[idx];
+                if (hb->dead) {
+                    hb->on_frame = hb->on_page = hb->on_view = false;
+                    continue;
+                }
+                link_block(idx);
+                if (hb->registered)
+                    map_insert((int)hb->view, hb->rip, idx + 1);
+            }
+        }
+
+        // Re-link all surviving live blocks from the other 3 p0 ring slots.
+        for (u32 s = 0; s < P0_SLOTS; s++) {
+            if (s == victim)
+                continue;
+            u32 base = s * P0_BLOCKS_PER_SLOT;
+            for (u32 i = 0; i < p0_block_count[s]; i++) {
+                u32 idx = base + i;
+                HostBlock *hb = &hblocks[idx];
+                if (hb->dead) {
+                    hb->on_frame = hb->on_page = hb->on_view = false;
+                    continue;
+                }
+                link_block(idx);
+                if (hb->registered)
+                    map_insert((int)hb->view, hb->rip, idx + 1);
+            }
+        }
+
+        p0_cur_slot = victim;
+        p0_slot_gen[victim] = ++p0_gen_seq;
+        __atomic_store_n(&ctx_ptr->p0_slot_gen[victim], p0_slot_gen[victim], __ATOMIC_RELEASE);
+        p0_ring_need_evict = false;
+        p0_ring_evictions++;
+        u64 ep0 = t2_epoch[0], ep1 = t2_epoch[1];
+        pthread_mutex_unlock(&t2_pub_lock);
+        t2_on_flush(false, (int)victim, ep0, ep1);
+        if (reset_p1)
+            t2_on_flush(false, -1, ep0, ep1);
+        return;
+    }
+
+    everything = everything || (!p0_ring_enabled && part_full(0));
+    u64 p0_cc_bytes = 0;
+    u32 p0_blks = 0, p0_pcm = 0;
+    if (p0_ring_enabled) {
+        for (u32 s = 0; s < P0_SLOTS; s++) {
+            p0_cc_bytes += (u64)((u8 *)p0_cc_cursor[s] - (u8 *)(cc_base + engine_p0_slot_word_base(s)));
+            p0_blks += p0_block_count[s];
+            p0_pcm += p0_pcmap_used[s] - s * P0_PCMAP_PER_SLOT;
+        }
+    } else {
+        p0_cc_bytes = (u64)((u8 *)cc_cursor[0] - (u8 *)cc_base);
+        p0_blks = hblock_count[0];
+        p0_pcm = pc_map_used[0];
+    }
+    fprintf(stderr, "[hvdbt-flush] all=%d p0(cc=%llu/%llu blk=%u/%llu pcm=%u/%zu) p1(cc=%ld/%llu blk=%u/%llu pcm=%u/%zu)\n",
             everything ? 1 : 0,
-            (long)((u8 *)cc_cursor[0] - (u8 *)cc_base), (unsigned long long)cc_limit,
-            hblock_count[0], (unsigned long long)PART_BLOCKS_MAX(0), pc_map_used[0], (size_t)PCMAP_ENTRIES,
+            (unsigned long long)p0_cc_bytes, (unsigned long long)cc_limit,
+            p0_blks, (unsigned long long)PART_BLOCKS_MAX(0), p0_pcm, (size_t)PCMAP_ENTRIES,
             (long)((u8 *)cc_cursor[1] - (u8 *)(cc_base + CC_PART2_WORD)), (unsigned long long)cc_limit,
             hblock_count[1], (unsigned long long)PART_BLOCKS_MAX(1),
             pc_map_used[1] - (u32)((OFF_PCMAP2 - OFF_PCMAP) / sizeof(PcMap)), (size_t)PCMAP_ENTRIES);
+
+    pthread_mutex_lock(&t2_pub_lock);
+    t2_epoch[1]++;
+    if (everything)
+        t2_epoch[0]++;
+
     ctx_ptr->tr_flushed = 1;
     memset(frame_head, 0, (cfg.ram_size >> 12) * sizeof(u32));
     memset(page_head, 0, PAGE_HEADS * sizeof(u32));
@@ -3193,34 +3829,84 @@ void tr_flush_parked(bool everything) {
     // in place that stale fetch would run silently. A zero traps, and the
     // monitor retries it once after synchronizing.
     clear_code(cc_base + CC_PART2_WORD, cc_cursor[1]);
-    if (everything)
-        clear_code(cc_base, cc_cursor[0]);
+    clear_code(cc_base + CC_T2_WORD1, cc_t2_cursor[1]);
+    if (everything) {
+        if (p0_ring_enabled) {
+            for (u32 s = 0; s < P0_SLOTS; s++)
+                clear_code(cc_base + engine_p0_slot_word_base(s), p0_cc_cursor[s]);
+        } else {
+            clear_code(cc_base, cc_cursor[0]);
+        }
+        clear_code(cc_base + CC_T2_WORD0, cc_t2_cursor[0]);
+    }
     cc_cursor[1] = cc_base + CC_PART2_WORD;
     hblock_count[1] = 0;
     pc_map_used[1] = (OFF_PCMAP2 - OFF_PCMAP) / sizeof(PcMap);
     read_copied[1] = READ_COPY_BYTES / 2;
-    ctx_ptr->block_count_private = 0;
+    __atomic_store_n(&ctx_ptr->block_count_private, 0ULL, __ATOMIC_RELEASE);
+    cc_t2_cursor[1] = cc_base + CC_T2_WORD1;
+    t2_block_cnt[1] = 0;
+    t2_pcmap_used[1] = T2_PCMAP_ENTRIES;
+    __atomic_store_n(&ctx_ptr->t2_block_count[1], 0ULL, __ATOMIC_RELEASE);
     if (everything) {
         stats.cache_resets++;
         cc_cursor[0] = cc_base;
         hblock_count[0] = 0;
         pc_map_used[0] = 0;
         read_copied[0] = 1;
-        ctx_ptr->block_count = 0;
+        __atomic_store_n(&ctx_ptr->block_count, 0ULL, __ATOMIC_RELEASE);
+        p0_cur_slot = 0;
+        p0_gen_seq = 1;
+        p0_ring_need_evict = false;
+        for (u32 s = 0; s < P0_SLOTS; s++) {
+            p0_cc_cursor[s] = cc_base + engine_p0_slot_word_base(s);
+            p0_block_count[s] = 0;
+            p0_pcmap_used[s] = s * P0_PCMAP_PER_SLOT;
+            p0_slot_gen[s] = s == 0 ? 1ULL : 0ULL;
+            __atomic_store_n(&ctx_ptr->p0_slot_gen[s], p0_slot_gen[s], __ATOMIC_RELEASE);
+            __atomic_store_n(&ctx_ptr->p0_slot_block_count[s], 0ULL, __ATOMIC_RELEASE);
+        }
+        cc_t2_cursor[0] = cc_base + CC_T2_WORD0;
+        t2_block_cnt[0] = 0;
+        t2_pcmap_used[0] = 0;
+        __atomic_store_n(&ctx_ptr->t2_block_count[0], 0ULL, __ATOMIC_RELEASE);
+        u64 ep0 = t2_epoch[0], ep1 = t2_epoch[1];
+        pthread_mutex_unlock(&t2_pub_lock);
+        t2_on_flush(true, -1, ep0, ep1);
         return;
     }
     stats.cache_private_resets++;
     // The shared part stays, and finds its way back onto what was just emptied. Its dead blocks stay off, as a kill took them.
-    for (u32 idx = 0; idx < hblock_count[0]; idx++) {
-        HostBlock *hb = &hblocks[idx];
-        if (hb->dead) {
-            hb->on_frame = hb->on_page = hb->on_view = false;
-            continue;
+    if (p0_ring_enabled) {
+        for (u32 s = 0; s < P0_SLOTS; s++) {
+            u32 base = s * P0_BLOCKS_PER_SLOT;
+            for (u32 i = 0; i < p0_block_count[s]; i++) {
+                u32 idx = base + i;
+                HostBlock *hb = &hblocks[idx];
+                if (hb->dead) {
+                    hb->on_frame = hb->on_page = hb->on_view = false;
+                    continue;
+                }
+                link_block(idx);
+                if (hb->registered)
+                    map_insert((int)hb->view, hb->rip, idx + 1);
+            }
         }
-        link_block(idx);
-        if (hb->registered)
-            map_insert((int)hb->view, hb->rip, idx + 1);
+    } else {
+        for (u32 idx = 0; idx < hblock_count[0]; idx++) {
+            HostBlock *hb = &hblocks[idx];
+            if (hb->dead) {
+                hb->on_frame = hb->on_page = hb->on_view = false;
+                continue;
+            }
+            link_block(idx);
+            if (hb->registered)
+                map_insert((int)hb->view, hb->rip, idx + 1);
+        }
     }
+    u64 ep0 = t2_epoch[0], ep1 = t2_epoch[1];
+    pthread_mutex_unlock(&t2_pub_lock);
+    t2_on_flush(false, -1, ep0, ep1);
 }
 
 TrStats tr_stats(void) { return stats; }
