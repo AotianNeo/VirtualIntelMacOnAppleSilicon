@@ -211,6 +211,16 @@ void *qemu_anon_ram_alloc(size_t size, uint64_t *alignment, bool shared,
     const uint32_t qemu_map_flags = (shared ? QEMU_MAP_SHARED : 0) |
                                     (noreserve ? QEMU_MAP_NORESERVE : 0);
     size_t align = QEMU_VMALLOC_ALIGN;
+#if defined(__APPLE__) && defined(__aarch64__)
+    if (size >= (2ULL << 20)) {
+        const char *no_hp = getenv("LC_HVDBT_NO_HUGEPAGES");
+        if (!(no_hp && no_hp[0] == '1' && no_hp[1] == '\0')) {
+            if (align < (2ULL << 20)) {
+                align = 2ULL << 20;
+            }
+        }
+    }
+#endif
 #ifndef EMSCRIPTEN
     void *ptr = qemu_ram_mmap(-1, size, align, qemu_map_flags, 0);
 

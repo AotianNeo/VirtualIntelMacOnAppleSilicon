@@ -461,6 +461,13 @@ typedef struct {
     uint32_t t2_sample_head;
     uint32_t t2_sample_pad;
     uint64_t t2_sample_ring[T2_SAMPLE_RING];
+    // Stage-1 huge pages (2 MiB L2 Block + 64 KiB PTE_CONT). Append-only.
+    uint32_t hugepages_disabled; // bit 0: disable 2 MiB L2 block, bit 1: disable 64 KiB PTE_CONT
+    uint32_t hugepages_pad;
+    uint64_t stat_hp_2m_fills;
+    uint64_t stat_hp_2m_splits;
+    uint64_t stat_hp_64k_fills;
+    uint64_t stat_hp_64k_breaks;
 } EngineCtx;
 _Static_assert(sizeof(EngineCtx) <= 32768, "EngineCtx must stay below the +32 KB per-vCPU scratch region");
 _Static_assert(sizeof(EngineCtx) <= CTX_SLOT, "EngineCtx must fit its existing per-vCPU slot");

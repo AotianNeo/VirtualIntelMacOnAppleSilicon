@@ -616,7 +616,11 @@ public final class Tally: @unchecked Sendable {
             ("mmio through the host", c.stat_mmio), ("#NM from CR0.TS", c.stat_nm),
             ("code frames noted by DMA or TCG", c.stat_note_code),
             ("table frames noted by DMA or TCG", c.stat_note_pt), ("view evictions", c.stat_view_evictions),
-            ("pool reclaims", c.stat_pool_reclaim)
+            ("pool reclaims", c.stat_pool_reclaim),
+            ("hugepage 2M block fills", c.stat_hp_2m_fills),
+            ("hugepage 2M block splits", c.stat_hp_2m_splits),
+            ("hugepage 64K cont fills", c.stat_hp_64k_fills),
+            ("hugepage 64K cont breaks", c.stat_hp_64k_breaks)
         ]
         for (name, value) in counters {
             o += name.padding(toLength: 34, withPad: " ", startingAt: 0) + perSecond(value) + "\n"

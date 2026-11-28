@@ -173,7 +173,21 @@ public final class Engine {
                 return hv_vm_create(nil)
             }
         }
+        let noHugePages = ProcessInfo.processInfo.environment["LC_HVDBT_NO_HUGEPAGES"] == "1"
         func anon(_ bytes: UInt64) throws -> UnsafeMutableRawPointer {
+            let align: UInt64 = 2 << 20
+            if !noHugePages && bytes >= align {
+                let total = Int(bytes + align)
+                let raw = mmap(nil, total, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0)
+                guard let raw, raw != MAP_FAILED else { throw EngineError.stop("mmap failed") }
+                let rawAddr = UInt64(UInt(bitPattern: raw))
+                let alignedAddr = (rawAddr + align - 1) & ~(align - 1)
+                let lead = Int(alignedAddr - rawAddr)
+                let tail = total - lead - Int(bytes)
+                if lead > 0 { munmap(raw, lead) }
+                if tail > 0 { munmap(raw + lead + Int(bytes), tail) }
+                return raw + lead
+            }
             let p = mmap(nil, Int(bytes), PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0)
             guard let p, p != MAP_FAILED else { throw EngineError.stop("mmap failed") }
             return p
@@ -470,6 +484,16 @@ public final class Engine {
         if environment["VIM_HYBRID_HELPER_CENSUS"] == "1" { ctx.pointee.profile_shift_helpers = 1 }
         ctx.pointee.profile_x87_helpers = environment["VIM_HYBRID_HELPER_CENSUS"] == "1" ? 1 : 0
         ctx.pointee.pte_same64 = environment["LC_HVDBT_PTE_SAME64"] == "1" ? 1 : 0
+        // hugepages_disabled bitmask:
+        //   bit 0 (1): disable 2 MiB L2 Block
+        //   bit 1 (2): disable 64 KiB PTE_CONT (fractured large pages)
+        //   bit 2 (4): disable 64 KiB PTE_CONT on 4 KiB guest PTEs (default off to avoid 16x TLBI churn; opt-in via LC_HVDBT_HP_64K_4K=1)
+        //   bit 3 (8): disable zap_table batched tlbi aside1is (for exact baseline A/B)
+        var hpDisabled: UInt32 = environment["LC_HVDBT_HP_64K_4K"] == "1" ? 0 : 4
+        if environment["LC_HVDBT_NO_HUGEPAGES"] == "1" { hpDisabled = 15 }
+        if environment["LC_HVDBT_NO_HP_2M"] == "1" { hpDisabled |= 1 }
+        if environment["LC_HVDBT_NO_HP_64K"] == "1" { hpDisabled |= 6 }
+        ctx.pointee.hugepages_disabled = hpDisabled
         // ENGINE_SHARE: the keeper rule in a test with no fallbacks, as --smp is, so that it runs with vCPUs really side by side.
         ctx.pointee.share_user = (options.hybrid && environment["LC_HVDBT_NO_SHARE"] != "1") || environment["ENGINE_SHARE"] == "1" ? 1 : 0
         ctx.pointee.clts_on_host = options.hybrid && ProcessInfo.processInfo.environment["LC_HVDBT_CLTS_TCG"] == "1" ? 1 : 0

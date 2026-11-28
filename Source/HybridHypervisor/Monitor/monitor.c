@@ -196,16 +196,20 @@ static inline void hostcall(u64 code) {
 #define SPSR_NZCV_C (1ULL << 29)
 #define SPSR_SS (1ULL << 21)
 
+#define PTE_BLOCK 1ULL
 #define PTE_VALID 3ULL
 #define PTE_AF (1ULL << 10)
 #define PTE_SH (3ULL << 8)
 #define PTE_NG (1ULL << 11)
+#define PTE_CONT (1ULL << 52)
 #define PTE_UXN (1ULL << 54)
 #define PTE_PXN (1ULL << 53)
 #define AP_RW (1ULL << 6) // EL0 and EL1 read/write
 #define AP_RO (3ULL << 6) // EL0 and EL1 read only
 #define PTE_X_MARK (1ULL << 55) // software: code was translated from this page in this view. Valid in invalid entries too.
 #define PTE_ADDR 0x0000FFFFFFFFF000ULL
+static inline bool is_table_desc(u64 e) { return (e & 3ULL) == PTE_VALID; }
+static inline bool is_block_desc(u64 e) { return (e & 3ULL) == PTE_BLOCK; }
 
 #define X_P 1ULL
 #define X_RW 2ULL
@@ -269,6 +273,10 @@ static ShadowDesc *const desc = (ShadowDesc *)PRIV(OFF_SHADOW_META);
 #define RMAP_HEAD_OFF (OFF_SHADOW_META + (48ULL << 20)) // u32 per guest frame
 #define RMAP_NODES_OFF (OFF_SHADOW_META + (80ULL << 20))
 #define RMAP_NODES ((64ULL << 20) / 8)
+#define RMAP2M_HEAD_OFF (OFF_SHADOW_META + (144ULL << 20)) // u32 per 2 MiB chunk (32 GiB / 2 MiB = 16384 = 64 KiB)
+#define RMAP2M_NODES_OFF (OFF_SHADOW_META + (145ULL << 20))
+#define RMAP2M_NODES ((4ULL << 20) / 8)
+_Static_assert(RMAP2M_NODES_OFF + RMAP2M_NODES * 8ULL <= OFF_PAGEINFO, "rmap2m overflows OFF_SHADOW_META");
 typedef struct {
     u32 pte; // pool byte offset / 8
     u32 next;
@@ -276,8 +284,11 @@ typedef struct {
 static u32 *const mirror_head = (u32 *)PRIV(MIRROR_HEAD_OFF);
 static u32 *const rmap_head = (u32 *)PRIV(RMAP_HEAD_OFF);
 static RmapNode *const rmap_nodes = (RmapNode *)PRIV(RMAP_NODES_OFF);
+static u32 *const rmap2m_head = (u32 *)PRIV(RMAP2M_HEAD_OFF);
+static RmapNode *const rmap2m_nodes = (RmapNode *)PRIV(RMAP2M_NODES_OFF);
 static u8 *const page_info = (u8 *)PRIV(OFF_PAGEINFO);
-static u32 pool_next __attribute__((aligned(64))), pool_free_head, pool_free_count, rmap_next = 1, rmap_free;
+static u32 pool_next __attribute__((aligned(64))), pool_free_head, pool_free_count, rmap_next = 1, rmap_free, rmap_free_count;
+static u32 rmap2m_next = 1, rmap2m_free, rmap2m_free_count;
 static u64 hole_entry_priv, hole_entry_ram; // root-level descriptors for the private slots
 
 static inline u64 *pool_page(u32 idx) { return (u64 *)(POOL_VA + (u64)idx * 4096); }
@@ -321,6 +332,15 @@ static u32 pool_alloc(u32 view, u32 level, u64 guest_table, u64 va_base) {
 static inline void tlbi_va(u32 asid, u64 va) {
     u64 op = (u64)asid << 48 | ((va >> 12) & 0xFFFFFFFFFFFULL);
     __asm__ volatile("dsb ishst\n tlbi vae1is, %0\n dsb ish\n isb" : : "r"(op));
+}
+static inline void tlbi_va_64k(u32 asid, u64 base_va) {
+    u64 base = (u64)asid << 48 | ((base_va >> 12) & 0xFFFFFFFFFFFULL);
+    __asm__ volatile("dsb ishst" : : : "memory");
+    for (u64 k = 0; k < 16; k++) {
+        u64 op = base + k;
+        __asm__ volatile("tlbi vae1is, %0" : : "r"(op));
+    }
+    __asm__ volatile("dsb ish\n isb" : : : "memory");
 }
 static inline void tlbi_all(void) { __asm__ volatile("dsb ishst\n tlbi vmalle1is\n dsb ish\n isb"); }
 static inline u32 view_asid(u32 v) { return v + 1; }
@@ -447,6 +467,7 @@ static void rmap_add(u64 gpa, u64 *pte) {
     if (rmap_free) {
         node = rmap_free;
         rmap_free = rmap_nodes[node].next;
+        rmap_free_count--;
     } else {
         if (rmap_next >= RMAP_NODES)
             stop(STOP_SHADOW_FULL, 0, 2, 0, 0);
@@ -467,6 +488,40 @@ static void rmap_remove(u64 gpa, u64 *pte) {
             *link = n->next;
             n->next = rmap_free;
             rmap_free = dead;
+            rmap_free_count++;
+            return;
+        }
+        link = &n->next;
+    }
+}
+static void rmap2m_add(u64 base_gpa, u64 *pte) {
+    LOCK_REQUIRED();
+    u32 node;
+    if (rmap2m_free) {
+        node = rmap2m_free;
+        rmap2m_free = rmap2m_nodes[node].next;
+        rmap2m_free_count--;
+    } else {
+        if (rmap2m_next >= RMAP2M_NODES)
+            stop(STOP_SHADOW_FULL, 0, 2, 0, 0);
+        node = rmap2m_next++;
+    }
+    u32 fr2m = (u32)(base_gpa >> 21);
+    rmap2m_nodes[node].pte = (u32)(((u64)pte - POOL_VA) >> 3);
+    rmap2m_nodes[node].next = rmap2m_head[fr2m];
+    rmap2m_head[fr2m] = node;
+}
+static void rmap2m_remove(u64 base_gpa, u64 *pte) {
+    u32 fr2m = (u32)(base_gpa >> 21), want = (u32)(((u64)pte - POOL_VA) >> 3);
+    u32 *link = &rmap2m_head[fr2m];
+    while (*link) {
+        RmapNode *n = &rmap2m_nodes[*link];
+        if (n->pte == want) {
+            u32 dead = *link;
+            *link = n->next;
+            n->next = rmap2m_free;
+            rmap2m_free = dead;
+            rmap2m_free_count++;
             return;
         }
         link = &n->next;
@@ -480,7 +535,23 @@ static u64 pte_va(const u64 *pte, const ShadowDesc *d) {
     return va;
 }
 
-// Clears writability of every shadow mapping of this frame.
+// Break-Before-Make teardown of a 16-entry (64 KiB) PTE_CONT group in a level-0 shadow page.
+static void break_cont_group(u64 *pte, const ShadowDesc *d, bool remove_self_rmap) {
+    u64 *grp = (u64 *)((u64)pte & ~127ULL);
+    u64 base_va = pte_va(grp, d);
+    for (u32 k = 0; k < 16; k++) {
+        u64 ge = grp[k];
+        if (ge & 1) {
+            if ((&grp[k] != pte || remove_self_rmap) && (ge & AP_RO) == AP_RW && (ge & PTE_ADDR) < c->ram_size)
+                rmap_remove(ge & PTE_ADDR, &grp[k]);
+            grp[k] = ge & PTE_X_MARK;
+        }
+    }
+    tlbi_va_64k(view_asid(d->view), base_va);
+    c->stat_hp_64k_breaks++;
+}
+
+// Clears writability of every shadow mapping of this frame (4 KiB, 64 KiB PTE_CONT, and 2 MiB L2 Block).
 static void write_protect_frame(u64 gpa) {
     u32 fr = (u32)(gpa >> 12);
     u32 it = rmap_head[fr];
@@ -491,13 +562,36 @@ static void write_protect_frame(u64 gpa) {
         u32 next = n->next;
         n->next = rmap_free;
         rmap_free = it;
+        rmap_free_count++;
         ShadowDesc *d = &desc[pool_index(pte)];
         u64 e = *pte;
-        if ((e & 1) && (e & AP_RO) == AP_RW) {
+        if ((e & 1) && (e & PTE_CONT)) {
+            break_cont_group(pte, d, false);
+        } else if ((e & 1) && (e & AP_RO) == AP_RW) {
             *pte = (e & ~AP_RW) | AP_RO;
             tlbi_va(view_asid(d->view), pte_va(pte, d));
         }
         it = next;
+    }
+    // Zap-on-Split any writable 2 MiB L2 Block covering this frame.
+    u32 fr2m = (u32)(gpa >> 21);
+    u32 it2 = rmap2m_head[fr2m];
+    rmap2m_head[fr2m] = 0;
+    while (it2) {
+        RmapNode *n = &rmap2m_nodes[it2];
+        u64 *pte = rmap_pte(n->pte);
+        u32 next = n->next;
+        n->next = rmap2m_free;
+        rmap2m_free = it2;
+        rmap2m_free_count++;
+        ShadowDesc *d = &desc[pool_index(pte)];
+        u64 e = *pte;
+        if (is_block_desc(e)) {
+            *pte = 0;
+            tlbi_va(view_asid(d->view), pte_va(pte, d));
+            c->stat_hp_2m_splits++;
+        }
+        it2 = next;
     }
 }
 
@@ -990,6 +1084,28 @@ static void reset_all_return_stacks(void) {
 }
 
 // ---- Shadow fill ----
+static inline bool chunk_2m_clean_ram(u64 base_gpa) {
+    if ((base_gpa & 0x1fffffULL) != 0 || base_gpa + (2ULL << 20) > c->ram_size)
+        return false;
+    const u64 *p = (const u64 *)&page_info[base_gpa >> 12];
+    const u64 mask = 0x0F0F0F0F0F0F0F0FULL;
+    const u64 want = 0x0404040404040404ULL; // PI_RAM only (no PI_CODE, PI_PT, PI_DIRECT)
+    for (u32 k = 0; k < 64; k++) {
+        if ((p[k] & mask) != want)
+            return false;
+    }
+    return true;
+}
+
+static inline bool chunk_64k_clean_ram(u64 base_gpa) {
+    if ((base_gpa & 0xffffULL) != 0 || base_gpa + 65536ULL > c->ram_size)
+        return false;
+    const u64 *p = (const u64 *)&page_info[base_gpa >> 12];
+    const u64 mask = 0x0F0F0F0F0F0F0F0FULL;
+    const u64 want = 0x0404040404040404ULL;
+    return (p[0] & mask) == want && (p[1] & mask) == want;
+}
+
 static u64 *shadow_slot(View *v, u64 va, const Walk *w, int leaf_level_target, u64 **parent_out) {
     bool high = va >> 47;
     u64 table_va = high ? v->root1 : v->root0;
@@ -998,6 +1114,15 @@ static u64 *shadow_slot(View *v, u64 va, const Walk *w, int leaf_level_target, u
     for (int level = 3; level > leaf_level_target; level--) {
         u64 *t = (u64 *)table_va;
         u64 *e = &t[(va >> (12 + 9 * level)) & 0x1ff];
+        if (level == 1 && is_block_desc(*e)) {
+            // Break-Before-Make Zap-on-Split of an existing 2 MiB L2 Block before allocating L0 child table.
+            u64 old_blk = *e;
+            if ((old_blk & AP_RO) == AP_RW && (old_blk & PTE_ADDR) < c->ram_size)
+                rmap2m_remove(old_blk & PTE_ADDR, e);
+            *e = 0;
+            tlbi_va(view_asid(vi), va & ~0x1fffffULL);
+            c->stat_hp_2m_splits++;
+        }
         if (!(*e & 1)) {
             int child = level - 1;
             // The child mirrors the guest table this entry points at. Below a large page there is none: it is a fracture.
@@ -1020,18 +1145,128 @@ static u64 *shadow_slot(View *v, u64 va, const Walk *w, int leaf_level_target, u
     return &((u64 *)table_va)[(va >> (12 + 9 * leaf_level_target)) & 0x1ff];
 }
 
+static void mark_x_slot(View *v, u64 va, const Walk *w) {
+    u64 *slot = shadow_slot(v, va, w, 0, 0);
+    if ((*slot & 1) && (*slot & PTE_CONT))
+        break_cont_group(slot, &desc[pool_index(slot)], true);
+    *slot |= PTE_X_MARK;
+}
+
+static bool try_install_cont_64k(const Walk *w, u64 va, u64 *slot, u64 gpa, bool want_write) {
+    u64 *grp = (u64 *)((u64)slot & ~127ULL);
+    for (u32 k = 0; k < 16; k++)
+        if (grp[k])
+            return false;
+    u32 idx_in_grp = (u32)(slot - grp);
+    u64 base64_gpa = gpa - ((u64)idx_in_grp << 12);
+    if (!chunk_64k_clean_ram(base64_gpa))
+        return false;
+    // Cold 64 KiB group: all 16 shadow slots are empty -> direct install with zero BBM/TLBI overhead.
+    bool writable;
+    if (w->leaf_level >= 1) {
+        if (w->write && !w->dirty)
+            return false;
+        writable = w->write && w->dirty;
+    } else {
+        if (c->hugepages_disabled & 4u)
+            return false;
+        u64 *guest_l0 = (u64 *)((u64)w->leaf & ~0xfffULL);
+        u32 grp_idx = (u32)(((va >> 12) & 0x1ffu) & ~15u);
+        bool upper_write = ((w->read[3] & w->read[2] & w->read[1] & X_RW) != 0) ||
+                           (c->cpl != 3 && !(c->cr0 & (1ULL << 16)));
+        bool all_rw = upper_write;
+        bool all_ro = true;
+        for (u32 k = 0; k < 16; k++) {
+            u64 ge = __atomic_load_n(&guest_l0[grp_idx + k], __ATOMIC_RELAXED);
+            if ((ge & (X_P | X_A)) != (X_P | X_A))
+                return false;
+            if (c->cpl == 3 && !(ge & X_US))
+                return false;
+            if ((ge & X_ADDR) != base64_gpa + ((u64)k << 12))
+                return false;
+            bool page_w = upper_write && (ge & X_RW);
+            if (page_w) {
+                all_ro = false;
+                if (!(ge & X_D))
+                    return false;
+            } else {
+                all_rw = false;
+            }
+        }
+        if (!all_rw && !all_ro)
+            return false;
+        if (want_write && !all_rw)
+            return false;
+        writable = all_rw;
+    }
+    if (writable && (u64)rmap_free_count + (RMAP_NODES - rmap_next) < 64)
+        return false;
+    u64 attr = PTE_VALID | PTE_CONT | PTE_AF | PTE_SH | PTE_NG | PTE_PXN | PTE_UXN | (writable ? AP_RW : AP_RO);
+    for (u32 k = 0; k < 16; k++) {
+        u64 kgpa = base64_gpa + ((u64)k << 12);
+        grp[k] = kgpa | attr;
+        if (writable)
+            rmap_add(kgpa, &grp[k]);
+    }
+    c->stat_hp_64k_fills++;
+    return true;
+}
+
 static void track_root(View *v, u64 va, const Walk *w);
 
-// Installs a 4 KB entry for va. A large x86 page fractures into shadow leaves, each still honouring A/D at the x86 leaf.
+// Installs a shadow mapping for va: 2 MiB L2 Block (for clean x86 large pages), 64 KiB PTE_CONT (for contiguous 16-page runs), or 4 KiB leaf.
 static u64 *shadow_install(View *v, u64 va, const Walk *w, bool want_write) {
-    (void)want_write;
     track_root(v, va, w);
+    if (w->leaf_level >= 1 && !(c->hugepages_disabled & 1u)) {
+        u64 base_gpa = w->gpa & ~0x1fffffULL;
+        if (chunk_2m_clean_ram(base_gpa)) {
+            u64 *l1_slot = shadow_slot(v, va, w, 1, 0);
+            // Re-verify after shadow_slot in case a newly tracked guest page table frame lies inside base_gpa..+2M.
+            if (chunk_2m_clean_ram(base_gpa)) {
+                u64 old1 = *l1_slot;
+                if (!(old1 & 1) || is_block_desc(old1)) {
+                    bool writable = w->write && w->dirty;
+                    bool have_rmap2m = !writable || (u64)rmap2m_free_count + (RMAP2M_NODES - rmap2m_next) >= 16;
+                    if (have_rmap2m) {
+                        if (is_block_desc(old1) && (old1 & PTE_ADDR) == base_gpa &&
+                            (!want_write || (old1 & AP_RO) == AP_RW))
+                            return l1_slot;
+                        if (is_block_desc(old1) && (old1 & PTE_ADDR) != base_gpa) {
+                            if ((old1 & AP_RO) == AP_RW && (old1 & PTE_ADDR) < c->ram_size)
+                                rmap2m_remove(old1 & PTE_ADDR, l1_slot);
+                            *l1_slot = 0;
+                            tlbi_va(view_asid((u32)(v - views)), va & ~0x1fffffULL);
+                            old1 = 0;
+                        }
+                        bool was_rw = is_block_desc(old1) && (old1 & AP_RO) == AP_RW && (old1 & PTE_ADDR) == base_gpa;
+                        *l1_slot = base_gpa | PTE_BLOCK | PTE_AF | PTE_SH | PTE_NG | PTE_PXN | PTE_UXN | (writable ? AP_RW : AP_RO);
+                        if (writable && !was_rw)
+                            rmap2m_add(base_gpa, l1_slot);
+                        else if (!writable && was_rw)
+                            rmap2m_remove(base_gpa, l1_slot);
+                        if (!(old1 & 1))
+                            c->stat_hp_2m_fills++;
+                        return l1_slot;
+                    }
+                }
+            }
+        }
+    }
     u64 *slot = shadow_slot(v, va, w, 0, 0);
     u64 old = *slot;
     u64 gpa = w->gpa & ~0xfffULL;
+    if ((old & 1) && (old & PTE_CONT)) {
+        if ((old & PTE_ADDR) == gpa && (!want_write || (old & AP_RO) == AP_RW))
+            return slot;
+        break_cont_group(slot, &desc[pool_index(slot)], true);
+        old = *slot;
+    }
+    u8 pi = gpa < PRIV_IPA ? page_info[gpa >> 12] : 0;
+    if (!old && !(c->hugepages_disabled & 2u) && !(pi & PI_DIRECT) && !(smp && me->tracked_new) &&
+        try_install_cont_64k(w, va, slot, gpa, want_write))
+        return slot;
     u64 pte = gpa | PTE_VALID | PTE_AF | PTE_SH | PTE_NG | PTE_PXN | PTE_UXN | (old & PTE_X_MARK);
     bool writable = w->write && w->dirty;
-    u8 pi = gpa < PRIV_IPA ? page_info[gpa >> 12] : 0;
     if (writable && (pi & (PI_CODE | PI_PT)))
         writable = false;
     pte |= writable ? AP_RW : AP_RO;
@@ -1264,7 +1499,7 @@ static void shared_mark(int row, u64 va, View *v) {
             return; // the block's own page is gone from under it: its next use faults
     }
     track_root(k, va, &own);
-    *shadow_slot(k, va, &own, 0, 0) |= PTE_X_MARK;
+    mark_x_slot(k, va, &own);
 }
 
 // The stack grows down from the top of this vCPU's slot toward its MonCpu, with nothing between. Going past would write over this vCPU's own state and show up as anything at all.
@@ -1402,25 +1637,25 @@ again:;
         shadow_slot(v, rip, &w, 0, 0);
         v->sees_shared = 1;
         View *keeper = domain_keeper(*w.chain[3] & X_ADDR, v);
-        *shadow_slot(keeper, rip, &w, 0, 0) |= PTE_X_MARK;
+        mark_x_slot(keeper, rip, &w);
         if (c->req_r[3]) {
             u64 next = (rip & ~0xfffULL) + 4096;
             Walk w2 = x86_walk(c->cr3, next, 0, false);
             if (w2.ok)
-                *shadow_slot(keeper, next, &w2, 0, 0) |= PTE_X_MARK;
+                mark_x_slot(keeper, next, &w2);
         }
     } else {
-        *shadow_slot(v, rip, &w, 0, 0) |= PTE_X_MARK;
+        mark_x_slot(v, rip, &w);
         if (c->cpl == 0 && (rip >> 47)) { // shared with other views: the domain's keeper must see writes to this mapping too
             View *keeper = domain_keeper(*w.chain[3] & X_ADDR, v);
             if (keeper != v)
-                *shadow_slot(keeper, rip, &w, 0, 0) |= PTE_X_MARK;
+                mark_x_slot(keeper, rip, &w);
         }
         if (c->req_r[3]) { // a straddling instruction: a change to the next page's mapping must invalidate this block as well
             u64 next = (rip & ~0xfffULL) + 4096;
             Walk w2 = x86_walk(c->cr3, next, 0, false);
             if (w2.ok)
-                *shadow_slot(v, next, &w2, 0, 0) |= PTE_X_MARK;
+                mark_x_slot(v, next, &w2);
         }
     }
     if (smp) {
@@ -1463,17 +1698,23 @@ static inline void mmu_xmark_zap(u64 old, u32 view) {
         c->stat_mmu_xmark_zaps[zap_why * 4 + (views[view].keeper != 0) * 2 + (old & 1)]++;
 }
 
+static bool in_zap_table;
+
 static void zap_entry(u64 *e, const ShadowDesc *d) {
     u64 v = *e;
     if (!v)
         return;
+    if (d->level == 0 && (v & 1) && (v & PTE_CONT) && !evicting && !in_zap_table) {
+        break_cont_group(e, d, true);
+        return;
+    }
     *e = 0;
     if (d->level == 0) {
         u64 va = pte_va(e, d);
         if (v & 1) {
             if ((v & AP_RO) == AP_RW && (v & PTE_ADDR) < c->ram_size)
                 rmap_remove(v & PTE_ADDR, e);
-            if (!evicting)
+            if (!evicting && !in_zap_table)
                 tlbi_va(view_asid(d->view), va);
         }
         if ((v & PTE_X_MARK) && !evicting) {
@@ -1489,7 +1730,12 @@ static void zap_entry(u64 *e, const ShadowDesc *d) {
             hostcall(HC_VIEW_INVALIDATE_VA);
             reset_all_return_stacks();
         }
-    } else if (v & 1) {
+    } else if (d->level == 1 && is_block_desc(v)) {
+        if ((v & AP_RO) == AP_RW && (v & PTE_ADDR) < c->ram_size)
+            rmap2m_remove(v & PTE_ADDR, e);
+        if (!evicting && !in_zap_table)
+            tlbi_va(view_asid(d->view), pte_va(e, d));
+    } else if (is_table_desc(v)) {
         bool kernel_slot = d->level == 3 && (((u64)e & 0xfff) >> 3) >= 256;
         bool compat_parent = false;
         // Follow the actual shared-table edge, not every low-address parent
@@ -1526,14 +1772,26 @@ static void zap_table(u32 idx) {
     LOCK_REQUIRED();
     ShadowDesc *d = &desc[idx];
     u64 *t = pool_page(idx);
+    bool prev_in_zap = in_zap_table;
+    bool had_leaf = false;
+    bool batch_tlbi = !(c->hugepages_disabled & 8u);
+    if (batch_tlbi)
+        in_zap_table = true;
     for (int i = 0; i < 512; i++) {
         if (d->level == 3 && !d->va_base && (u64)i == ((PRIV_VA >> 39) & 0x1ff))
             continue; // the private slots of root0 are not shadows; root1 slots 480/482 are real kernel mappings
         if (d->level == 3 && !d->va_base && (u64)i == ((RAM_ALIAS_VA >> 39) & 0x1ff))
             continue;
-        if (t[i])
+        if (t[i]) {
+            if (d->level == 0 || (d->level == 1 && is_block_desc(t[i])))
+                had_leaf = true;
             zap_entry(&t[i], d);
+        }
     }
+    in_zap_table = prev_in_zap;
+    // Ensure no core retains a stale TLB/walk entry pointing into this page before reusing slot 0 for pool_free_head.
+    if (batch_tlbi && !evicting && had_leaf)
+        __asm__ volatile("dsb ishst\n tlbi aside1is, %0\n dsb ish\n isb" : : "r"((u64)view_asid(d->view) << 48));
     if (d->guest_table != ~0ULL && d->guest_table < c->ram_size) {
         u32 *link = &mirror_head[d->guest_table >> 12];
         while (*link) {
@@ -1607,7 +1865,7 @@ static void pt_slot_changed_impl(u64 gpa_slot, bool same64, bool has_old_next, u
             u32 view = d->view;
             c->stat_pt_unshadow++;
             zap_why = KILL_PT_FLOOD;
-            if ((*parent & 1) && (*parent & PTE_ADDR) == VA_TO_IPA((u64)t))
+            if (is_table_desc(*parent) && (*parent & PTE_ADDR) == VA_TO_IPA((u64)t))
                 zap_entry(parent, &pd);
             else
                 zap_table(it - 1);
@@ -2478,6 +2736,10 @@ static void handle_data_abort(bool lower) {
         w2.write = true;
         u64 *slot = shadow_slot(v, far, &w, 0, 0);
         u64 old = *slot;
+        if ((old & 1) && (old & PTE_CONT)) {
+            break_cont_group(slot, &desc[pool_index(slot)], true);
+            old = *slot;
+        }
         *slot = (w.gpa & ~0xfffULL) | PTE_VALID | PTE_AF | PTE_SH | PTE_NG | PTE_PXN | PTE_UXN | (old & PTE_X_MARK) | AP_RW;
         tlbi_va(view_asid(c->view), far);
         pt_step_slot = w.gpa | 1;
@@ -2492,22 +2754,47 @@ static void handle_data_abort(bool lower) {
     u64 *installed = shadow_install(v, far, &w, write);
     if (smp && me->tracked_new) { // Protected now: drop what was read before it and let the access fault again, which reads the table again.
         u64 old = *installed;
-        if ((old & 1) && (old & AP_RO) == AP_RW)
-            rmap_remove(old & PTE_ADDR, installed);
-        *installed = old & PTE_X_MARK;
-        tlbi_va(view_asid(c->view), far);
+        if (is_block_desc(old)) {
+            if ((old & AP_RO) == AP_RW && (old & PTE_ADDR) < c->ram_size)
+                rmap2m_remove(old & PTE_ADDR, installed);
+            *installed = 0;
+            tlbi_va(view_asid(c->view), far & ~0x1fffffULL);
+        } else if ((old & 1) && (old & PTE_CONT)) {
+            break_cont_group(installed, &desc[pool_index(installed)], true);
+        } else {
+            if ((old & 1) && (old & AP_RO) == AP_RW)
+                rmap_remove(old & PTE_ADDR, installed);
+            *installed = old & PTE_X_MARK;
+            tlbi_va(view_asid(c->view), far);
+        }
         mon_unlock();
         return;
     }
     if (perm) {
         c->stat_dirty++;
-        tlbi_va(view_asid(c->view), far);
+        tlbi_va(view_asid(c->view), is_block_desc(*installed) ? (far & ~0x1fffffULL) : far);
     } else {
         // Batch-prefetch up to 31 already-accessed adjacent 4KB entries in the same L0 shadow page.
-        if (!(pi & PI_DIRECT) && (w.leaf_level == 0 || w.leaf_level == 1)) {
+        if (!is_block_desc(*installed) && !(pi & PI_DIRECT) && (w.leaf_level == 0 || w.leaf_level == 1)) {
             u64 *shadow_l0 = (u64 *)((u64)installed & ~0xfffULL);
             u32 idx = (u32)((far >> 12) & 0x1ffu);
             u32 win_start = idx & ~31u, win_end = win_start + 32u;
+            if (!(c->hugepages_disabled & 2u)) {
+                // Also try coalescing the sibling 64 KiB half of this 128 KiB window into PTE_CONT before 4 KiB prefetch.
+                u32 other = (idx & ~15u) ^ 16u;
+                if (!shadow_l0[other]) {
+                    u64 other_va = (far & ~0x1fffffULL) | ((u64)other << 12);
+                    if (w.leaf_level == 0) {
+                        u64 *guest_l0 = (u64 *)((u64)w.leaf & ~0xfffULL);
+                        u64 ge = __atomic_load_n(&guest_l0[other], __ATOMIC_RELAXED);
+                        if ((ge & (X_P | X_A)) == (X_P | X_A) && (c->cpl != 3 || (ge & X_US)))
+                            try_install_cont_64k(&w, other_va, &shadow_l0[other], ge & X_ADDR, false);
+                    } else {
+                        u64 other_gpa = (w.gpa & ~0x1fffffULL) + ((u64)other << 12);
+                        try_install_cont_64k(&w, other_va, &shadow_l0[other], other_gpa, false);
+                    }
+                }
+            }
             if (w.leaf_level == 0) {
                 u64 *guest_l0 = (u64 *)((u64)w.leaf & ~0xfffULL);
                 bool upper_write = ((w.read[3] & w.read[2] & w.read[1] & X_RW) != 0) ||
