@@ -182,14 +182,20 @@ void ext_ymm_cache_reset_unpinned(void);
 void ext_ymm_cache_flush_dirty(void);
 void ext_ymm_cache_flush_and_drop(void);
 void ext_ymm_cache_pin_ro(int xreg);
+void ext_ymm_cache_pin_rw(int xreg);
 void ext_ymm_cache_preload_clean(int xreg);
 void ext_ymm_set_dirty_limit(int limit);
 bool ext_ymm_cache_has_dirty(void);
 int ext_ymm_cache_dirty_run(void);
 int ext_ymm_cache_snapshot_dirty(u8 vregs[4], u8 xregs[4]);
 void ext_ymm_emit_flush_list(int cnt, const u8 vregs[4], const u8 xregs[4]);
+void ext_ymm_cache_get_resident_map(u8 out_regs[4]);
+void ext_ymm_emit_resident_flush(u8 wr_mask);
 bool ext_insn_keeps_ymm_cache(const Insn *in);
 void ext_insn_ymm_rw(const Insn *in, u16 *out_read_256, u16 *out_write_any);
+bool ext_insn_s5_free(const Insn *in);
+bool ext_insn_s4_free(const Insn *in);
+u16 ext_insn_written_gprs(const Insn *in);
 extern bool tr_profile_shift_helpers;
 extern bool tr_inline_shr8;
 extern bool tr_page_rep;
@@ -216,7 +222,8 @@ void tr_t2_clear_snapshot(void);
 bool tr_t2_publish(u32 t1_idx, u32 part, u32 p0_slot, u64 start_epoch, u64 head_rip,
                    u32 key, u8 cpl, bool compat, u32 patch_word, u64 frame0,
                    u16 snap_off, u16 snap_len, const u8 *snap_bytes,
-                   const u32 *code, u32 code_words, const PcMap *pcm, u32 pcm_count);
+                   const u32 *code, u32 code_words, const PcMap *pcm, u32 pcm_count,
+                   const T2TrapMeta *trap_meta, const u32 *bail_sites, u32 bail_cnt);
 u8 tr_insn_reads(const Insn *in);
 void tr_update_zext(const Insn *in);
 bool tr_ad_page_safe_op(u8 op);

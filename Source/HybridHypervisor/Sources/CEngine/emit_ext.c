@@ -96,7 +96,8 @@ static _Thread_local YmmCacheSlot ymm_cache[YMM_CACHE_SLOTS];
 static _Thread_local u32 ymm_cache_clk;
 static _Thread_local u16 ymm_zero_mask; // bit r (0..15): architectural ymm_hi[r] is known all-zero
 static _Thread_local int ymm_dirty_run_cnt;
-static _Thread_local u8 ymm_pinned_mask; // bit s (0..3): read-only Preheader-pinned slot (never evicted/dropped inside loop)
+static _Thread_local u8 ymm_pinned_mask; // bit s (0..3): Preheader-pinned slot (never evicted/dropped inside loop)
+static _Thread_local u8 ymm_t2_resident_mask; // bit s (0..3): Tier-2 full RW resident slot (trap-synced via T2TrapMeta)
 static _Thread_local int ymm_dirty_run_limit = 8;
 
 void ext_ymm_cache_reset(void) {
@@ -108,6 +109,7 @@ void ext_ymm_cache_reset(void) {
     ymm_zero_mask = 0;
     ymm_dirty_run_cnt = 0;
     ymm_pinned_mask = 0;
+    ymm_t2_resident_mask = 0;
     ymm_dirty_run_limit = 8;
 }
 
@@ -149,6 +151,47 @@ void ext_ymm_cache_pin_ro(int xreg) {
     }
 }
 
+void ext_ymm_cache_pin_rw(int xreg) {
+    if (!tr_opt_ymm_cache || xreg < 8 || xreg > 15)
+        return;
+    for (int s = 0; s < YMM_CACHE_SLOTS; s++) {
+        if (ymm_cache[s].xreg == (int8_t)xreg) {
+            ymm_pinned_mask |= (u8)(1u << s);
+            ymm_t2_resident_mask |= (u8)(1u << s);
+            ymm_cache[s].dirty = false;
+            return;
+        }
+    }
+    for (int s = 0; s < YMM_CACHE_SLOTS; s++) {
+        if (!(ymm_pinned_mask & (1u << s)) && ymm_cache[s].xreg < 0) {
+            int vreg = ymm_pool_vreg[s];
+            // Always preload entry value so a #PF/trap before the first write in Iter 0 reconstructs exact state.
+            VLDR128_U12(vreg, CTX, ymm_hi_off(xreg));
+            ymm_cache[s].xreg = (int8_t)xreg;
+            ymm_cache[s].dirty = false;
+            ymm_cache[s].age = ++ymm_cache_clk;
+            ymm_pinned_mask |= (u8)(1u << s);
+            ymm_t2_resident_mask |= (u8)(1u << s);
+            return;
+        }
+    }
+}
+
+void ext_ymm_cache_get_resident_map(u8 out_regs[4]) {
+    for (int s = 0; s < YMM_CACHE_SLOTS; s++) {
+        out_regs[s] = ((ymm_t2_resident_mask & (1u << s)) && ymm_cache[s].xreg >= 8)
+                          ? (u8)ymm_cache[s].xreg
+                          : 0;
+    }
+}
+
+void ext_ymm_emit_resident_flush(u8 wr_mask) {
+    for (int s = 0; s < YMM_CACHE_SLOTS; s++) {
+        if ((ymm_t2_resident_mask & (1u << s)) && (wr_mask & (1u << s)) && ymm_cache[s].xreg >= 8)
+            VSTR128_U12(ymm_pool_vreg[s], CTX, ymm_hi_off(ymm_cache[s].xreg));
+    }
+}
+
 void ext_ymm_cache_preload_clean(int xreg) {
     if (!tr_opt_ymm_cache || xreg < 8 || xreg > 15)
         return;
@@ -169,7 +212,7 @@ void ext_ymm_cache_preload_clean(int xreg) {
 
 bool ext_ymm_cache_has_dirty(void) {
     for (int s = 0; s < YMM_CACHE_SLOTS; s++)
-        if (ymm_cache[s].xreg >= 8 && ymm_cache[s].dirty)
+        if (!(ymm_t2_resident_mask & (1u << s)) && ymm_cache[s].xreg >= 8 && ymm_cache[s].dirty)
             return true;
     return false;
 }
@@ -181,7 +224,7 @@ int ext_ymm_cache_dirty_run(void) {
 int ext_ymm_cache_snapshot_dirty(u8 vregs[4], u8 xregs[4]) {
     int n = 0;
     for (int s = 0; s < YMM_CACHE_SLOTS; s++) {
-        if (ymm_cache[s].xreg >= 8 && ymm_cache[s].dirty) {
+        if (!(ymm_t2_resident_mask & (1u << s)) && ymm_cache[s].xreg >= 8 && ymm_cache[s].dirty) {
             vregs[n] = ymm_pool_vreg[s];
             xregs[n] = (u8)ymm_cache[s].xreg;
             n++;
@@ -197,7 +240,7 @@ void ext_ymm_emit_flush_list(int cnt, const u8 vregs[4], const u8 xregs[4]) {
 
 void ext_ymm_cache_flush_dirty(void) {
     for (int s = 0; s < YMM_CACHE_SLOTS; s++) {
-        if (ymm_cache[s].xreg >= 8 && ymm_cache[s].dirty) {
+        if (!(ymm_t2_resident_mask & (1u << s)) && ymm_cache[s].xreg >= 8 && ymm_cache[s].dirty) {
             VSTR128_U12(ymm_pool_vreg[s], CTX, ymm_hi_off(ymm_cache[s].xreg));
             ymm_cache[s].dirty = false;
         }
@@ -207,23 +250,25 @@ void ext_ymm_cache_flush_dirty(void) {
 
 void ext_ymm_cache_flush_and_drop(void) {
     for (int s = 0; s < YMM_CACHE_SLOTS; s++) {
-        if (ymm_cache[s].xreg >= 8 && ymm_cache[s].dirty)
+        if (ymm_cache[s].xreg >= 8 && (ymm_cache[s].dirty || (ymm_t2_resident_mask & (1u << s))))
             VSTR128_U12(ymm_pool_vreg[s], CTX, ymm_hi_off(ymm_cache[s].xreg));
         ymm_cache[s].xreg = -1;
         ymm_cache[s].dirty = false;
     }
     ymm_dirty_run_cnt = 0;
     ymm_pinned_mask = 0;
+    ymm_t2_resident_mask = 0;
 }
 
 static void ymm_cache_evict_vreg(int vreg) {
     for (int s = 0; s < YMM_CACHE_SLOTS; s++) {
         if (ymm_pool_vreg[s] == (u8)vreg) {
-            if (ymm_cache[s].xreg >= 8 && ymm_cache[s].dirty)
+            if (ymm_cache[s].xreg >= 8 && (ymm_cache[s].dirty || (ymm_t2_resident_mask & (1u << s))))
                 VSTR128_U12(vreg, CTX, ymm_hi_off(ymm_cache[s].xreg));
             ymm_cache[s].xreg = -1;
             ymm_cache[s].dirty = false;
             ymm_pinned_mask &= (u8)~(1u << s);
+            ymm_t2_resident_mask &= (u8)~(1u << s);
             return;
         }
     }
@@ -232,6 +277,8 @@ static void ymm_cache_evict_vreg(int vreg) {
 static void ymm_cache_drop_xreg(int reg) {
     for (int s = 0; s < YMM_CACHE_SLOTS; s++) {
         if (ymm_cache[s].xreg == (int8_t)reg) {
+            if (ymm_t2_resident_mask & (1u << s))
+                return;
             ymm_cache[s].xreg = -1;
             ymm_cache[s].dirty = false;
             ymm_pinned_mask &= (u8)~(1u << s);
@@ -255,9 +302,11 @@ static int ymm_cache_get(int reg, bool load_if_miss, bool will_write, u8 *pin_ma
         if (ymm_cache[s].xreg == (int8_t)reg) {
             ymm_cache[s].age = ++ymm_cache_clk;
             if (will_write) {
-                ymm_cache[s].dirty = true;
                 ymm_zero_mask &= (u16)~(1u << reg);
-                ymm_pinned_mask &= (u8)~(1u << s);
+                if (!(ymm_t2_resident_mask & (1u << s))) {
+                    ymm_cache[s].dirty = true;
+                    ymm_pinned_mask &= (u8)~(1u << s);
+                }
             }
             if (pin_mask)
                 *pin_mask |= (u8)(1u << s);
@@ -301,6 +350,19 @@ static int ymm_cache_get(int reg, bool load_if_miss, bool will_write, u8 *pin_ma
 }
 
 static inline void ymm_zero_hi(int reg) {
+    if (reg >= 8 && ymm_t2_resident_mask) {
+        for (int s = 0; s < YMM_CACHE_SLOTS; s++) {
+            if ((ymm_t2_resident_mask & (1u << s)) && ymm_cache[s].xreg == (int8_t)reg) {
+                if (!(tr_opt_ymm_cache && (ymm_zero_mask & (1u << reg)))) {
+                    int vreg = ymm_pool_vreg[s];
+                    VEORQ(vreg, vreg, vreg);
+                }
+                if (tr_opt_ymm_cache)
+                    ymm_zero_mask |= (u16)(1u << reg);
+                return;
+            }
+        }
+    }
     if (tr_opt_ymm_cache && (ymm_zero_mask & (1u << reg))) {
         if (reg >= 8)
             ymm_cache_drop_xreg(reg);
@@ -328,6 +390,16 @@ static inline void ymm_load_hi(int vtmp, int reg) {
             VMOVQ(vtmp, home);
         return;
     }
+    if (reg >= 8 && ymm_t2_resident_mask) {
+        for (int s = 0; s < YMM_CACHE_SLOTS; s++) {
+            if ((ymm_t2_resident_mask & (1u << s)) && ymm_cache[s].xreg == (int8_t)reg) {
+                int vreg = ymm_pool_vreg[s];
+                if (vtmp != vreg)
+                    VMOVQ(vtmp, vreg);
+                return;
+            }
+        }
+    }
     if (tr_opt_ymm_cache && (ymm_zero_mask & (1u << reg))) {
         VEORQ(vtmp, vtmp, vtmp);
         return;
@@ -342,6 +414,16 @@ static inline void ymm_store_hi(int vtmp, int reg) {
         if (vtmp != home)
             VMOVQ(home, vtmp);
         return;
+    }
+    if (reg >= 8 && ymm_t2_resident_mask) {
+        for (int s = 0; s < YMM_CACHE_SLOTS; s++) {
+            if ((ymm_t2_resident_mask & (1u << s)) && ymm_cache[s].xreg == (int8_t)reg) {
+                int vreg = ymm_pool_vreg[s];
+                if (vtmp != vreg)
+                    VMOVQ(vreg, vtmp);
+                return;
+            }
+        }
     }
     ymm_cache_drop_xreg(reg);
     VSTR128_U12(vtmp, CTX, ymm_hi_off(reg));
@@ -2844,6 +2926,75 @@ void ext_insn_ymm_rw(const Insn *in, u16 *out_read_256, u16 *out_write_any) {
     *out_write_any = wr;
 }
 
+bool ext_insn_s5_free(const Insn *in) {
+    if (in->op != OP_EXT)
+        return true;
+    ZydisMnemonic mnem = (ZydisMnemonic)in->ext.mnem;
+    switch (mnem) {
+        case ZYDIS_MNEMONIC_PDEP:
+        case ZYDIS_MNEMONIC_PEXT:
+        case ZYDIS_MNEMONIC_VPCMPISTRI:
+            return false;
+        default:
+            return true;
+    }
+}
+
+bool ext_insn_s4_free(const Insn *in) {
+    if (in->op != OP_EXT)
+        return true;
+    ZydisMnemonic mnem = (ZydisMnemonic)in->ext.mnem;
+    switch (mnem) {
+        case ZYDIS_MNEMONIC_ADCX:
+        case ZYDIS_MNEMONIC_ADOX:
+        case ZYDIS_MNEMONIC_BEXTR:
+        case ZYDIS_MNEMONIC_BZHI:
+        case ZYDIS_MNEMONIC_PDEP:
+        case ZYDIS_MNEMONIC_PEXT:
+        case ZYDIS_MNEMONIC_VCVTPS2PH:
+        case ZYDIS_MNEMONIC_VPHMINPOSUW:
+        case ZYDIS_MNEMONIC_VPCMPISTRI:
+        case ZYDIS_MNEMONIC_VGATHERDPS:
+        case ZYDIS_MNEMONIC_VGATHERDPD:
+        case ZYDIS_MNEMONIC_VGATHERQPS:
+        case ZYDIS_MNEMONIC_VGATHERQPD:
+        case ZYDIS_MNEMONIC_VPGATHERDD:
+        case ZYDIS_MNEMONIC_VPGATHERDQ:
+        case ZYDIS_MNEMONIC_VPGATHERQD:
+        case ZYDIS_MNEMONIC_VPGATHERQQ:
+            return false;
+        default:
+            break;
+    }
+    if (in->memop) {
+        if (in->riprel || in->no_base || !in->no_index || in->seg || in->addr32 || in->addr16 || tr_compat)
+            return false;
+        if (in->disp < -256 || in->disp > 1008 || (in->disp & 15) != 0)
+            return false;
+    }
+    return true;
+}
+
+u16 ext_insn_written_gprs(const Insn *in) {
+    if (in->op != OP_EXT)
+        return 0;
+    const ExtDecoded *ex = &in->ext;
+    ZydisMnemonic mnem = (ZydisMnemonic)ex->mnem;
+    if (mnem == ZYDIS_MNEMONIC_VPCMPISTRI)
+        return (u16)(1u << 1); // writes RCX/ECX
+    if (mnem == ZYDIS_MNEMONIC_XGETBV)
+        return (u16)((1u << 0) | (1u << 2));
+    if (mnem == ZYDIS_MNEMONIC_MULX) {
+        u16 m = 0;
+        if (ex->op_cnt >= 1 && ex->op_type[0] == EXT_OP_GPR) m |= (u16)(1u << ex->op_reg[0]);
+        if (ex->op_cnt >= 2 && ex->op_type[1] == EXT_OP_GPR) m |= (u16)(1u << ex->op_reg[1]);
+        return m;
+    }
+    if (ex->op_cnt >= 1 && ex->op_type[0] == EXT_OP_GPR)
+        return (u16)(1u << ex->op_reg[0]);
+    return 0;
+}
+
 void emit_ext(const Insn *in, int live) {
     const ExtDecoded *ex = &in->ext;
     ZydisMnemonic mnem = (ZydisMnemonic)ex->mnem;
@@ -3540,8 +3691,15 @@ void emit_ext(const Insn *in, int live) {
                     if (tr_opt_ymm_cache) {
                         u8 pin = 0;
                         int dh = ymm_cache_get(d, false, true, &pin);
-                        ext_load256_pair(in, d, dh);
-                        if (d >= 8)
+                        if (tr_t2_mode) {
+                            // Cross-page #PF exactness: load into scratch pair before committing architectural d and resident dh.
+                            ext_load256_pair(in, V_MEM, V_S2);
+                            vmov128(d, V_MEM);
+                            vmov128(dh, V_S2);
+                        } else {
+                            ext_load256_pair(in, d, dh);
+                        }
+                        if (d >= 8 && !(ymm_t2_resident_mask & pin))
                             ymm_dirty_run_cnt++;
                     } else {
                         int dh = ymm_resident(d);
@@ -4012,12 +4170,17 @@ void emit_ext(const Insn *in, int live) {
         case ZYDIS_MNEMONIC_VBROADCASTF128:
         case ZYDIS_MNEMONIC_VBROADCASTI128: {
             int d = ex->op_reg[0];
-            ext_vldst(4, true, d, addr_prepare(in, 16));
+            if (tr_t2_mode) {
+                ext_vldst(4, true, V_MEM, addr_prepare(in, 16));
+                vmov128(d, V_MEM);
+            } else {
+                ext_vldst(4, true, d, addr_prepare(in, 16));
+            }
             if (tr_opt_ymm_cache) {
                 u8 pin = 0;
                 int dh = ymm_cache_get(d, false, true, &pin);
                 vmov128(dh, d);
-                if (d >= 8)
+                if (d >= 8 && !(ymm_t2_resident_mask & pin))
                     ymm_dirty_run_cnt++;
             } else {
                 ymm_store_hi(d, d);

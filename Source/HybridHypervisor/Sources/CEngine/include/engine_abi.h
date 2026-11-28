@@ -95,9 +95,33 @@ static inline uint64_t engine_shared_compat_domain(uint64_t rip, uint64_t table)
 #define CC_T2_WORD1 ((uint32_t)(CC_PART2_WORD + CC_T2_WORD0))
 #define OFF_BLOCKS_T2 (952ULL << 20) // 512 KiB in unused 952..1024 MiB (EL1 rw): 8192 BlockEntries per partition
 #define T2_BLOCKS_MAX 8192U
+#define OFF_META_T2 (953ULL << 20) // 1 MiB in unused 953..954 MiB (EL1 rw): 8192 T2TrapMeta (64B) per partition
 #define OFF_PCMAP_T2 (954ULL << 20) // 8 MiB in unused 952..1024 MiB (EL1 rw): 1M PcMaps per partition
 #define T2_PCMAP_ENTRIES (1U << 20)
 #define T2_SAMPLE_RING 64U
+#define T2_MAX_STK_SLOTS 2U
+#define T2_META_FLAG_ACTIVE 1U
+
+// Per-Tier-2-block trap reconstruction metadata (EL1 rw at OFF_META_T2).
+// When EL0 traps inside [body_start_word, body_end_word), Monitor/monitor.c uses this table to flush
+// live resident ymm8..15 highs (q24,q25,q29,q31) to EngineCtx.ymm_hi and dirty promoted stack slots
+// (x29/S5, x24/S4) to guest RAM before exception/IRQ delivery, SMC redirect, or HC_FALLBACK/HC_BOUNDARY.
+typedef struct {
+    uint32_t body_start_word; // relative to block arm_off
+    uint32_t body_end_word;   // relative to block arm_off (before epilogue/exit stubs)
+    uint8_t ymm_reg[4];       // pool slot s in {0:q24,1:q25,2:q29,3:q31}: x86 ymm 8..15, or 0 if unused
+    uint8_t ymm_wr_mask;      // bit s (0..3): slot s may be written in loop body (dirty)
+    uint8_t stk_cnt;          // 0..2 promoted stack slots
+    uint8_t stk_base;         // x86 base GPR index (4=RSP, 5=RBP)
+    uint8_t stk_dirty_mask;   // bit k (0..1): slot k is written in loop body (needs trap writeback)
+    uint8_t stk_sz[T2_MAX_STK_SLOTS];   // 4 or 8 bytes
+    uint8_t stk_phys[T2_MAX_STK_SLOTS]; // ARM64 GPR index (29=S5, 24=S4)
+    uint8_t flags;            // T2_META_FLAG_ACTIVE when resident YMM or dirty stack state exists
+    uint8_t pad[3];
+    int64_t stk_disp[T2_MAX_STK_SLOTS]; // signed displacement from stk_base
+    uint64_t rsvd[3];
+} T2TrapMeta;
+_Static_assert(sizeof(T2TrapMeta) == 64, "T2TrapMeta must be 64 bytes");
 
 static inline uint32_t engine_p0_slot_word_base(uint32_t slot) {
     return slot < 2U ? slot * P0_SLOT_WORDS : (CC_T2_WORD0 + CC_T2_WORDS + (slot - 2U) * P0_SLOT_WORDS);
@@ -110,7 +134,8 @@ static inline int engine_p0_slot_of_word(uint32_t word) {
     return -1;
 }
 _Static_assert(CC_T2_OFF + CC_T2_SIZE + 2ULL * P0_SLOT_BYTES <= CC_SIZE, "P0 ring slots + CC_T2 exceed CC_SIZE");
-_Static_assert(OFF_BLOCKS_T2 + 2ULL * T2_BLOCKS_MAX * 32ULL <= OFF_PCMAP_T2, "OFF_BLOCKS_T2 runs past OFF_PCMAP_T2");
+_Static_assert(OFF_BLOCKS_T2 + 2ULL * T2_BLOCKS_MAX * 32ULL <= OFF_META_T2, "OFF_BLOCKS_T2 runs past OFF_META_T2");
+_Static_assert(OFF_META_T2 + 2ULL * T2_BLOCKS_MAX * sizeof(T2TrapMeta) <= OFF_PCMAP_T2, "OFF_META_T2 runs past OFF_PCMAP_T2");
 _Static_assert(OFF_PCMAP_T2 + 2ULL * T2_PCMAP_ENTRIES * 4ULL <= OFF_HASH, "OFF_PCMAP_T2 runs past OFF_HASH");
 _Static_assert(OFF_FEX_L1 - OFF_CTX == (4ULL << 20), "OFF_FEX_L1 must remain exactly 4 MiB past OFF_CTX for vectors.s and L1 inline probes");
 _Static_assert(OFF_STUBS_HI + (2ULL << 20) <= OFF_PT, "part 0 code cache + high stubs run past OFF_PT");

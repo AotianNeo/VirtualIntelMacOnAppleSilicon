@@ -111,6 +111,7 @@ static BlockEntry *block_table;
 static PcMap *pc_map;
 static BlockEntry *t2_block_table;
 static PcMap *t2_pc_map;
+static T2TrapMeta *t2_trap_meta;
 // The code cache has two parts, each with its share of the block table and pc maps. Shared domains go in the first: the kernel and system libraries, which every
 // process needs and which live long. Blocks of one view go in the second, and most die with their process, unusable until a reset. Links join blocks of one key, so
 // none crosses between the parts, and the second can reset alone without taking the first with it.
@@ -1643,14 +1644,13 @@ static int t2_find_clean_loop(const Insn *list, int count, const int *tgt_idx) {
         if (h < 0 || h > i)
             continue;
         int len = i - h + 1;
-        if (len < 2 || len > 64 || len >= best_len)
+        if (len < 2 || len > 96 || len >= best_len)
             continue;
         bool ok = true;
         for (int j = h; j <= i; j++) {
             if (t2_loop_op_forbidden(&list[j])) { ok = false; break; }
             int tj = tgt_idx[j];
-            if (tj >= 0 && tj < h) { ok = false; break; }
-            if (tj > h && tj <= j) { ok = false; break; } // nested inner backedge
+            if (tj > h && tj <= j) { ok = false; break; } // nested inner backedge; tj < h is a valid cold exit
         }
         // Single-entry check: no instruction before h may jump strictly inside (h..i].
         for (int j = 0; ok && j < h; j++) {
@@ -2878,6 +2878,7 @@ void tr_init(const TrConfig *config) {
     pc_map = (PcMap *)(cfg.priv + OFF_PCMAP);
     t2_block_table = (BlockEntry *)(cfg.priv + OFF_BLOCKS_T2);
     t2_pc_map = (PcMap *)(cfg.priv + OFF_PCMAP_T2);
+    t2_trap_meta = (T2TrapMeta *)(cfg.priv + OFF_META_T2);
     ctx_ptr = (EngineCtx *)(cfg.priv + OFF_CTX);
     compile_inputs_init();
     tr_precise_flags = cfg.precise_flags;
@@ -2945,7 +2946,8 @@ void tr_init(const TrConfig *config) {
 bool tr_t2_publish(u32 t1_idx, u32 part, u32 p0_slot, u64 start_epoch, u64 head_rip,
                    u32 key, u8 cpl, bool compat, u32 patch_word, u64 frame0,
                    u16 snap_off, u16 snap_len, const u8 *snap_bytes,
-                   const u32 *code, u32 code_words, const PcMap *pcm, u32 pcm_count) {
+                   const u32 *code, u32 code_words, const PcMap *pcm, u32 pcm_count,
+                   const T2TrapMeta *trap_meta, const u32 *bail_sites, u32 bail_cnt) {
     if (part > 1 || !code_words || !pcm_count || !t2_meta[part])
         return false;
     pthread_mutex_lock(&t2_pub_lock);
@@ -2971,8 +2973,22 @@ bool tr_t2_publish(u32 t1_idx, u32 part, u32 p0_slot, u64 start_epoch, u64 head_
     i64 dist = t2_start - t1_patch;
     if (dist < -(1 << 25) || dist >= (1 << 25))
         goto out;
+    // Validate all alias-guard Tier-1 fallback branch sites fit in ±128 MiB relative B before publishing.
+    u32 *t1_body = t1_patch + 1;
+    for (u32 k = 0; k < bail_cnt; k++) {
+        if (!bail_sites || bail_sites[k] >= code_words)
+            goto out;
+        i64 bdist = t1_body - (t2_start + bail_sites[k]);
+        if (bdist < -(1 << 25) || bdist >= (1 << 25))
+            goto out;
+    }
 
     memcpy(t2_start, code, (size_t)code_words * 4);
+    for (u32 k = 0; k < bail_cnt; k++) {
+        u32 *site = t2_start + bail_sites[k];
+        i64 bdist = t1_body - site;
+        *site = 0x14000000u | ((u32)bdist & 0x3ffffffu);
+    }
     u32 map0 = t2_pcmap_used[part];
     memcpy(&t2_pc_map[map0], pcm, (size_t)pcm_count * sizeof(PcMap));
     t2_pcmap_used[part] = map0 + pcm_count;
@@ -2986,6 +3002,12 @@ bool tr_t2_publish(u32 t1_idx, u32 part, u32 p0_slot, u64 start_epoch, u64 head_
     be->map_off = map0;
     be->map_count = pcm_count;
     be->pad = 0;
+    if (t2_trap_meta) {
+        if (trap_meta)
+            t2_trap_meta[part * T2_BLOCKS_MAX + bi] = *trap_meta;
+        else
+            memset(&t2_trap_meta[part * T2_BLOCKS_MAX + bi], 0, sizeof(T2TrapMeta));
+    }
 
     T2BlockMeta *m = &t2_meta[part][bi];
     m->rip = head_rip;

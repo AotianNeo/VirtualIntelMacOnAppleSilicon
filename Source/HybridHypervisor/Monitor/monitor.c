@@ -19,6 +19,7 @@ register EngineCtx *c __asm__("x18");
 void mon_hvc(void);
 void mon_fp_save(void *);
 void mon_fp_restore(void *);
+void mon_t2_read_pool(void *);
 void mon_enter_guest(void);
 _Noreturn void mon_restart(void);
 
@@ -44,7 +45,7 @@ void *memcpy(void *d, const void *s, unsigned long n) {
 // x18 picks the vCPU. EngineCtx is reachable from EL0, so what the monitor keeps for itself sits at a fixed distance from it, in EL1 memory, with the stack at the
 // slot's top. The defines keep the old names: this state was statics, and a static in this file is now shared by every vCPU, so it must either move here or be locked.
 typedef struct {
-    bool mon_resync, walk_any_tables, evicting, event_delivered, code_cache_reset;
+    bool mon_resync, walk_any_tables, evicting, event_delivered, code_cache_reset, t2_synced;
     u32 zap_why, deliver_depth;
     u64 pt_step_slot, *pt_step_pte, pt_step_va;
     u64 note_wait_cr3, note_wait_status;
@@ -713,6 +714,76 @@ static u64 rip_here(u64 pc) {
     return rip;
 }
 
+// Reconstruct architectural ymm8..15 and dirty promoted stack slots when leaving a Tier-2 loop body on trap/fault/IRQ/SMC/stop.
+// Zero cost on Tier-1 code and retryable shadow-PT fills (returns immediately unless c->elr is inside a T2 loop body).
+static bool t2_sync_on_trap(void) {
+    if (me->t2_synced)
+        return false;
+    u64 pc = c->elr;
+    u64 cc = PRIV_VA + OFF_CC;
+    if (pc < cc || pc >= PRIV_VA + OFF_CC2 + CC_SIZE)
+        return false;
+    u32 word = (u32)((pc - cc) >> 2);
+    u32 part;
+    if (word >= CC_T2_WORD0 && word < CC_T2_WORD0 + CC_T2_WORDS)
+        part = 0U;
+    else if (word >= CC_T2_WORD1 && word < CC_T2_WORD1 + CC_T2_WORDS)
+        part = 1U;
+    else
+        return false;
+    BlockEntry *t2 = (BlockEntry *)PRIV(OFF_BLOCKS_T2);
+    u64 first = (u64)part * T2_BLOCKS_MAX;
+    u64 lo = first, hi = first + __atomic_load_n(&c0->t2_block_count[part], __ATOMIC_ACQUIRE);
+    while (lo < hi) {
+        u64 mid = (lo + hi) / 2;
+        if (t2[mid].arm_off <= word)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    if (lo <= first)
+        return false;
+    u64 idx = lo - 1;
+    BlockEntry *b = &t2[idx];
+    if (word >= b->arm_off + b->arm_words)
+        return false;
+    const T2TrapMeta *tm = &((const T2TrapMeta *)PRIV(OFF_META_T2))[idx];
+    if (!(tm->flags & T2_META_FLAG_ACTIVE))
+        return false;
+    u32 rel = word - b->arm_off;
+    if (rel < tm->body_start_word || rel >= tm->body_end_word)
+        return false;
+    me->t2_synced = true;
+    if (tm->ymm_wr_mask) {
+        u64 pool[4][2] __attribute__((aligned(16)));
+        mon_t2_read_pool(pool);
+        for (u32 s = 0; s < 4; s++) {
+            if (!(tm->ymm_wr_mask & (1U << s)))
+                continue;
+            u32 reg = tm->ymm_reg[s];
+            if (reg >= 8U && reg < 16U) {
+                c->ymm_hi[reg][0] = pool[s][0];
+                c->ymm_hi[reg][1] = pool[s][1];
+            }
+        }
+    }
+    if (tm->stk_cnt && tm->stk_dirty_mask && tm->stk_base < 16U) {
+        u32 access = c->cpl == 3 ? 4U : 0U;
+        u64 base_va = c->x[tm->stk_base];
+        for (u32 k = 0; k < tm->stk_cnt && k < T2_MAX_STK_SLOTS; k++) {
+            if (!(tm->stk_dirty_mask & (1U << k)))
+                continue;
+            u32 phys = tm->stk_phys[k];
+            u32 sz = tm->stk_sz[k];
+            if (phys < 31U && (sz == 4U || sz == 8U)) {
+                u64 val = c->x[phys];
+                guest_write(base_va + (u64)tm->stk_disp[k], &val, sz, access);
+            }
+        }
+    }
+    return true;
+}
+
 // ---- Stops ----
 // A stop this instruction can come back from, in hybrid mode. The state is precise at every rip passed to stop: nothing guest-visible changes
 // before an instruction's last access. Stops with no rip are about the engine's own limits, and stay final.
@@ -720,6 +791,7 @@ static void x87_flush_fast_cache(void);
 static void irq_deliver_now(u64 rip, u32 apic_vector);
 static void fex_unspill_state(void);
 _Noreturn static void stop(u64 reason, u64 rip, u64 a, u64 b, u64 d) {
+    t2_sync_on_trap();
     fex_unspill_state();
     if (reason == STOP_MONITOR_FAULT)
         c->req_a[5] = engine_capture_code_fault(d, PRIV_VA + OFF_CC, PRIV_VA + OFF_CC2, CC_SIZE);
@@ -2586,6 +2658,7 @@ static void handle_data_abort(bool lower) {
         c->req_a[1] = KILL_STORE;
         c->stat_smc++;
         __atomic_store_n(&page_info[gpa >> 12], pi & ~PI_CODE, __ATOMIC_RELEASE); // before the kill: see frame_unprotected
+        t2_sync_on_trap();
         hostcall(HC_SMC);
         fex_unspill_state();
         reset_all_return_stacks();
@@ -2986,6 +3059,7 @@ static void fex_unspill_state(void) {
 }
 
 static void deliver(u32 vector, u32 err, bool has_err, u64 ret_rip, bool sw_int) {
+    t2_sync_on_trap();
     bool was_fex = (c->x[R_FS] == (u64)c + 32768ULL);
     fex_unspill_state();
     if (!c->model_kernel) {
@@ -3288,6 +3362,7 @@ again:
             c->stop_requested = 0;
             c->req_a[0] = rip;
             c->req_r[0] = rip;
+            bool from_t2 = t2_sync_on_trap();
             if (in_fex)
                 fex_unspill_state();
             x87_flush_fast_cache();
@@ -3295,7 +3370,7 @@ again:
             c->fp_d_valid = 0;
             if (c->hybrid)
                 host_resync();
-            else if (in_fex || c->req_r[0] != rip || c->tr_flushed) { // restart through native state after unspilling, moving RIP, or resetting the cache
+            else if (in_fex || from_t2 || c->req_r[0] != rip || c->tr_flushed) { // restart through native state after unspilling, leaving T2, moving RIP, or resetting the cache
                 event_delivered = false;
                 c->elr = translate_here(c->req_r[0], 0, 0, false);
             }
@@ -5004,6 +5079,7 @@ static bool retry_unknown_code_fetch(void) {
 }
 
 void mon_sync(void) {
+    me->t2_synced = false;
     u32 ec = (u32)(c->esr >> 26);
     u32 n = (u32)c->esr & 0xffff;
     if (ec == 0 && retry_unknown_code_fetch())
@@ -5574,6 +5650,7 @@ void mon_sync(void) {
 }
 
 void mon_irq(void) {
+    me->t2_synced = false;
     if (me->smc_held)
         __atomic_store_n(&me->smc_held, 0, __ATOMIC_RELEASE);
     // Lockless 4-instruction Tier-2 hot-loop PC sample (zero EL0 instrumentation, zero false sharing).
@@ -5593,7 +5670,10 @@ void mon_irq(void) {
     exit_check(false, c->hybrid);
 }
 
-void mon_fiq(void) { stop(STOP_MONITOR_FAULT, 0, 0, 0, c->elr); }
+void mon_fiq(void) {
+    me->t2_synced = false;
+    stop(STOP_MONITOR_FAULT, 0, 0, 0, c->elr);
+}
 
 // Set by the host once: runs first, on the initial entry.
 void mon_init(void) {

@@ -1318,6 +1318,161 @@ BASELINE_TESTS = [
         add rax, [rbx + 128]
         xor rax, [rbx + 160]
     """),
+    ("tier2_r2_memop_dirty_ymm_residency", """
+        ; Exercises memop-safe full dirty YMM8..11 residency across loads, stores, FMA3, and VEX-128 zeroing.
+        lea rsi, [rel scratch_buf]
+        lea rdi, [rel scratch_buf + 32]
+        lea rdx, [rel scratch_buf + 256]
+        mov rax, 0x3fc000003f800000 ; 1.0f, 1.5f
+        vmovq xmm0, rax
+        vpbroadcastq ymm8, xmm0
+        mov rax, 0x400000003f000000 ; 0.5f, 2.0f
+        vmovq xmm1, rax
+        vpbroadcastq ymm9, xmm1
+        mov rax, 0xbf8000003e800000 ; 0.25f, -1.0f
+        vmovq xmm2, rax
+        vpbroadcastq ymm10, xmm2
+        vpxor ymm11, ymm11, ymm11
+        mov rcx, 8
+        mov r8, rsi
+    .r2_seed:
+        vmovdqu [r8], ymm8
+        vaddps ymm8, ymm8, ymm10
+        add r8, 32
+        dec rcx
+        jnz .r2_seed
+
+        ; Hot memop AVX2+FMA3 loop (odd trip count 7 -> 4x unroll backedge + 3rd inverted exit + dirty resident flush)
+        mov rcx, 7
+    .r2_hot_fma:
+        vmovups ymm8, [rsi]
+        vfmadd231ps ymm10, ymm9, [rdi]
+        vaddps ymm11, ymm10, ymm8
+        vmovups [rdx], ymm11
+        add rsi, 32
+        add rdi, 32
+        add rdx, 32
+        dec rcx
+        jnz .r2_hot_fma
+
+        ; VEX-128 zeroing of resident ymm10 inside memop loop (must emit VEORQ, 0 EngineCtx STR XZR)
+        lea rsi, [rel scratch_buf]
+        lea rdx, [rel scratch_buf + 256]
+        mov rcx, 7
+    .r2_hot_vex128:
+        vmovaps xmm10, [rsi]
+        vaddps ymm10, ymm10, ymm8
+        vmovups [rdx], ymm10
+        add rsi, 16
+        add rdx, 32
+        dec rcx
+        jnz .r2_hot_vex128
+
+        ; Fold output buffer into ymm12..15 so diff harness checks every stored lane
+        vmovups ymm12, [rel scratch_buf + 256]
+        vmovups ymm13, [rel scratch_buf + 288]
+        vmovups ymm14, [rel scratch_buf + 320]
+        vmovups ymm15, [rel scratch_buf + 448]
+    """),
+    ("tier2_r2_stk_promo_fast_and_alias_fallback", """
+        ; Exercises Guarded Stack-Slot Register Promotion on BOTH:
+        ;   (A) Non-aliasing fast path (2 promoted slots {x29, x24} + per-iter guard on rdx)
+        ;   (B) Deliberate aliasing path (rdx sweeps across [rsp+0x18] -> alias guard bails to Tier-1!)
+        sub rsp, 64
+        mov qword [rsp + 0x10], 0x1122334455667788
+        mov qword [rsp + 0x18], 0x0000000000000005
+        mov dword [rsp + 0x20], 0x00000007
+        lea rsi, [rel scratch_buf]
+        lea rdx, [rel scratch_buf + 256]
+
+        ; (A) Non-aliasing fast path (15 iterations -> odd count exercises intermediate exit writeback)
+        mov rcx, 15
+    .r2_stk_fast:
+        mov rax, [rsi]
+        add [rsp + 0x18], rax
+        xor rax, [rsp + 0x10]
+        mov [rdx], rax
+        add rsi, 8
+        add rdx, 8
+        dec rcx
+        jnz .r2_stk_fast
+
+        mov r8, [rsp + 0x18]
+        mov r9, [rel scratch_buf + 256]
+        mov r10, [rel scratch_buf + 256 + 14*8]
+
+        ; (B) Deliberate aliasing path: rdx starts at rsp+0x08 and sweeps directly across [rsp+0x18]
+        mov qword [rsp + 0x18], 0x1234
+        lea rdx, [rsp + 0x08]
+        lea rsi, [rel scratch_buf]
+        mov rcx, 5
+    .r2_stk_alias:
+        mov rax, [rsi]
+        add [rsp + 0x18], rax
+        mov [rdx], rax
+        add rsi, 8
+        add rdx, 8
+        dec rcx
+        jnz .r2_stk_alias
+
+        mov r11, [rsp + 0x18]
+        mov r12, [rsp + 0x10]
+        mov r13, [rsp + 0x20]
+        add rsp, 64
+    """),
+    ("tier2_r2_unroll4_edge_trip_counts", """
+        ; Verifies 4x unrolling across every trip count 1..17 (all 3 inverted intermediate exits + backedge).
+        lea rbx, [rel scratch_buf]
+        xor r8, r8
+        xor r9, r9
+        mov r10, 1
+    .r2_u4_outer:
+        mov rcx, r10
+        mov rsi, rbx
+        xor rax, rax
+    .r2_u4_inner:
+        add rax, [rsi]
+        add rsi, 8
+        dec rcx
+        jnz .r2_u4_inner
+        xor r8, rax
+        rol r8, 5
+        add r9, rax
+        inc r10
+        cmp r10, 18
+        jne .r2_u4_outer
+    """),
+    ("tier2_r2_diamond_and_licm_avx2", """
+        ; Verifies diamond if/else loop with post-dominating stack slot + AVX2 RIP-rel LICM AD.
+        sub rsp, 32
+        mov qword [rsp + 0x10], 0
+        lea rsi, [rel scratch_buf]
+        lea rdx, [rel scratch_buf + 192]
+        vpxor ymm9, ymm9, ymm9
+        mov rcx, 7
+    .r2_dia_loop:
+        mov rax, [rsi]
+        test rcx, 1
+        jz .r2_even_arm
+        add rax, 0x12345
+        jmp .r2_merge_arm
+    .r2_even_arm:
+        xor rax, 0x55aa
+    .r2_merge_arm:
+        add [rsp + 0x10], rax
+        vbroadcastss ymm8, [rel scratch_buf + 16]
+        vaddps ymm9, ymm9, ymm8
+        vmovups [rdx + 64], ymm9
+        add rsi, 8
+        add rdx, 32
+        dec rcx
+        jnz .r2_dia_loop
+
+        mov r8, [rsp + 0x10]
+        vmovups ymm10, [rel scratch_buf + 256]
+        vmovups ymm11, [rel scratch_buf + 448]
+        add rsp, 32
+    """),
 ]
 
 
