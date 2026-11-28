@@ -29,6 +29,12 @@ final class CMachine: EngineMachine {
     func apicEOI(vector: UInt8) { ops.apic_eoi(ops.opaque, vector) }
     func apicICR(_ icr: UInt64) { ops.apic_icr(ops.opaque, icr) }
     func apicTPR(_ tpr: UInt8) { ops.apic_tpr?(ops.opaque, tpr) }
+    func vmport(regs: inout [UInt64], port: UInt16, size: Int, isWrite: Bool) -> Bool {
+        guard let fn = ops.vmport else { return false }
+        return regs.withUnsafeMutableBufferPointer { buf in
+            fn(ops.opaque, buf.baseAddress!, port, UInt32(size), isWrite)
+        }
+    }
     func syscall(_ state: UnsafeMutablePointer<EngineCtx>, engine: Engine) throws {
         throw EngineError.stop("syscall with no shim: the C API is the kernel model")
     }

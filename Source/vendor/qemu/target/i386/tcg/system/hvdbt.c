@@ -72,6 +72,7 @@ static struct {
     int hpet_cal_lock;
     bool hpet_was_enabled;
     int64_t hpet_last_off;
+    bool vmport_present; /* true when QEMU's VMware backdoor device ("vmport") is realized */
 } hv;
 
 /* As the engine's MAX_VCPUS. */
@@ -225,7 +226,8 @@ static bool hvdbt_direct_section(MemoryRegionSection *section)
 {
     const char *name = memory_region_name(section->mr);
 
-    if (!name || (strcmp(name, "vga.vram") && strcmp(name, "vmsvga.fifo") &&
+    if (!name || (strcmp(name, "vga.vram") && strcmp(name, "vmvga.vram") &&
+                  strcmp(name, "vmsvga.fifo") && strcmp(name, "vmvga.fifo") &&
                   strcmp(name, "vim-gl-headless-mailbox")) || !memory_region_is_ram(section->mr)) {
         return false;
     }
@@ -310,12 +312,15 @@ static void hvdbt_direct_commit(MemoryListener *listener)
     hv_direct_del_n = 0;
 }
 
-/* shortcut: everything counts as written at each sync, so legacy VGA redraws whole frames. It is only the boot screens; narrow it with write protection if they ever matter. */
+/* shortcut: everything counts as written at each sync, so legacy VGA / SVGA 2D redraws whole frames. FIFO RAM does not need VGA dirty marks. */
 static void hvdbt_direct_sync(MemoryListener *listener, MemoryRegionSection *section)
 {
     if (hvdbt_direct_section(section)) {
-        physical_memory_set_dirty_range(memory_region_get_ram_addr(section->mr), int128_get64(section->size),
-                                        1 << DIRTY_MEMORY_VGA);
+        const char *name = memory_region_name(section->mr);
+        if (name && (!strcmp(name, "vga.vram") || !strcmp(name, "vmvga.vram"))) {
+            physical_memory_set_dirty_range(memory_region_get_ram_addr(section->mr), int128_get64(section->size),
+                                            1 << DIRTY_MEMORY_VGA);
+        }
     }
 }
 
@@ -621,6 +626,51 @@ static void hvdbt_apic_tpr(void *opaque, uint8_t tpr)
     cpu_set_apic_tpr(apic, new_tpr >> 4);
     hvdbt_after_device(opaque);
     bql_unlock();
+}
+
+/* VMware backdoor (0x5658) fast path: syncs [RAX, RCX, RDX, RBX, RBP, RSI, RDI] directly with QEMU vmport
+ * without leaving HVDBT for a TCG fallback or TLB flush. Permits Ring-3 calls (vm3dum64.dll / guest agents)
+ * whenever the QEMU vmport device is realized, matching aero-on-apple-silicon's helper_check_io() semantics. */
+static bool hvdbt_vmport(void *opaque, uint64_t regs[7], uint16_t port, unsigned size, bool is_write)
+{
+    CPUState *cs = opaque;
+    if (!hv.vmport_present || port != 0x5658) {
+        return false;
+    }
+    CPUX86State *env = cpu_env(cs);
+    bql_lock();
+    hvdbt_sync_eoi_to_apic(cs);
+    env->regs[R_EAX] = regs[0];
+    env->regs[R_ECX] = regs[1];
+    env->regs[R_EDX] = regs[2];
+    env->regs[R_EBX] = regs[3];
+    env->regs[R_EBP] = regs[4];
+    env->regs[R_ESI] = regs[5];
+    env->regs[R_EDI] = regs[6];
+    if (is_write) {
+        uint32_t val = (uint32_t)regs[0];
+        address_space_write(&address_space_io, port, MEMTXATTRS_UNSPECIFIED, &val, size);
+    } else {
+        uint32_t val = 0;
+        address_space_read(&address_space_io, port, MEMTXATTRS_UNSPECIFIED, &val, size);
+        if (size == 4) {
+            env->regs[R_EAX] = val;
+        } else if (size == 2) {
+            env->regs[R_EAX] = (env->regs[R_EAX] & ~0xffffULL) | (val & 0xffffu);
+        } else {
+            env->regs[R_EAX] = (env->regs[R_EAX] & ~0xffULL) | (val & 0xffu);
+        }
+    }
+    regs[0] = env->regs[R_EAX];
+    regs[1] = env->regs[R_ECX];
+    regs[2] = env->regs[R_EDX];
+    regs[3] = env->regs[R_EBX];
+    regs[4] = env->regs[R_EBP];
+    regs[5] = env->regs[R_ESI];
+    regs[6] = env->regs[R_EDI];
+    hvdbt_after_device(cs);
+    bql_unlock();
+    return true;
 }
 
 /* ---- State ---- */
@@ -954,6 +1004,7 @@ static void hvdbt_set_ops(EngineMachineOps *ops, CPUState *cs)
         .apic_eoi = hvdbt_apic_eoi,
         .apic_icr = hvdbt_apic_icr,
         .apic_tpr = hvdbt_apic_tpr,
+        .vmport = hvdbt_vmport,
     };
 }
 
@@ -965,8 +1016,8 @@ static bool hvdbt_check_vga_bar(Int128 start, Int128 len, const MemoryRegion *mr
 {
     bool *found = opaque;
     const char *name = memory_region_name(mr);
-    if (name && !strcmp(name, "vga.vram") && memory_region_is_ram(mr) &&
-        int128_get64(start) >= (1ULL << 20)) {
+    if (name && (!strcmp(name, "vga.vram") || !strcmp(name, "vmvga.vram")) &&
+        memory_region_is_ram(mr) && int128_get64(start) >= (1ULL << 20)) {
         *found = true;
         return true;
     }
@@ -1036,6 +1087,7 @@ static bool hvdbt_create(CPUState *cs)
     hv.ram_base = memory_region_get_ram_addr(ms->ram);
     hv.ram_bytes = ms->ram_size;
     hv.below_4g = x86ms->above_4g_mem_size ? x86ms->below_4g_mem_size : ms->ram_size;
+    hv.vmport_present = object_resolve_path_type("", "vmport", NULL) != NULL;
     HV(cs)->protect_all = true;
     HV(cs)->engine = engine;
     hv.engine = engine; /* hvdbt_mark_device reads it, and nothing else can until the release below */

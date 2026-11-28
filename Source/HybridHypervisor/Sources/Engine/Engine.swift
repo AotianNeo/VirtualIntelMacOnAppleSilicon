@@ -22,6 +22,8 @@ public protocol EngineMachine: AnyObject {
     func apicICR(_ icr: UInt64)
     /// Hybrid: CR8/TPR update forwarded directly to QEMU's APIC.
     func apicTPR(_ tpr: UInt8)
+    /// Hybrid: VMware backdoor (0x5658) syncing [RAX,RCX,RDX,RBX,RBP,RSI,RDI] directly with QEMU vmport.
+    func vmport(regs: inout [UInt64], port: UInt16, size: Int, isWrite: Bool) -> Bool
     /// True when an interrupt wants delivering; the engine then raises the guest's IRQ line on the vCPU thread.
     func hasInterruptWaiting() -> Bool
     /// End this run at a host-visible boundary, including a completed HLT.
@@ -34,6 +36,7 @@ public protocol EngineMachine: AnyObject {
 extension EngineMachine {
     public var shouldStopRun: Bool { false }
     public func apicTPR(_ tpr: UInt8) {}
+    public func vmport(regs: inout [UInt64], port: UInt16, size: Int, isWrite: Bool) -> Bool { false }
 }
 
 public struct EngineOptions {
@@ -827,6 +830,30 @@ public final class Engine {
             machine?.apicICR(c.pointee.req_a.0)
         case Int(HC_APIC_TPR):
             machine?.apicTPR(UInt8(truncatingIfNeeded: c.pointee.req_a.0))
+        case Int(HC_VMPORT):
+            guard let machine else { throw EngineError.stop("vmport access with no machine attached") }
+            let port = UInt16(truncatingIfNeeded: c.pointee.req_a.0)
+            let size = Int(c.pointee.req_a.1)
+            let isWrite = c.pointee.req_a.2 != 0
+            tally?.port(port)
+            portCount += 1
+            var regs: [UInt64] = [
+                c.pointee.x.0, c.pointee.x.1, c.pointee.x.2, c.pointee.x.3,
+                c.pointee.x.5, c.pointee.x.6, c.pointee.x.7,
+            ]
+            if machine.vmport(regs: &regs, port: port, size: size, isWrite: isWrite) {
+                c.pointee.x.0 = regs[0]
+                c.pointee.x.1 = regs[1]
+                c.pointee.x.2 = regs[2]
+                c.pointee.x.3 = regs[3]
+                c.pointee.x.5 = regs[4]
+                c.pointee.x.6 = regs[5]
+                c.pointee.x.7 = regs[6]
+                c.pointee.req_r.0 = regs[0]
+                c.pointee.req_r.1 = 1
+            } else {
+                c.pointee.req_r.1 = 0
+            }
         case Int(HC_BOUNDARY):
             if !options.hybrid && severalVCPUs && machine?.shouldStopRun != true { // a cache reset keeps this vCPU in the monitor; an explicit machine stop does not
                 gate.leave()
@@ -1012,8 +1039,8 @@ public final class Engine {
     }
 
     public func mapDirect(gpa: UInt64, host: UnsafeMutableRawPointer, bytes: UInt64) -> Bool {
-        // A frame must be describable to the monitor, and must not be RAM already.
-        guard gpa + bytes <= ramTop else { return false }
+        // A frame must fit within page_info (covers [0, PRIV_IPA) = 60 GB < 64 GB table), and must not be RAM already.
+        guard gpa <= kPrivIPA, bytes <= kPrivIPA - gpa else { return false }
         let pageInfo = (priv + Int(kOffPageInfo)).assumingMemoryBound(to: UInt8.self)
         for frame in stride(from: gpa >> 12, to: (gpa + bytes) >> 12, by: 1) where pageInfo[Int(frame)] & UInt8(PI_RAM) != 0 { return false }
         let rwx = hv_memory_flags_t(HV_MEMORY_READ | HV_MEMORY_WRITE | HV_MEMORY_EXEC)
@@ -1036,10 +1063,15 @@ public final class Engine {
 
     public func unmapDirect(gpa: UInt64, bytes: UInt64) {
         let pageInfo = (priv + Int(kOffPageInfo)).assumingMemoryBound(to: UInt8.self)
-        for frame in stride(from: gpa >> 12, to: (gpa + bytes) >> 12, by: 1) { pageInfo[Int(frame)] &= ~UInt8(PI_DIRECT) }
+        let end = min(gpa &+ bytes, kPrivIPA)
+        if gpa < end {
+            for frame in stride(from: gpa >> 12, to: end >> 12, by: 1) { pageInfo[Int(frame)] &= ~UInt8(PI_DIRECT) }
+        }
         gate.condition.lock()
-        for engine in gate.engines { engine.ctx.pointee.direct_flush = 1 }
+        let engines = gate.engines
+        for engine in engines { engine.ctx.pointee.direct_flush = 1 }
         gate.condition.unlock()
+        for engine in engines { engine.interruptRequested() }
         hv_vm_unmap(gpa, Int(bytes))
     }
 

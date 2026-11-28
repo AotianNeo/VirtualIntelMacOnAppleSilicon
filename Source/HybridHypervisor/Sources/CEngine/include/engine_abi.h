@@ -225,6 +225,7 @@ enum {
     HC_CALL_TAIL, // a[0] a cross-key call/jump site, a[1] its x86 target: use a view lookup without repeatedly entering the monitor
     HC_CODE_FETCH_RETRY, // a[0] ARM pc, a[1] x86 block entry or 0, a[2] this vCPU's retry count (only the first few are reported)
     HC_APIC_TPR, // a[0] new TPR (bits 7:4): hybrid mode fast-path for CR8/TPR writes without TCG fallback
+    HC_VMPORT, // a[0] port (0x5658), a[1] size, a[2] is write; syncs RAX/RCX/RDX/RBX/RBP/RSI/RDI directly with QEMU vmport (r[1]=1 handled, r[0]=EAX)
 };
 
 // Stop reasons for HC_STOP.

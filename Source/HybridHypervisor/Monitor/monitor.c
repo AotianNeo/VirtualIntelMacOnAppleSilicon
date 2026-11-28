@@ -281,8 +281,9 @@ static u64 hole_entry_priv, hole_entry_ram; // root-level descriptors for the pr
 static inline u64 *pool_page(u32 idx) { return (u64 *)(POOL_VA + (u64)idx * 4096); }
 static inline u32 pool_index(const void *p) { return (u32)(((u64)p - POOL_VA) >> 12); }
 // ram_size is the top of RAM: below it there can be holes, which belong to devices.
+// Direct-mapped PCI BARs (e.g. VRAM/FIFO) may sit above ram_size on <=3 GB VMs or 64-bit BARs, up to PRIV_IPA (60 GB < 64 GB page_info).
 static inline bool is_ram(u64 gpa) { return gpa < c->ram_size && (page_info[gpa >> 12] & PI_RAM); }
-static inline bool is_direct(u64 gpa) { return gpa < c->ram_size && (page_info[gpa >> 12] & PI_DIRECT); }
+static inline bool is_direct(u64 gpa) { return gpa < PRIV_IPA && (page_info[gpa >> 12] & PI_DIRECT); }
 
 
 static u32 pool_alloc(u32 view, u32 level, u64 guest_table, u64 va_base) {
@@ -993,7 +994,7 @@ static u64 *shadow_install(View *v, u64 va, const Walk *w, bool want_write) {
     u64 gpa = w->gpa & ~0xfffULL;
     u64 pte = gpa | PTE_VALID | PTE_AF | PTE_SH | PTE_NG | PTE_PXN | PTE_UXN | (old & PTE_X_MARK);
     bool writable = w->write && w->dirty;
-    u8 pi = gpa < c->ram_size ? page_info[gpa >> 12] : 0;
+    u8 pi = gpa < PRIV_IPA ? page_info[gpa >> 12] : 0;
     if (writable && (pi & (PI_CODE | PI_PT)))
         writable = false;
     pte |= writable ? AP_RW : AP_RO;
@@ -4604,8 +4605,21 @@ void mon_sync(void) {
                 break;
             case SVC_IN:
             case SVC_OUT: {
-                if (c->hybrid && (c->x[R_S0] & 0xffff) == 0x5658)
+                u16 port = (u16)(c->x[R_S0] & 0xffff);
+                if (c->hybrid && port == 0x5658) {
+                    // VMware backdoor: permit Ring-3 (vm3dum64.dll / guest agents) when QEMU vmport exists
+                    // and sync all 7 backdoor GPRs directly without a TCG fallback or TLB flush.
+                    c->req_a[0] = port;
+                    c->req_a[1] = c->x[R_S1];
+                    c->req_a[2] = n == SVC_OUT;
+                    hostcall(HC_VMPORT);
+                    if (c->req_r[1]) {
+                        if (n == SVC_IN)
+                            c->x[R_S0] = c->req_r[0];
+                        break;
+                    }
                     stop(STOP_FALLBACK, rip_here(c->elr - 4), FB_VMPORT, 0, 0);
+                }
                 u32 iopl = (u32)(c->rflags_sys >> 12) & 3;
                 if (c->cpl > iopl) {
                     x86_gp0();

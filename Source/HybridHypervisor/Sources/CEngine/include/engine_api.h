@@ -34,6 +34,9 @@ typedef struct {
     void (*apic_icr)(void *opaque, uint64_t icr);
     // Hybrid: CR8/TPR update forwarded directly to QEMU's APIC without a TCG fallback.
     void (*apic_tpr)(void *opaque, uint8_t tpr);
+    // Hybrid: VMware backdoor (0x5658) fast-path syncing [RAX,RCX,RDX,RBX,RBP,RSI,RDI] directly with QEMU vmport.
+    // Returns false if no vmport device is present so the monitor can fall back to TCG IOPB/#GP checks.
+    bool (*vmport)(void *opaque, uint64_t regs[7], uint16_t port, unsigned size, bool is_write);
 } EngineMachineOps;
 
 typedef struct {
