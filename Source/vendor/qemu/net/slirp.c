@@ -89,6 +89,8 @@ struct GuestFwd {
     Slirp *slirp;
 };
 
+#define SLIRP_MAX_QUEUED_PACKETS 256
+
 typedef struct SlirpState {
     NetClientState nc;
     QTAILQ_ENTRY(SlirpState) entry;
@@ -99,6 +101,7 @@ typedef struct SlirpState {
     gchar *smb_dir;
 #endif
     GSList *fwd;
+    unsigned int queued_packets;
 } SlirpState;
 
 static struct slirp_config_str *slirp_configs;
@@ -116,18 +119,41 @@ static void slirp_smb_cleanup(SlirpState *s);
 static inline void slirp_smb_cleanup(SlirpState *s) { }
 #endif
 
+static void net_slirp_send_completed(NetClientState *nc, ssize_t len)
+{
+    SlirpState *s = DO_UPCAST(SlirpState, nc, nc);
+
+    if (s->queued_packets > 0) {
+        s->queued_packets--;
+    }
+    if (s->queued_packets == 0) {
+        qemu_notify_event();
+    }
+}
+
 static ssize_t net_slirp_send_packet(const void *pkt, size_t pkt_len,
                                      void *opaque)
 {
     SlirpState *s = opaque;
     uint8_t min_pkt[ETH_ZLEN];
     size_t min_pktsz = sizeof(min_pkt);
+    ssize_t ret;
 
     if (net_peer_needs_padding(&s->nc)) {
         if (eth_pad_short_frame(min_pkt, &min_pktsz, pkt, pkt_len)) {
             pkt = min_pkt;
             pkt_len = min_pktsz;
         }
+    }
+
+    if (s->queued_packets < SLIRP_MAX_QUEUED_PACKETS) {
+        ret = qemu_send_packet_async(&s->nc, pkt, pkt_len,
+                                     net_slirp_send_completed);
+        if (ret == 0) {
+            s->queued_packets++;
+            return pkt_len;
+        }
+        return ret;
     }
 
     return qemu_send_packet(&s->nc, pkt, pkt_len);
@@ -329,15 +355,23 @@ static int slirp_poll_to_gio(int events)
     return ret;
 }
 
+typedef struct SlirpPollCtx {
+    GArray *pollfds;
+    bool pause_in;
+} SlirpPollCtx;
+
 static int net_slirp_add_poll(slirp_os_socket fd, int events, void *opaque)
 {
-    GArray *pollfds = opaque;
+    SlirpPollCtx *ctx = opaque;
+    if (ctx->pause_in) {
+        events &= ~SLIRP_POLL_IN;
+    }
     GPollFD pfd = {
         .fd = fd,
         .events = slirp_poll_to_gio(events),
     };
-    int idx = pollfds->len;
-    g_array_append_val(pollfds, pfd);
+    int idx = ctx->pollfds->len;
+    g_array_append_val(ctx->pollfds, pfd);
     return idx;
 }
 
@@ -377,10 +411,15 @@ static void net_slirp_poll_notify(Notifier *notifier, void *data)
     SlirpState *s = container_of(notifier, SlirpState, poll_notifier);
 
     switch (poll->state) {
-    case MAIN_LOOP_POLL_FILL:
+    case MAIN_LOOP_POLL_FILL: {
+        SlirpPollCtx ctx = {
+            .pollfds = poll->pollfds,
+            .pause_in = s->queued_packets > 0,
+        };
         slirp_pollfds_fill_socket(s->slirp, &poll->timeout,
-                                  net_slirp_add_poll, poll->pollfds);
+                                  net_slirp_add_poll, &ctx);
         break;
+    }
     case MAIN_LOOP_POLL_OK:
     case MAIN_LOOP_POLL_ERR:
         slirp_pollfds_poll(s->slirp, poll->state == MAIN_LOOP_POLL_ERR,
@@ -665,6 +704,16 @@ static int net_slirp_init(NetClientState *peer, const char *model,
     cfg.vnameserver6 = ip6_dns;
     cfg.vdnssearch = dnssearch;
     cfg.vdomainname = vdomainname;
+    {
+        const char *mtu_env = getenv("QEMU_SLIRP_MTU");
+        if (mtu_env && *mtu_env) {
+            unsigned long mtu = strtoul(mtu_env, NULL, 10);
+            if (mtu >= 576 && mtu <= 65521) {
+                cfg.if_mtu = mtu;
+                cfg.if_mru = mtu;
+            }
+        }
+    }
     s->slirp = slirp_new(&cfg, &slirp_cb, s);
     QTAILQ_INSERT_TAIL(&slirp_stacks, s, entry);
 

@@ -359,16 +359,19 @@ set_interrupt_cause(E1000State *s, int index, uint32_t val)
         mit_update_delay(&mit_delay, s->mac_reg[ITR]);
 
         /*
-         * According to e1000 SPEC, the Ethernet controller guarantees
-         * a maximum observable interrupt rate of 7813 interrupts/sec.
-         * Thus if mit_delay < 500 then the delay should be set to the
-         * minimum delay possible which is 500.
+         * Respect guest-disabled moderation (mit_delay == 0) instead of
+         * forcing a 128 us floor (500 * 256 ns), and cap virtual coalescing
+         * at ~16 us (64 * 256 ns) so burst interrupts still coalesce without
+         * stalling low-window backends (e.g. SLIRP 64 KiB TCP window).
          */
-        mit_delay = (mit_delay < 500) ? 500 : mit_delay;
-
-        s->mit_timer_on = 1;
-        timer_mod(s->mit_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
-                  mit_delay * 256);
+        if (mit_delay > 64) {
+            mit_delay = 64;
+        }
+        if (mit_delay > 0) {
+            s->mit_timer_on = 1;
+            timer_mod(s->mit_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                      (int64_t)mit_delay * 256);
+        }
         s->mit_ide = 0;
     }
 
@@ -422,6 +425,7 @@ static void e1000_reset_hold(Object *obj, ResetType type)
     timer_del(d->autoneg_timer);
     timer_del(d->mit_timer);
     timer_del(d->flush_queue_timer);
+    qemu_purge_queued_packets(qemu_get_queue(d->nic));
     d->mit_timer_on = 0;
     d->mit_irq_level = 0;
     d->mit_ide = 0;
@@ -988,7 +992,7 @@ e1000_receive_iov(NetClientState *nc, const struct iovec *iov, int iovcnt)
     total_size = size + e1000x_fcs_len(s->mac_reg);
     if (!e1000_has_rxbufs(s, total_size)) {
         e1000_receiver_overrun(s, total_size);
-        return -1;
+        return 0;
     }
     do {
         desc_size = total_size - desc_offset;

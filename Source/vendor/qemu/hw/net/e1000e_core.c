@@ -51,8 +51,10 @@
 
 #include "trace.h"
 
-/* No more then 7813 interrupts per second according to spec 10.2.4.2 */
-#define E1000E_MIN_XITR     (500)
+/* Virtual interrupt throttling cap (~16 us) avoids stalling low-window backends
+ * such as SLIRP while still coalescing synchronous packet bursts. */
+#define E1000E_MIN_XITR          (64)
+#define E1000E_MAX_INTR_DELAY_NS (16000)
 
 #define E1000E_MAX_TX_FRAGS (64)
 
@@ -107,6 +109,10 @@ e1000e_intrmgr_rearm_timer(E1000IntrDelayTimer *timer)
 {
     int64_t delay_ns = (int64_t) timer->core->mac[timer->delay_reg] *
                                  timer->delay_resolution_ns;
+
+    if (delay_ns > E1000E_MAX_INTR_DELAY_NS) {
+        delay_ns = E1000E_MAX_INTR_DELAY_NS;
+    }
 
     trace_e1000e_irq_rearm_timer(timer->delay_reg << 2, delay_ns);
 
@@ -2817,7 +2823,7 @@ e1000e_set_itr(E1000ECore *core, int index, uint32_t val)
     trace_e1000e_irq_itr_set(val);
 
     core->itr_guest_value = interval;
-    core->mac[index] = MAX(interval, E1000E_MIN_XITR);
+    core->mac[index] = interval ? MIN(interval, E1000E_MIN_XITR) : 0;
 }
 
 static void
@@ -2829,7 +2835,7 @@ e1000e_set_eitr(E1000ECore *core, int index, uint32_t val)
     trace_e1000e_irq_eitr_set(eitr_num, val);
 
     core->eitr_guest_value[eitr_num] = interval;
-    core->mac[index] = MAX(interval, E1000E_MIN_XITR);
+    core->mac[index] = interval ? MIN(interval, E1000E_MIN_XITR) : 0;
 }
 
 static void
