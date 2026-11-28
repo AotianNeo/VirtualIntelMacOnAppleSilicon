@@ -68,6 +68,8 @@ typedef struct {
     u32 hybrid_apic_id_val;
     u32 hybrid_apic_ver_cached;
     u32 hybrid_apic_ver_val;
+    u64 hv_hc_va_cached;
+    u64 hv_hc_gpa_cached;
     u8 fx_area[512] __attribute__((aligned(16))); // the x87 save formats, one at a time
 } MonCpu;
 _Static_assert(sizeof(MonCpu) <= CTX_SLOT / 2, "the rest of the slot is the stack");
@@ -1982,6 +1984,50 @@ static inline bool walk_still_valid(const Walk *w) {
     return true;
 }
 
+static inline void hybrid_apic_tpr_write(u32 new_tpr) {
+    u32 old_tpr = c->apic_tpr;
+    new_tpr &= 0xffu;
+    if (new_tpr != old_tpr)
+        __atomic_store_n(&c->apic_tpr, new_tpr, __ATOMIC_SEQ_CST);
+    if ((new_tpr & 0xf0u) <= (old_tpr & 0xf0u) &&
+        __atomic_load_n(&c->apic_irr_prio, __ATOMIC_SEQ_CST) > (new_tpr & 0xf0u)) {
+        c->req_a[0] = new_tpr;
+        hostcall(HC_APIC_TPR);
+    }
+}
+
+static void hybrid_apic_eoi_fast(bool *did_fast) {
+    u32 isrv = apic_highest(c->apic_isr);
+    if (!isrv) {
+        if (did_fast)
+            *did_fast = true;
+        return;
+    }
+    bool level = (c->apic_tmr[isrv >> 5] >> (isrv & 31)) & 1u;
+    bool fast_ok = false;
+    if (!level && !c->hybrid_apic_vapic) {
+        u32 wi = isrv >> 5, bm = 1u << (isrv & 31);
+        c->apic_isr[wi] &= ~bm;
+        u32 next_isrv = apic_highest(c->apic_isr);
+        u32 tpr_p = c->apic_tpr & 0xf0u;
+        u32 isr_p = next_isrv & 0xf0u;
+        u32 new_ppr = tpr_p >= isr_p ? tpr_p : isr_p;
+        __atomic_store_n(&c->hybrid_eoi_pending, 1u, __ATOMIC_SEQ_CST);
+        u32 irr_prio = __atomic_load_n(&c->apic_irr_prio, __ATOMIC_SEQ_CST);
+        if (irr_prio == 0 || irr_prio <= new_ppr) {
+            fast_ok = true;
+        } else {
+            c->apic_isr[wi] |= bm;
+        }
+    }
+    if (!fast_ok) {
+        c->req_a[0] = isrv;
+        hostcall(HC_APIC_EOI);
+    }
+    if (did_fast)
+        *did_fast = fast_ok;
+}
+
 static void handle_data_abort(bool lower) {
     (void)lower;
     u64 far = c->far, esr = c->esr;
@@ -2064,46 +2110,12 @@ static void handle_data_abort(bool lower) {
             if (a.load) {
                 r = c->apic_tpr;
             } else {
-                u32 old_tpr = c->apic_tpr;
-                u32 new_tpr = (u32)val & 0xffu;
-                if (new_tpr != old_tpr) {
-                    __atomic_store_n(&c->apic_tpr, new_tpr, __ATOMIC_SEQ_CST);
-                    if (new_tpr < old_tpr &&
-                        __atomic_load_n(&c->apic_irr_prio, __ATOMIC_SEQ_CST) > (new_tpr & 0xf0u)) {
-                        c->req_a[0] = new_tpr;
-                        hostcall(HC_APIC_TPR);
-                    }
-                }
+                hybrid_apic_tpr_write((u32)val & 0xffu);
             }
             c->stat_mmio_vm++;
         } else if (reg == 0xb0 && !a.load) { // hybrid LAPIC EOI fast path: defer edge-triggered EOI when no IRR unmasked
-            u32 isrv = apic_highest(c->apic_isr);
-            if (!isrv) {
-                c->stat_mmio_vm++;
-            } else {
-                bool level = (c->apic_tmr[isrv >> 5] >> (isrv & 31)) & 1u;
-                bool fast_ok = false;
-                if (!level && !c->hybrid_apic_vapic) {
-                    u32 wi = isrv >> 5, bm = 1u << (isrv & 31);
-                    c->apic_isr[wi] &= ~bm;
-                    u32 next_isrv = apic_highest(c->apic_isr);
-                    u32 tpr_p = c->apic_tpr & 0xf0u;
-                    u32 isr_p = next_isrv & 0xf0u;
-                    u32 new_ppr = tpr_p >= isr_p ? tpr_p : isr_p;
-                    __atomic_store_n(&c->hybrid_eoi_pending, 1u, __ATOMIC_SEQ_CST);
-                    u32 irr_prio = __atomic_load_n(&c->apic_irr_prio, __ATOMIC_SEQ_CST);
-                    if (irr_prio == 0 || irr_prio <= new_ppr) {
-                        fast_ok = true;
-                    } else {
-                        c->apic_isr[wi] |= bm;
-                    }
-                }
-                if (!fast_ok) {
-                    c->req_a[0] = isrv;
-                    hostcall(HC_APIC_EOI);
-                }
-                c->stat_mmio_vm++;
-            }
+            hybrid_apic_eoi_fast(0);
+            c->stat_mmio_vm++;
         } else if (reg == 0x300 || reg == 0x310) { // the kernel reads both and writes both for each IPI, and only the last write needs QEMU
             if (a.load)
                 r = reg == 0x300 ? c->apic_icr_lo : c->apic_icr_hi;
@@ -3426,10 +3438,508 @@ static void do_mov_cr_write(void) {
 #define MSR_SYSENTER_ESP 0x175u
 #define MSR_SYSENTER_EIP 0x176u
 
+// ---- Hyper-V Enlightenments (Microsoft TLFS, EL1 zero-VM-exit fast paths) ----
+// Shared with Swift (Engine.swift / Tally.swift) at a dedicated 4 KiB page inside OFF_MON_DATA
+// (after the 512 KiB handoff slot, well below OFF_MON_CPU at +1 MiB) so engine_abi.h stays untouched.
+#define HV_SHARED_OFF (OFF_MON_DATA + 0x81000ULL)
+#define HV_SHARED_MAGIC 0x4856454E4C494748ULL // "HVENLIGH"
+#define HV_SHARED_VERSION 1u
+
+#define HV_FEAT_TIME_REF_COUNT (1u << 1)
+#define HV_FEAT_APIC_ACCESS (1u << 4)
+#define HV_FEAT_HYPERCALL (1u << 5)
+#define HV_FEAT_VP_INDEX (1u << 6)
+#define HV_FEAT_REFERENCE_TSC (1u << 9)
+#define HV_FEAT_ACCESS_FREQ_MSRS (1u << 11)
+
+#define HV_MSR_GUEST_OS_ID 0x40000000u
+#define HV_MSR_HYPERCALL 0x40000001u
+#define HV_MSR_VP_INDEX 0x40000002u
+#define HV_MSR_TIME_REF_COUNT 0x40000020u
+#define HV_MSR_REFERENCE_TSC 0x40000021u
+#define HV_MSR_TSC_FREQUENCY 0x40000022u
+#define HV_MSR_APIC_FREQUENCY 0x40000023u
+#define HV_MSR_EOI 0x40000070u
+#define HV_MSR_ICR 0x40000071u
+#define HV_MSR_TPR 0x40000072u
+#define HV_MSR_APIC_ASSIST_PAGE 0x40000073u
+
+#define HV_STATUS_SUCCESS 0ULL
+#define HV_STATUS_INVALID_HYPERCALL_CODE 2ULL
+#define HV_STATUS_INVALID_HYPERCALL_INPUT 3ULL
+#define HV_STATUS_INVALID_ALIGNMENT 4ULL
+#define HV_STATUS_INVALID_PARAMETER 5ULL
+
+#define HVCALL_FLUSH_VIRTUAL_ADDRESS_SPACE 0x0002u
+#define HVCALL_FLUSH_VIRTUAL_ADDRESS_LIST 0x0003u
+#define HVCALL_NOTIFY_LONG_SPIN_WAIT 0x0008u
+#define HVCALL_FLUSH_VIRTUAL_ADDRESS_SPACE_EX 0x0013u
+#define HVCALL_FLUSH_VIRTUAL_ADDRESS_LIST_EX 0x0014u
+
+typedef struct {
+    u64 apic_assist_msr;
+    u64 stat_msr_time_ref;
+    u64 stat_msr_ref_tsc_w;
+    u64 stat_msr_eoi;
+    u64 stat_msr_eoi_fast;
+    u64 stat_msr_tpr_r;
+    u64 stat_msr_tpr_w;
+    u64 stat_msr_icr_r;
+    u64 stat_msr_icr_w;
+    u64 stat_msr_apic_assist_w;
+    u64 stat_msr_vp_index;
+    u64 stat_msr_guest_os_id_w;
+    u64 stat_msr_hypercall_w;
+    u64 stat_hc_spinwait;
+    u64 stat_hc_flush_space;
+    u64 stat_hc_flush_list;
+    u64 stat_hc_flush_space_ex;
+    u64 stat_hc_flush_list_ex;
+    u64 stat_hc_flush_gva_reps;
+    u64 stat_hc_unknown;
+    u64 last_unknown_code;
+    u64 pad[3];
+} HvCpuShared __attribute__((aligned(64)));
+
+typedef struct {
+    u64 magic;
+    u32 version;
+    u32 enabled;
+    u32 feat_eax;
+    u32 feat_edx;
+    u32 enlighten_eax;
+    u32 spinlock_attempts;
+    u64 guest_os_id;
+    u64 hypercall_msr;
+    u64 ref_tsc_msr;
+    u32 tsc_seq;
+    u32 pad_hdr;
+    HvCpuShared cpu[MAX_VCPUS];
+} HvSharedBlock;
+
+typedef struct {
+    u32 tsc_sequence;
+    u32 reserved1;
+    u64 tsc_scale;
+    i64 tsc_offset;
+} HvReferenceTscPage;
+
+_Static_assert(sizeof(HvCpuShared) == 192, "HvCpuShared must be 192 bytes (3 cache lines) to match Swift");
+_Static_assert(__builtin_offsetof(HvSharedBlock, cpu) == 64, "HvSharedBlock.cpu offset must be 64 to match Swift");
+_Static_assert(sizeof(HvSharedBlock) <= 4096, "HvSharedBlock must fit within one 4 KiB page");
+
+#define hv_blk ((HvSharedBlock *)PRIV(HV_SHARED_OFF))
+static inline bool hv_active(void) {
+    return hv_blk->magic == HV_SHARED_MAGIC && hv_blk->enabled != 0;
+}
+
+static bool udiv128(u64 hi, u64 lo, u64 d, u64 *q, u64 *r);
+
 // The 24 MHz counter in nanoseconds, then at the guest's TSC rate, in the same steps as QEMU's cpu_get_tsc so TCG and the engine agree.
+static inline u64 hv_vm_ns_now(void) {
+    return (RSR(cntvct_el0) + c->tsc_counter_offset) * 125 / 3 + c->tsc_ns_offset;
+}
 static inline u64 tsc_now(void) {
-    u64 ns = (RSR(cntvct_el0) + c->tsc_counter_offset) * 125 / 3 + c->tsc_ns_offset;
+    u64 ns = hv_vm_ns_now();
     return ns + ns * c->tsc_num / c->tsc_den + c->tsc_offset;
+}
+static inline u64 hv_tsc_freq_hz(void) {
+    u64 den = c->tsc_den ? c->tsc_den : 1;
+    return 1000000000ULL + (1000000000ULL * c->tsc_num) / den;
+}
+
+static void hv_prepare_guest_page_write(u64 gpa) {
+    LOCK_REQUIRED();
+    u32 fr = (u32)(gpa >> 12);
+    u8 pi = page_info[fr];
+    if (pi & PI_CODE) {
+        c->req_a[0] = gpa;
+        c->req_a[1] = KILL_STORE;
+        __atomic_store_n(&page_info[fr], (u8)(pi & ~PI_CODE), __ATOMIC_RELEASE);
+        hostcall(HC_SMC);
+        reset_all_return_stacks();
+        pi = page_info[fr];
+    }
+    if (pi & PI_PT) {
+        if (!mirror_head[fr]) {
+            page_info[fr] = (u8)(pi & ~PI_PT);
+        } else {
+            for (u32 i = 0; i < 512; i++)
+                pt_slot_changed(gpa + (u64)i * 8);
+        }
+    }
+}
+
+static bool hv_setup_hypercall_page(u64 val) {
+    mon_lock();
+    u64 os_id = __atomic_load_n(&hv_blk->guest_os_id, __ATOMIC_ACQUIRE);
+    if (!(val & 1ULL) || !os_id) {
+        __atomic_store_n(&hv_blk->hypercall_msr, val & ~1ULL, __ATOMIC_RELEASE);
+        mon_unlock();
+        return true;
+    }
+    u64 gpa = val & ~0xFFFULL;
+    if (!is_ram(gpa)) {
+        mon_unlock();
+        return false;
+    }
+    hv_prepare_guest_page_write(gpa);
+    u8 *pg = (u8 *)RAM(gpa);
+    memset(pg, 0, 4096);
+    // Standard Intel x86-64 Hyper-V hypercall stub: vmcall; ret
+    pg[0] = 0x0F;
+    pg[1] = 0x01;
+    pg[2] = 0xC1;
+    pg[3] = 0xC3;
+    __asm__ volatile("dsb ishst" : : : "memory");
+    __atomic_store_n(&hv_blk->hypercall_msr, gpa | 1ULL, __ATOMIC_RELEASE);
+    mon_unlock();
+    return true;
+}
+
+static bool hv_setup_ref_tsc_page(u64 val) {
+    mon_lock();
+    if (!(val & 1ULL)) {
+        u64 old = __atomic_load_n(&hv_blk->ref_tsc_msr, __ATOMIC_ACQUIRE);
+        if (old & 1ULL) {
+            u64 old_gpa = old & ~0xFFFULL;
+            if (is_ram(old_gpa)) {
+                HvReferenceTscPage *opg = (HvReferenceTscPage *)RAM(old_gpa);
+                __atomic_store_n(&opg->tsc_sequence, 0u, __ATOMIC_RELEASE);
+            }
+        }
+        __atomic_store_n(&hv_blk->ref_tsc_msr, val, __ATOMIC_RELEASE);
+        mon_unlock();
+        return true;
+    }
+    u64 gpa = val & ~0xFFFULL;
+    if (!is_ram(gpa)) {
+        mon_unlock();
+        return false;
+    }
+    u64 tsc_freq = hv_tsc_freq_hz();
+    u64 scale = 0, rem = 0;
+    if (!udiv128(10000000ULL, 0, tsc_freq, &scale, &rem)) {
+        mon_unlock();
+        return false;
+    }
+    if (rem * 2 >= tsc_freq)
+        scale++;
+    i64 off = 0;
+    if (c->tsc_offset != 0 || c->tsc_num != 0) {
+        u64 den = c->tsc_den ? c->tsc_den : 1;
+        u64 now_ns = hv_vm_ns_now();
+        u64 cur_ref = now_ns / 100ULL;
+        u64 cur_tsc = now_ns + now_ns * c->tsc_num / den + c->tsc_offset;
+        u64 scaled = (u64)(((__uint128_t)cur_tsc * scale) >> 64);
+        off = (i64)(cur_ref - scaled);
+    }
+    hv_prepare_guest_page_write(gpa);
+    u8 *raw = (u8 *)RAM(gpa);
+    HvReferenceTscPage *pg = (HvReferenceTscPage *)raw;
+    __atomic_store_n(&pg->tsc_sequence, 0u, __ATOMIC_RELEASE);
+    __asm__ volatile("dsb ishst" : : : "memory");
+    memset(raw + 4, 0, 4096 - 4);
+    pg->tsc_scale = scale;
+    pg->tsc_offset = off;
+    u32 seq = hv_blk->tsc_seq + 1;
+    if (seq == 0 || seq == 0xFFFFFFFFu)
+        seq = 1;
+    hv_blk->tsc_seq = seq;
+    __asm__ volatile("dsb ishst" : : : "memory");
+    __atomic_store_n(&pg->tsc_sequence, seq, __ATOMIC_RELEASE);
+    __atomic_store_n(&hv_blk->ref_tsc_msr, val, __ATOMIC_RELEASE);
+    mon_unlock();
+    return true;
+}
+
+static bool hv_setup_apic_assist_page(u64 val) {
+    if (val & 1ULL) {
+        u64 gpa = val & ~0xFFFULL;
+        if (!is_ram(gpa))
+            return false;
+        mon_lock();
+        hv_prepare_guest_page_write(gpa);
+        *(u32 *)RAM(gpa) = 0; // NO_EOI_REQUIRED = 0; EOI takes the EL1 HV_MSR_EOI fast path
+        __asm__ volatile("dsb ishst" : : : "memory");
+        mon_unlock();
+    }
+    hv_blk->cpu[cpu_index()].apic_assist_msr = val;
+    return true;
+}
+
+static bool hv_rdmsr(u32 m, u64 *v) {
+    u32 feat = hv_blk->feat_eax;
+    HvCpuShared *hvc = &hv_blk->cpu[cpu_index()];
+    switch (m) {
+        case HV_MSR_GUEST_OS_ID:
+            *v = __atomic_load_n(&hv_blk->guest_os_id, __ATOMIC_ACQUIRE);
+            return true;
+        case HV_MSR_HYPERCALL:
+            *v = __atomic_load_n(&hv_blk->hypercall_msr, __ATOMIC_ACQUIRE);
+            return true;
+        case HV_MSR_VP_INDEX:
+            if (!(feat & HV_FEAT_VP_INDEX))
+                return false;
+            hvc->stat_msr_vp_index++;
+            *v = cpu_index();
+            return true;
+        case HV_MSR_TIME_REF_COUNT:
+            if (!(feat & HV_FEAT_TIME_REF_COUNT))
+                return false;
+            hvc->stat_msr_time_ref++;
+            *v = hv_vm_ns_now() / 100ULL;
+            return true;
+        case HV_MSR_REFERENCE_TSC:
+            if (!(feat & HV_FEAT_REFERENCE_TSC))
+                return false;
+            *v = __atomic_load_n(&hv_blk->ref_tsc_msr, __ATOMIC_ACQUIRE);
+            return true;
+        case HV_MSR_TSC_FREQUENCY:
+            if (!(feat & HV_FEAT_ACCESS_FREQ_MSRS))
+                return false;
+            *v = hv_tsc_freq_hz();
+            return true;
+        case HV_MSR_APIC_FREQUENCY:
+            if (!(feat & HV_FEAT_ACCESS_FREQ_MSRS))
+                return false;
+            *v = 1000000000ULL;
+            return true;
+        case HV_MSR_EOI:
+            return false; // Write-only per TLFS
+        case HV_MSR_ICR:
+            if (!(feat & HV_FEAT_APIC_ACCESS))
+                return false;
+            hvc->stat_msr_icr_r++;
+            *v = ((u64)c->apic_icr_hi << 32) | c->apic_icr_lo;
+            return true;
+        case HV_MSR_TPR:
+            if (!(feat & HV_FEAT_APIC_ACCESS))
+                return false;
+            hvc->stat_msr_tpr_r++;
+            *v = c->apic_tpr;
+            return true;
+        case HV_MSR_APIC_ASSIST_PAGE:
+            if (!(feat & HV_FEAT_APIC_ACCESS))
+                return false;
+            *v = hvc->apic_assist_msr;
+            return true;
+        default:
+            return false;
+    }
+}
+
+static bool hv_wrmsr(u32 m, u64 v) {
+    u32 feat = hv_blk->feat_eax;
+    HvCpuShared *hvc = &hv_blk->cpu[cpu_index()];
+    switch (m) {
+        case HV_MSR_GUEST_OS_ID:
+            hvc->stat_msr_guest_os_id_w++;
+            __atomic_store_n(&hv_blk->guest_os_id, v, __ATOMIC_RELEASE);
+            if (!v)
+                __atomic_store_n(&hv_blk->hypercall_msr,
+                                 __atomic_load_n(&hv_blk->hypercall_msr, __ATOMIC_RELAXED) & ~1ULL,
+                                 __ATOMIC_RELEASE);
+            return true;
+        case HV_MSR_HYPERCALL:
+            hvc->stat_msr_hypercall_w++;
+            return hv_setup_hypercall_page(v);
+        case HV_MSR_REFERENCE_TSC:
+            if (!(feat & HV_FEAT_REFERENCE_TSC))
+                return false;
+            hvc->stat_msr_ref_tsc_w++;
+            return hv_setup_ref_tsc_page(v);
+        case HV_MSR_EOI: {
+            if (!(feat & HV_FEAT_APIC_ACCESS))
+                return false;
+            hvc->stat_msr_eoi++;
+            if (c->hybrid) {
+                bool fast = false;
+                hybrid_apic_eoi_fast(&fast);
+                if (fast)
+                    hvc->stat_msr_eoi_fast++;
+            } else {
+                vapic_write(0xB0, (u32)v);
+                hvc->stat_msr_eoi_fast++;
+            }
+            return true;
+        }
+        case HV_MSR_ICR: {
+            if (!(feat & HV_FEAT_APIC_ACCESS))
+                return false;
+            hvc->stat_msr_icr_w++;
+            u32 lo = (u32)v;
+            u32 hi = (u32)(v >> 32);
+            c->apic_icr_hi = hi;
+            c->apic_icr_lo = lo & ~0x1000u; // delivery status always idle
+            if (c->hybrid) {
+                c->req_a[0] = ((u64)hi << 32) | lo;
+                hostcall(HC_APIC_ICR);
+            } else {
+                vapic_write(0x310, hi);
+                vapic_write(0x300, lo);
+            }
+            return true;
+        }
+        case HV_MSR_TPR:
+            if (!(feat & HV_FEAT_APIC_ACCESS))
+                return false;
+            hvc->stat_msr_tpr_w++;
+            if (c->hybrid) {
+                hybrid_apic_tpr_write((u32)v & 0xffu);
+            } else {
+                c->apic_tpr = (u32)v & 0xffu;
+            }
+            return true;
+        case HV_MSR_APIC_ASSIST_PAGE:
+            if (!(feat & HV_FEAT_APIC_ACCESS))
+                return false;
+            hvc->stat_msr_apic_assist_w++;
+            return hv_setup_apic_assist_page(v);
+        default:
+            return false; // Read-only or unadvertised Hyper-V MSR -> #GP(0)
+    }
+}
+
+static bool try_hv_vmcall(u64 rip) {
+    if (!hv_active() || c->cpl != 0)
+        return false;
+    u64 hc_msr = __atomic_load_n(&hv_blk->hypercall_msr, __ATOMIC_ACQUIRE);
+    if (!(hc_msr & 1ULL))
+        return false;
+    u64 hc_gpa = hc_msr & ~0xFFFULL;
+    bool is_vmcall = false;
+    if (me->hv_hc_va_cached == rip && me->hv_hc_gpa_cached == hc_gpa && (rip & 0xFFFULL) <= 0xFFCu) {
+        u32 insn = *(const u32 *)RAM(hc_gpa + (rip & 0xFFFULL));
+        if ((insn & 0x00FFFFFFu) == 0x00C1010Fu)
+            is_vmcall = true;
+    }
+    if (!is_vmcall) {
+        Walk w = x86_walk(c->cr3, rip, 16, false);
+        if (!w.ok || !is_ram(w.gpa))
+            return false;
+        u8 b[3];
+        if ((w.gpa & 0xFFFULL) <= 0xFFDu) {
+            const u8 *p = (const u8 *)RAM(w.gpa);
+            b[0] = p[0];
+            b[1] = p[1];
+            b[2] = p[2];
+        } else if (!guest_read(rip, b, 3, 0)) {
+            return false;
+        }
+        if (b[0] != 0x0F || b[1] != 0x01 || b[2] != 0xC1)
+            return false;
+        if ((w.gpa & ~0xFFFULL) == hc_gpa && (w.gpa & 0xFFFULL) <= 0xFFCu) {
+            me->hv_hc_va_cached = rip;
+            me->hv_hc_gpa_cached = hc_gpa;
+        }
+    }
+
+    u64 in_ctrl = c->x[1]; // RCX
+    u64 in_param = c->x[2]; // RDX
+    u32 code = (u32)(in_ctrl & 0xFFFFu);
+    bool fast = ((in_ctrl >> 16) & 1u) != 0;
+    u32 var_head = (u32)((in_ctrl >> 17) & 0x3FFu);
+    u32 rep_count = (u32)((in_ctrl >> 32) & 0xFFFu);
+    u32 rep_start = (u32)((in_ctrl >> 48) & 0xFFFu);
+    HvCpuShared *hvc = &hv_blk->cpu[cpu_index()];
+    u64 result = HV_STATUS_INVALID_HYPERCALL_CODE;
+
+    if (in_ctrl & 0xF000F000F8000000ULL) {
+        result = HV_STATUS_INVALID_HYPERCALL_INPUT;
+    } else {
+        switch (code) {
+            case HVCALL_NOTIFY_LONG_SPIN_WAIT:
+                if (rep_count != 0 || rep_start != 0 || var_head != 0) {
+                    result = HV_STATUS_INVALID_HYPERCALL_INPUT;
+                    break;
+                }
+                if (!fast) {
+                    if (in_param & 7ULL) {
+                        result = HV_STATUS_INVALID_ALIGNMENT;
+                        break;
+                    }
+                    if (!is_ram(in_param)) {
+                        result = HV_STATUS_INVALID_PARAMETER;
+                        break;
+                    }
+                }
+                hvc->stat_hc_spinwait++;
+                __asm__ volatile("yield");
+                if (smp) {
+                    c->req_a[0] = 0;
+                    c->req_a[1] = 0;
+                    c->req_a[2] = 0;
+                    hostcall(HC_YIELD);
+                }
+                result = HV_STATUS_SUCCESS;
+                break;
+            case HVCALL_FLUSH_VIRTUAL_ADDRESS_SPACE:
+            case HVCALL_FLUSH_VIRTUAL_ADDRESS_SPACE_EX:
+                if (rep_count != 0 || rep_start != 0 ||
+                    (code == HVCALL_FLUSH_VIRTUAL_ADDRESS_SPACE && var_head != 0)) {
+                    result = HV_STATUS_INVALID_HYPERCALL_INPUT;
+                    break;
+                }
+                if (!fast) {
+                    if (in_param & 7ULL) {
+                        result = HV_STATUS_INVALID_ALIGNMENT;
+                        break;
+                    }
+                    if (!is_ram(in_param)) {
+                        result = HV_STATUS_INVALID_PARAMETER;
+                        break;
+                    }
+                }
+                // Shadow page tables stay synchronously coherent via PI_PT write-protection + tlbi vae1is/aside1is;
+                // drain any pending DMA/TCG page-table notes and ensure inner-shareable TLBI visibility.
+                if (c->hybrid)
+                    notes_drain();
+                __asm__ volatile("dsb ish" : : : "memory");
+                if (code == HVCALL_FLUSH_VIRTUAL_ADDRESS_SPACE)
+                    hvc->stat_hc_flush_space++;
+                else
+                    hvc->stat_hc_flush_space_ex++;
+                result = HV_STATUS_SUCCESS;
+                break;
+            case HVCALL_FLUSH_VIRTUAL_ADDRESS_LIST:
+            case HVCALL_FLUSH_VIRTUAL_ADDRESS_LIST_EX:
+                if (rep_count == 0 || rep_start >= rep_count ||
+                    (code == HVCALL_FLUSH_VIRTUAL_ADDRESS_LIST && var_head != 0)) {
+                    result = HV_STATUS_INVALID_HYPERCALL_INPUT;
+                    break;
+                }
+                if (!fast) {
+                    if (in_param & 7ULL) {
+                        result = HV_STATUS_INVALID_ALIGNMENT;
+                        break;
+                    }
+                    if (!is_ram(in_param)) {
+                        result = HV_STATUS_INVALID_PARAMETER;
+                        break;
+                    }
+                }
+                if (c->hybrid)
+                    notes_drain();
+                __asm__ volatile("dsb ish" : : : "memory");
+                if (code == HVCALL_FLUSH_VIRTUAL_ADDRESS_LIST)
+                    hvc->stat_hc_flush_list++;
+                else
+                    hvc->stat_hc_flush_list_ex++;
+                hvc->stat_hc_flush_gva_reps += (u64)(rep_count - rep_start);
+                // TLFS 3.6.2: RepsCompleted (bits 43:32) equals total rep_count on full completion.
+                result = ((u64)rep_count << 32) | HV_STATUS_SUCCESS;
+                break;
+            default:
+                hvc->stat_hc_unknown++;
+                hvc->last_unknown_code = in_ctrl;
+                result = HV_STATUS_INVALID_HYPERCALL_CODE;
+                break;
+        }
+    }
+    c->x[0] = result;
+    c->elr = translate_here(rip + 3, 0, 0, false);
+    return true;
 }
 
 // Intel RAPL / thermal / platform / perf sensor MSRs verified to hit `default: val = 0;`
@@ -3466,18 +3976,25 @@ static bool msr_is_monitors(u32 m) {
     return m == MSR_EFER || m == MSR_STAR || m == MSR_LSTAR || m == MSR_CSTAR || m == MSR_SFMASK || m == MSR_FS || m == MSR_GS || m == MSR_KGS || m == MSR_SYSENTER_CS || m == MSR_SYSENTER_ESP || m == MSR_SYSENTER_EIP;
 }
 
+static bool msr_is_hv_range(u32 m) {
+    return hv_active() && m >= 0x40000000u && m <= 0x400001FFu;
+}
+
 static bool msr_is_monitors_read(u32 m) {
     return msr_is_monitors(m) || m == MSR_TSC ||
            (m == MSR_APIC_BASE && c->hybrid_apic_base_msr != 0) ||
            (m == MSR_CORE_THREAD_COUNT && c->msr_core_thread_count != 0) ||
+           msr_is_hv_range(m) ||
            msr_is_zero_read(m);
 }
 
 static bool msr_is_monitors_write(u32 m) {
-    return msr_is_monitors(m) || msr_is_noop_write(m);
+    return msr_is_monitors(m) || msr_is_hv_range(m) || msr_is_noop_write(m);
 }
 
 static bool rdmsr(u32 m, u64 *v) {
+    if (msr_is_hv_range(m))
+        return hv_rdmsr(m, v);
     switch (m) {
         case MSR_EFER:
             *v = c->efer;
@@ -3540,6 +4057,8 @@ static bool rdmsr(u32 m, u64 *v) {
 }
 
 static bool wrmsr(u32 m, u64 v) {
+    if (msr_is_hv_range(m))
+        return hv_wrmsr(m, v);
     if (c->hybrid && msr_is_noop_write(m))
         return true;
     switch (m) {
@@ -4317,8 +4836,12 @@ void mon_sync(void) {
                     c->elr = arm;
                 break;
             }
-            case SVC_STOP:
-                stop(STOP_UNTRANSLATED, rip_here(c->elr - 4), *(u32 *)c->elr, 0, 0);
+            case SVC_STOP: {
+                u64 rip = rip_here(c->elr - 4);
+                if (try_hv_vmcall(rip))
+                    break;
+                stop(STOP_UNTRANSLATED, rip, *(u32 *)c->elr, 0, 0);
+            }
             case SVC_SYSCALL:
                 do_syscall();
                 break;

@@ -622,6 +622,52 @@ public final class Tally: @unchecked Sendable {
             o += name.padding(toLength: 34, withPad: " ", startingAt: 0) + perSecond(value) + "\n"
         }
 
+        let hvBase = engine.priv + Engine.hvSharedOffset
+        if hvBase.load(fromByteOffset: 0, as: UInt64.self) == Engine.hvSharedMagic,
+           hvBase.load(fromByteOffset: 0x0C, as: UInt32.self) != 0 {
+            let featEax = hvBase.load(fromByteOffset: 0x10, as: UInt32.self)
+            let enlEax = hvBase.load(fromByteOffset: 0x18, as: UInt32.self)
+            let spinAttempts = hvBase.load(fromByteOffset: 0x1C, as: UInt32.self)
+            let guestOsId = hvBase.load(fromByteOffset: 0x20, as: UInt64.self)
+            let hypercallMsr = hvBase.load(fromByteOffset: 0x28, as: UInt64.self)
+            let refTscMsr = hvBase.load(fromByteOffset: 0x30, as: UInt64.self)
+            let tscSeq = hvBase.load(fromByteOffset: 0x38, as: UInt32.self)
+            let cpuOff = Engine.hvCpuBaseOffset + Int(engine.cpuIndex) * Engine.hvCpuStride
+            func hvStat(_ idx: Int) -> UInt64 {
+                hvBase.load(fromByteOffset: cpuOff + idx * 8, as: UInt64.self)
+            }
+            o += "\n== Hyper-V enlightenments (EL1 fast paths) ==\n"
+            o += "hv_feat_eax \(hex(UInt64(featEax))) hv_enlighten_eax \(hex(UInt64(enlEax))) hv_spinlocks \(hex(UInt64(spinAttempts)))\n"
+            o += "hv_guest_os_id \(hex(guestOsId)) hv_hypercall_msr \(hex(hypercallMsr)) hv_ref_tsc_msr \(hex(refTscMsr)) hv_tsc_seq \(tscSeq) hv_apic_assist_msr \(hex(hvStat(0)))\n"
+            let hvRows: [(String, UInt64)] = [
+                ("hv_msr_time_ref_count", hvStat(1)),
+                ("hv_msr_ref_tsc_write", hvStat(2)),
+                ("hv_msr_eoi_total", hvStat(3)),
+                ("hv_msr_eoi_el1_fast", hvStat(4)),
+                ("hv_msr_tpr_read", hvStat(5)),
+                ("hv_msr_tpr_write", hvStat(6)),
+                ("hv_msr_icr_read", hvStat(7)),
+                ("hv_msr_icr_write", hvStat(8)),
+                ("hv_msr_apic_assist_write", hvStat(9)),
+                ("hv_msr_vp_index", hvStat(10)),
+                ("hv_msr_guest_os_id_write", hvStat(11)),
+                ("hv_msr_hypercall_write", hvStat(12)),
+                ("hv_hc_notify_long_spin_wait", hvStat(13)),
+                ("hv_hc_flush_va_space", hvStat(14)),
+                ("hv_hc_flush_va_list", hvStat(15)),
+                ("hv_hc_flush_va_space_ex", hvStat(16)),
+                ("hv_hc_flush_va_list_ex", hvStat(17)),
+                ("hv_hc_flush_gva_reps", hvStat(18)),
+                ("hv_hc_unknown", hvStat(19)),
+            ]
+            for (name, value) in hvRows {
+                o += name.padding(toLength: 34, withPad: " ", startingAt: 0) + perSecond(value) + "\n"
+            }
+            if hvStat(19) != 0 {
+                o += "hv_hc_last_unknown_rcx \(hex(hvStat(20)))\n"
+            }
+        }
+
         o += "\n== events delivered by vector, ranked; last return rip, error code, bytes there ==\n"
         let vectors = withUnsafeBytes(of: c.stat_vector) { Array($0.bindMemory(to: UInt64.self)) }
         let vectorRIP = withUnsafeBytes(of: c.vector_last_rip) { Array($0.bindMemory(to: UInt64.self)) }

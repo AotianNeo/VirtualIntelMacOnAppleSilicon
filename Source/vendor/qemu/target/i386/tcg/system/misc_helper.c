@@ -28,6 +28,17 @@
 #include "exec/cputlb.h"
 #include "tcg/helper-tcg.h"
 #include "hw/i386/apic.h"
+#include "hw/i386/apic_internal.h"
+#include "system/cpu-timers.h"
+#include "system/tcg.h"
+#include "kvm/hyperv-proto.h"
+
+static inline bool tcg_hv_active(X86CPU *cpu)
+{
+    return tcg_enabled() &&
+           (cpu->hyperv_features != 0 ||
+            cpu->hyperv_spinlock_attempts != HYPERV_SPINLOCK_NEVER_NOTIFY);
+}
 
 void helper_outb(CPUX86State *env, uint32_t port, uint32_t data)
 {
@@ -317,6 +328,70 @@ void helper_wrmsr(CPUX86State *env)
 
         break;
     }
+    case HV_X64_MSR_GUEST_OS_ID:
+        if (!tcg_hv_active(env_archcpu(env))) {
+            break;
+        }
+        env->msr_hv_guest_os_id = val;
+        if (!val) {
+            env->msr_hv_hypercall &= ~1ULL;
+        }
+        break;
+    case HV_X64_MSR_HYPERCALL:
+        if (!tcg_hv_active(env_archcpu(env))) {
+            break;
+        }
+        env->msr_hv_hypercall = env->msr_hv_guest_os_id ? val : (val & ~1ULL);
+        break;
+    case HV_X64_MSR_REFERENCE_TSC:
+        if (!tcg_hv_active(env_archcpu(env))) {
+            break;
+        }
+        env->msr_hv_tsc = val;
+        break;
+    case HV_X64_MSR_APIC_ASSIST_PAGE:
+        if (!tcg_hv_active(env_archcpu(env))) {
+            break;
+        }
+        env->msr_hv_vapic = val;
+        break;
+    case HV_X64_MSR_EOI:
+        if (tcg_hv_active(env_archcpu(env))) {
+            APICCommonState *apic = env_archcpu(env)->apic_state;
+            if (apic) {
+                uint32_t zero = 0;
+                bql_lock();
+                address_space_write(&address_space_memory,
+                                    (apic->apicbase & MSR_IA32_APICBASE_BASE) + 0xb0,
+                                    MEMTXATTRS_UNSPECIFIED, &zero, 4);
+                bql_unlock();
+            }
+        }
+        break;
+    case HV_X64_MSR_TPR:
+        if (tcg_hv_active(env_archcpu(env))) {
+            APICCommonState *apic = env_archcpu(env)->apic_state;
+            if (apic) {
+                bql_lock();
+                cpu_set_apic_tpr(apic, (val >> 4) & 0xf);
+                bql_unlock();
+            }
+        }
+        break;
+    case HV_X64_MSR_ICR:
+        if (tcg_hv_active(env_archcpu(env))) {
+            APICCommonState *apic = env_archcpu(env)->apic_state;
+            if (apic) {
+                uint32_t low = (uint32_t)val;
+                bql_lock();
+                apic->icr[1] = (uint32_t)(val >> 32);
+                address_space_write(&address_space_memory,
+                                    (apic->apicbase & MSR_IA32_APICBASE_BASE) + 0x300,
+                                    MEMTXATTRS_UNSPECIFIED, &low, 4);
+                bql_unlock();
+            }
+        }
+        break;
     default:
         if ((uint32_t)env->regs[R_ECX] >= MSR_MC0_CTL
             && (uint32_t)env->regs[R_ECX] < MSR_MC0_CTL +
@@ -495,6 +570,40 @@ void helper_rdmsr(CPUX86State *env)
 
         break;
     }
+    case HV_X64_MSR_GUEST_OS_ID:
+        val = tcg_hv_active(x86_cpu) ? env->msr_hv_guest_os_id : 0;
+        break;
+    case HV_X64_MSR_HYPERCALL:
+        val = tcg_hv_active(x86_cpu) ? env->msr_hv_hypercall : 0;
+        break;
+    case HV_X64_MSR_VP_INDEX:
+        val = tcg_hv_active(x86_cpu) ? (uint64_t)env_cpu(env)->cpu_index : 0;
+        break;
+    case HV_X64_MSR_TIME_REF_COUNT:
+        val = tcg_hv_active(x86_cpu) ? (uint64_t)cpu_get_ticks() / 100ULL : 0;
+        break;
+    case HV_X64_MSR_REFERENCE_TSC:
+        val = tcg_hv_active(x86_cpu) ? env->msr_hv_tsc : 0;
+        break;
+    case HV_X64_MSR_TSC_FREQUENCY:
+        val = tcg_hv_active(x86_cpu) ? (env->user_tsc_khz ? (uint64_t)env->user_tsc_khz * 1000ULL : 1000000000ULL) : 0;
+        break;
+    case HV_X64_MSR_APIC_FREQUENCY:
+        val = tcg_hv_active(x86_cpu) ? 1000000000ULL : 0;
+        break;
+    case HV_X64_MSR_ICR:
+        val = (tcg_hv_active(x86_cpu) && x86_cpu->apic_state)
+            ? (((uint64_t)x86_cpu->apic_state->icr[1] << 32) | x86_cpu->apic_state->icr[0])
+            : 0;
+        break;
+    case HV_X64_MSR_TPR:
+        val = (tcg_hv_active(x86_cpu) && x86_cpu->apic_state)
+            ? ((uint64_t)cpu_get_apic_tpr(x86_cpu->apic_state) << 4)
+            : 0;
+        break;
+    case HV_X64_MSR_APIC_ASSIST_PAGE:
+        val = tcg_hv_active(x86_cpu) ? env->msr_hv_vapic : 0;
+        break;
     default:
         if ((uint32_t)env->regs[R_ECX] >= MSR_MC0_CTL
             && (uint32_t)env->regs[R_ECX] < MSR_MC0_CTL +

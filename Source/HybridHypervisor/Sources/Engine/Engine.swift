@@ -492,10 +492,53 @@ public final class Engine {
         ctx.pointee.xcr0 = 1
     }
 
+    // ---- Hyper-V Enlightenments shared block at OFF_MON_DATA + 0x81000 ----
+    static let hvSharedOffset = Int(kOffMonData) + 0x81000
+    static let hvSharedMagic: UInt64 = 0x4856_454E_4C49_4748 // "HVENLIGH"
+    static let hvSharedVersion: UInt32 = 1
+    static let hvCpuBaseOffset = 64
+    static let hvCpuStride = 192
+
+    private func initHyperVSharedBlock() {
+        let base = priv + Self.hvSharedOffset
+        if base.load(fromByteOffset: 0, as: UInt64.self) == Self.hvSharedMagic { return }
+        guard let machine else { return }
+        let iface = machine.cpuid(leaf: 0x4000_0001, subleaf: 0)
+        memset(base, 0, 4096)
+        if iface.eax == 0x3123_7648 { // "Hv#1"
+            let feat = machine.cpuid(leaf: 0x4000_0003, subleaf: 0)
+            let enl = machine.cpuid(leaf: 0x4000_0004, subleaf: 0)
+            base.storeBytes(of: Self.hvSharedVersion, toByteOffset: 0x08, as: UInt32.self)
+            base.storeBytes(of: feat.eax, toByteOffset: 0x10, as: UInt32.self)
+            base.storeBytes(of: feat.edx, toByteOffset: 0x14, as: UInt32.self)
+            base.storeBytes(of: enl.eax, toByteOffset: 0x18, as: UInt32.self)
+            base.storeBytes(of: enl.ebx, toByteOffset: 0x1C, as: UInt32.self)
+            base.storeBytes(of: UInt32(1), toByteOffset: 0x0C, as: UInt32.self)
+            base.storeBytes(of: Self.hvSharedMagic, toByteOffset: 0x00, as: UInt64.self)
+        } else {
+            base.storeBytes(of: Self.hvSharedVersion, toByteOffset: 0x08, as: UInt32.self)
+            base.storeBytes(of: UInt32(0), toByteOffset: 0x0C, as: UInt32.self)
+            base.storeBytes(of: Self.hvSharedMagic, toByteOffset: 0x00, as: UInt64.self)
+        }
+    }
+
+    private func resetHyperVSharedState() {
+        let base = priv + Self.hvSharedOffset
+        guard base.load(fromByteOffset: 0, as: UInt64.self) == Self.hvSharedMagic else { return }
+        base.storeBytes(of: UInt64(0), toByteOffset: 0x20, as: UInt64.self) // guest_os_id
+        base.storeBytes(of: UInt64(0), toByteOffset: 0x28, as: UInt64.self) // hypercall_msr
+        base.storeBytes(of: UInt64(0), toByteOffset: 0x30, as: UInt64.self) // ref_tsc_msr
+        base.storeBytes(of: UInt32(0), toByteOffset: 0x38, as: UInt32.self) // tsc_seq
+        for cpu in 0..<Int(MAX_VCPUS) {
+            base.storeBytes(of: UInt64(0), toByteOffset: Self.hvCpuBaseOffset + cpu * Self.hvCpuStride, as: UInt64.self)
+        }
+    }
+
     // ---- Running ----
 
     /// Starts the x86 CPU at `rip`. The caller filled registers in `ctx` and page tables in RAM.
     public func run(entry rip: UInt64) throws -> RunOutcome {
+        if cpuIndex == 0 { initHyperVSharedBlock() }
         ctx.pointee.req_a.0 = rip
         if let seconds = ProcessInfo.processInfo.environment["ENGINE_WATCHDOG"].flatMap(Double.init) {
             let target = vcpu
@@ -1052,6 +1095,7 @@ public final class Engine {
     public func forgetAll() {
         translatorLock.lock()
         tr_flush_parked(true)
+        resetHyperVSharedState()
         gate.condition.lock()
         for engine in gate.engines {
             engine.ctx.pointee.tr_flushed = 1

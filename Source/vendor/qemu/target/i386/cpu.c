@@ -31,6 +31,7 @@
 #include "whpx/whpx-i386.h"
 #include "hvf/hvf-i386.h"
 #include "kvm/kvm_i386.h"
+#include "kvm/hyperv-proto.h"
 #include "kvm/tdx.h"
 #include "sev.h"
 #include "qapi/error.h"
@@ -8622,6 +8623,114 @@ static bool tcg_has_cpuid_clock(X86CPU *cpu)
 #endif
 }
 
+static bool tcg_hyperv_enabled(X86CPU *cpu)
+{
+#ifndef CONFIG_USER_ONLY
+    return tcg_enabled() &&
+           ((cpu->hyperv_spinlock_attempts != HYPERV_SPINLOCK_NEVER_NOTIFY) ||
+            cpu->hyperv_features != 0);
+#else
+    return false;
+#endif
+}
+
+static void tcg_hyperv_cpuid(X86CPU *cpu, CPUX86State *env, uint32_t index,
+                             bool tcg_clock,
+                             uint32_t *eax, uint32_t *ebx,
+                             uint32_t *ecx, uint32_t *edx)
+{
+    uint32_t signature[3];
+
+    *eax = *ebx = *ecx = *edx = 0;
+
+    switch (index) {
+    case HV_CPUID_VENDOR_AND_MAX_FUNCTIONS: /* 0x40000000 */
+        *eax = HV_CPUID_IMPLEMENT_LIMITS;
+        *ebx = cpu->hyperv_vendor_id[0];
+        *ecx = cpu->hyperv_vendor_id[1];
+        *edx = cpu->hyperv_vendor_id[2];
+        break;
+    case HV_CPUID_INTERFACE: /* 0x40000001 */
+        *eax = cpu->hyperv_interface_id[0];
+        *ebx = cpu->hyperv_interface_id[1];
+        *ecx = cpu->hyperv_interface_id[2];
+        *edx = cpu->hyperv_interface_id[3];
+        break;
+    case HV_CPUID_VERSION: /* 0x40000002 */
+        *eax = cpu->hyperv_ver_id_build;
+        *ebx = ((uint32_t)cpu->hyperv_ver_id_major << 16) |
+               cpu->hyperv_ver_id_minor;
+        *ecx = cpu->hyperv_ver_id_sp;
+        *edx = ((uint32_t)cpu->hyperv_ver_id_sb << 24) |
+               (cpu->hyperv_ver_id_sn & 0xffffff);
+        break;
+    case HV_CPUID_FEATURES: /* 0x40000003 */
+        *eax = HV_HYPERCALL_AVAILABLE;
+        if (hyperv_feat_enabled(cpu, HYPERV_FEAT_VPINDEX) ||
+            hyperv_feat_enabled(cpu, HYPERV_FEAT_TLBFLUSH)) {
+            *eax |= HV_VP_INDEX_AVAILABLE;
+        }
+        if (hyperv_feat_enabled(cpu, HYPERV_FEAT_TIME)) {
+            *eax |= HV_TIME_REF_COUNT_AVAILABLE | HV_REFERENCE_TSC_AVAILABLE;
+        }
+        if (hyperv_feat_enabled(cpu, HYPERV_FEAT_VAPIC)) {
+            *eax |= HV_APIC_ACCESS_AVAILABLE;
+        }
+        if (hyperv_feat_enabled(cpu, HYPERV_FEAT_FREQUENCIES)) {
+            *eax |= HV_ACCESS_FREQUENCY_MSRS;
+        }
+        *edx = HV_CPU_DYNAMIC_PARTITIONING_AVAILABLE;
+        if (hyperv_feat_enabled(cpu, HYPERV_FEAT_FREQUENCIES)) {
+            *edx |= HV_FREQUENCY_MSRS_AVAILABLE;
+        }
+        if (hyperv_feat_enabled(cpu, HYPERV_FEAT_TLBFLUSH_EXT)) {
+            *edx |= HV_EXT_GVA_RANGES_FLUSH_AVAILABLE;
+        }
+        break;
+    case HV_CPUID_ENLIGHTMENT_INFO: /* 0x40000004 */
+        if (hyperv_feat_enabled(cpu, HYPERV_FEAT_RELAXED)) {
+            *eax |= HV_RELAXED_TIMING_RECOMMENDED;
+        }
+        if (hyperv_feat_enabled(cpu, HYPERV_FEAT_VAPIC)) {
+            *eax |= HV_APIC_ACCESS_RECOMMENDED;
+        }
+        if (hyperv_feat_enabled(cpu, HYPERV_FEAT_TLBFLUSH)) {
+            *eax |= HV_REMOTE_TLB_FLUSH_RECOMMENDED |
+                    HV_EX_PROCESSOR_MASKS_RECOMMENDED;
+        }
+        *ebx = cpu->hyperv_spinlock_attempts;
+        break;
+    case HV_CPUID_IMPLEMENT_LIMITS: /* 0x40000005 */
+        *eax = cpu->hv_max_vps > 0 ? (uint32_t)cpu->hv_max_vps : 64u;
+        *ebx = cpu->hyperv_limits[0];
+        *ecx = cpu->hyperv_limits[1];
+        *edx = cpu->hyperv_limits[2];
+        break;
+    case 0x40000100:
+        /* Coexistence with VMware SVGA3D/vmport and TCG timing leaf. */
+        if (cpu->expose_tcg && (x86_vmvga_vmware_cpuid || tcg_clock)) {
+            if (x86_vmvga_vmware_cpuid) {
+                memcpy(signature, "VMwareVMware", 12);
+            } else {
+                memcpy(signature, "TCGTCGTCGTCG", 12);
+            }
+            *eax = tcg_clock ? 0x40000110 : 0x40000101;
+            *ebx = signature[0];
+            *ecx = signature[1];
+            *edx = signature[2];
+        }
+        break;
+    case 0x40000110:
+        if (cpu->expose_tcg && tcg_clock) {
+            *eax = env->user_tsc_khz;
+            *ebx = 1000000;
+        }
+        break;
+    default:
+        break;
+    }
+}
+
 void cpu_x86_cpuid(CPUX86State *env, uint32_t index, uint32_t count,
                    uint32_t *eax, uint32_t *ebx,
                    uint32_t *ecx, uint32_t *edx)
@@ -8635,6 +8744,11 @@ void cpu_x86_cpuid(CPUX86State *env, uint32_t index, uint32_t count,
     bool tcg_clock = tcg_has_cpuid_clock(cpu);
 
     threads_per_pkg = x86_threads_per_pkg(topo_info);
+
+    if (index >= 0x40000000 && index < 0x80000000 && tcg_hyperv_enabled(cpu)) {
+        tcg_hyperv_cpuid(cpu, env, index, tcg_clock, eax, ebx, ecx, edx);
+        return;
+    }
 
     /* Calculate & apply limits for different index ranges */
     if (index >= 0xC0000000) {
@@ -8672,6 +8786,9 @@ void cpu_x86_cpuid(CPUX86State *env, uint32_t index, uint32_t count,
         *ebx = (cpu->apic_id << 24) |
                8 << 8; /* CLFLUSH size in quad words, Linux wants it. */
         *ecx = env->features[FEAT_1_ECX];
+        if (tcg_hyperv_enabled(cpu)) {
+            *ecx |= CPUID_EXT_HYPERVISOR;
+        }
         if ((*ecx & CPUID_EXT_XSAVE) && (env->cr[4] & CR4_OSXSAVE_MASK)) {
             *ecx |= CPUID_EXT_OSXSAVE;
         }
