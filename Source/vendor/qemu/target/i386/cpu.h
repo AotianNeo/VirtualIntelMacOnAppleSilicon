@@ -3157,4 +3157,11 @@ static inline bool x86_cpu_interrupts_enabled(const CPUX86State *env)
 #define SUB_COUT_VEC(op1, op2, result) \
    MAJ_INV1(op1, op2, result)
 
+/* True when the VMware backdoor port device is present (-machine vmport=on).
+ * VMware's guest drivers call the backdoor from ring 3; see helper_check_io(). */
+extern bool x86_vmport_user_io_allowed;
+/* True when VMware SVGA3D (vmware-svga/vmvga) has registered with vmport so
+ * CPUID 0x40000000 reports "VMwareVMware" without affecting plain -device VGA. */
+extern bool x86_vmvga_vmware_cpuid;
+
 #endif /* I386_CPU_H */

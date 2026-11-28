@@ -711,7 +711,9 @@ uint32_t vbe_ioport_read_data(void *opaque, uint32_t addr)
             val = s->vbe_regs[s->vbe_index];
         }
     } else if (s->vbe_index == VBE_DISPI_INDEX_VIDEO_MEMORY_64K) {
-        val = s->vbe_size / (64 * KiB);
+        uint32_t reported = s->vbe_report_size
+            ? MIN(s->vbe_size, s->vbe_report_size) : s->vbe_size;
+        val = reported / (64 * KiB);
     } else {
         val = 0;
     }

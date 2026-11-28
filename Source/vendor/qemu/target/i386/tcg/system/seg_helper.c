@@ -224,11 +224,23 @@ bool x86_cpu_exec_interrupt(CPUState *cs, int interrupt_request)
     return true;
 }
 
+bool x86_vmport_user_io_allowed;
+bool x86_vmvga_vmware_cpuid;
+
+/* Must match isa_register_ioport() in hw/i386/vmport.c. */
+#define X86_VMPORT_BACKDOOR_ADDR 0x5658
+
 /* check if Port I/O is allowed in TSS */
 void helper_check_io(CPUX86State *env, uint32_t addr, uint32_t size)
 {
     uintptr_t retaddr = GETPC();
     uint32_t io_offset, val, mask;
+
+    /* VMware compatibility: permit unprivileged access to the backdoor port
+     * (0x5658) only when the vmport device is present, matching real VMware. */
+    if (addr == X86_VMPORT_BACKDOOR_ADDR && x86_vmport_user_io_allowed) {
+        return;
+    }
 
     /* TSS must be a valid 32 bit one */
     if (!(env->tr.flags & DESC_P_MASK) ||

@@ -21,7 +21,16 @@ system_ss.add(when: 'CONFIG_XEN_BUS', if_true: files('xenfb.c'))
 system_ss.add(when: 'CONFIG_VGA_PCI', if_true: files('vga-pci.c'))
 system_ss.add(when: 'CONFIG_VGA_ISA', if_true: files('vga-isa.c'))
 system_ss.add(when: 'CONFIG_VGA_MMIO', if_true: files('vga-mmio.c'))
-system_ss.add(when: 'CONFIG_VMWARE_VGA', if_true: files('vmware_vga.c'))
+# NOTE (SVGA3D / qemu-vmvga): vmware_vga.c is a single translation unit that
+# #includes vmware_vga_gmr.c and vmware_vga_3d.c (and its dxvk/vgpu fragments).
+if host_os == 'darwin' and sdl.found()
+  specific_ss.add(when: 'CONFIG_VMWARE_VGA', if_true: [files('vmware_vga.c'), pixman, sdl])
+  system_ss.add(when: 'CONFIG_VMWARE_VGA',
+                if_true: [files('vmware_vga_overlay.m'), sdl,
+                          dependency('appleframeworks', modules: ['Cocoa', 'QuartzCore', 'Metal'])])
+else
+  specific_ss.add(when: 'CONFIG_VMWARE_VGA', if_true: [files('vmware_vga.c'), pixman])
+endif
 if host_os == 'darwin'
   system_ss.add(when: 'CONFIG_VMWARE_VGA', if_true: files('vim-gl-headless.c'))
   # Private VRAM capability research authenticates Mach audit trailers.

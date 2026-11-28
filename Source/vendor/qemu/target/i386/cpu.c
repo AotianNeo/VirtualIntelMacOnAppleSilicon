@@ -9096,7 +9096,13 @@ void cpu_x86_cpuid(CPUX86State *env, uint32_t index, uint32_t count,
          * set here, but we restrict to TCG none the less.
          */
         if (tcg_enabled() && cpu->expose_tcg) {
-            memcpy(signature, "TCGTCGTCGTCG", 12);
+            if (x86_vmvga_vmware_cpuid) {
+                /* Report VMware hypervisor identity only when SVGA3D/vmvga
+                 * is attached so plain -device VGA / HVDBT stays untouched. */
+                memcpy(signature, "VMwareVMware", 12);
+            } else {
+                memcpy(signature, "TCGTCGTCGTCG", 12);
+            }
             *eax = tcg_clock ? 0x40000010 : 0x40000001;
             *ebx = signature[0];
             *ecx = signature[1];
